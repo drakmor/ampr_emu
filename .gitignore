@@ -1,0 +1,30 @@
+# Build outputs
+/build/
+/build_*/
+/ps5/build/
+/ps5/build_prx/
+/original/
+
+
+# Binaries and libraries
+*.o
+*.obj
+*.lo
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# PS5 outputs
+/ps5/*.elf
+/ps5/*.prx
+/ps5/*.sprx
+/ps5/build_prx_libkernel/
+
+# IDE/editor junk
+/.vscode/
+/.idea/
+*.swp
+*.swo
+.DS_Store

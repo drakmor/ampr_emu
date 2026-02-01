@@ -1,0 +1,32 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Roman Tarasov
+ */
+
+{
+  global:
+    "WT-5NKy42fw#C#A";
+    "gEpBkcwxUjw#C#A";
+    "i3HWvW35jao#C#A";
+    "w5fcCG+t31g#C#A";
+    "eYAh2vlCY-U#C#A";
+    "QzB4O+bJQyA#C#A";
+    "VB-BtuIW8Xc#C#A";
+    "C+Khtbbx2g8#C#A";
+    "WvEu7yl3Ivg#C#A";
+    "ApkYaHb8Sek#C#A";
+    "eE4Szl8sil8#C#A";
+    "Omr9X+YmT7I#C#A";
+    "ASoW5WE-UPo#C#A";
+    "0ers1N4C9CY#C#A";
+    "qvMUCyyaCSI#C#A";
+    "rqwFKI4PAiM#C#A";
+    "D0OdFMjp46I#C#A";
+    "bBfz7kMF2Ho#C#A";
+    "bMmid3pfyjo#C#A";
+    "vuae5JPNt9A#C#A";
+    "fzyMKs9kim0#C#A";
+    "jpFjmgAC5AE#C#A";
+  local:
+    *;
+};

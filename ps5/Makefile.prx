@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Copyright (C) 2026 Roman Tarasov
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+ifndef PS5_PAYLOAD_SDK
+$(error PS5_PAYLOAD_SDK is undefined. Set it to your SDK prefix, e.g. /opt/ps5-payload-sdk)
+endif
+
+include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
+
+BUILD := build_prx
+PRX_SONAME := libSceAmpr.prx
+PRX := $(PRX_SONAME)
+FSELF := libSceAmpr.sprx
+FSELF_PTYPE ?= fake
+FSELF_TOOL := ../ps5/make_fself.py
+PRX_LDSCRIPT := prx_sce.ld
+EXPORTS_MAP := nid_exports.map
+
+INCLUDES := -I../include
+
+# Build everything as PIC (required for ET_DYN)
+CXXFLAGS += -std=gnu++17 -fPIC -fno-exceptions -fno-rtti -ffunction-sections -fdata-sections -fvisibility=hidden -fvisibility-inlines-hidden $(INCLUDES) -DAMPR_EMU_LOG=1 -DAMPR_EMU_USE_KLOG=1 -DAMPR_EXPORT_NID_ONLY=1 -DAMPR_EMU_QUEUE_BACKEND_KQUEUE=1
+CFLAGS   += -fPIC -ffunction-sections -fdata-sections -fvisibility=hidden $(INCLUDES) -DAMPR_EMU_LOG=1 -DAMPR_EMU_USE_KLOG=1 -DAMPR_EXPORT_NID_ONLY=1 -DAMPR_EMU_QUEUE_BACKEND_KQUEUE=1
+LDFLAGS  += -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--version-script,$(EXPORTS_MAP) -Wl,--as-needed -Wl,--build-id=sha1
+LDLIBS   += -Wl,-Bstatic -lc++ -lc++abi -lunwind -Wl,-Bdynamic
+
+# Sources providing the full sceAmpr* surface + NID exports
+SRCS_CPP := \
+  ../src/ampr_emu.cpp \
+  ../src/sceampr_exports.cpp \
+  ./prx_sce_sections.cpp
+SRCS_ASM := \
+  ../src/ampr_nid_stubs.S
+
+OBJS := \
+  $(BUILD)/ampr_emu.o \
+  $(BUILD)/sceampr_exports.o \
+  $(BUILD)/prx_sce_sections.o \
+  $(BUILD)/ampr_nid_stubs.o
+
+.PHONY: all fself clean print-vars
+
+all: $(PRX)
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/ampr_emu.o: ../src/ampr_emu.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/sceampr_exports.o: ../src/sceampr_exports.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/prx_sce_sections.o: ./prx_sce_sections.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/ampr_nid_stubs.o: ../src/ampr_nid_stubs.S | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Shared module. We set SONAME to libSceAmpr.prx (what the loader expects).
+# We also avoid stripping so the NID symbols remain.
+$(PRX): $(OBJS)
+	$(CXX) $(LDFLAGS) -shared -Wl,-soname,$(PRX_SONAME) \
+		-Wl,-T,$(PRX_LDSCRIPT) \
+	-Wl,--eh-frame-hdr -Wl,-z,relro \
+	-Wl,--hash-style=sysv \
+		-Wl,-z,max-page-size=0x4000 -Wl,-z,common-page-size=0x4000 \
+		-o $@ \
+		$(OBJS) \
+		$(LDLIBS)
+
+fself: $(PRX)
+	python3 $(FSELF_TOOL) $(PRX) $(FSELF) --ptype $(FSELF_PTYPE)
+
+clean:
+	rm -rf $(BUILD) $(PRX) $(FSELF)
+
+print-vars:
+	@echo "PS5_PAYLOAD_SDK=$(PS5_PAYLOAD_SDK)"
+	@echo "CC=$(CC)"
+	@echo "CXX=$(CXX)"
+	@echo "CFLAGS=$(CFLAGS)"
+	@echo "CXXFLAGS=$(CXXFLAGS)"
+	@echo "LDFLAGS=$(LDFLAGS)"
+	@echo "LDLIBS=$(LDLIBS)"

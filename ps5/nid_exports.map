@@ -1,0 +1,12 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Copyright (C) 2026 Roman Tarasov
+ */
+
+{
+  global:
+    "*#C#A";
+    "*#B#C";
+  local:
+    *;
+};
