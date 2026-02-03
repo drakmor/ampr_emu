@@ -28,6 +28,8 @@ PRX_LDSCRIPT := prx_sce.ld
 EXPORTS_MAP := nid_libkernel_exports.map
 FSELF := libkernel_sys_stub.sprx
 FSELF_PTYPE ?= fake
+FW_VERSION ?= 0x09400001
+APP_VERSION ?= $(FW_VERSION)
 FSELF_TOOL := ../ps5/make_fself.py
 
 INCLUDES := -I../include
@@ -37,12 +39,12 @@ INCLUDES := -I../include
 CXXFLAGS += -std=gnu++17 -fPIC -fno-exceptions -fno-rtti -ffunction-sections -fdata-sections \
 	-fvisibility=hidden -fvisibility-inlines-hidden \
 	$(INCLUDES) \
-	-DAMPR_EMU_LOG=1 -DAMPR_EMU_USE_KLOG=1 -DAMPR_EXPORT_NID_ONLY=1 \
+	-DAMPR_EMU_LOG=1 -DAMPR_EMU_USE_KLOG=1 -DAMPR_EXPORT_NID_ONLY=1 -DAMPR_PRX_STUB_INIT_FINI=1 \
 	-DAMPR_PRX_PRODG_META_SIZE=0x6c \
 	-DAMPR_EMU_KERNEL_STUBS_QUEUE=1 -DAMPR_EMU_KERNEL_STUBS_MEMORY=0 -DAMPR_EMU_QUEUE_BACKEND_KQUEUE=1
 CFLAGS   += -fPIC -ffunction-sections -fdata-sections -fvisibility=hidden \
 	$(INCLUDES) \
-	-DAMPR_EMU_LOG=1 -DAMPR_EMU_USE_KLOG=1 -DAMPR_EXPORT_NID_ONLY=1 \
+	-DAMPR_EMU_LOG=1 -DAMPR_EMU_USE_KLOG=1 -DAMPR_EXPORT_NID_ONLY=1 -DAMPR_PRX_STUB_INIT_FINI=1 \
 	-DAMPR_PRX_PRODG_META_SIZE=0x6c \
 	-DAMPR_EMU_KERNEL_STUBS_QUEUE=1 -DAMPR_EMU_KERNEL_STUBS_MEMORY=0 -DAMPR_EMU_QUEUE_BACKEND_KQUEUE=1
 
@@ -65,7 +67,7 @@ OBJS := \
 all: $(PRX)
 
 fself: $(PRX)
-	python3 $(FSELF_TOOL) $(PRX) $(FSELF) --ptype $(FSELF_PTYPE)
+	python3 $(FSELF_TOOL) $(PRX) $(FSELF) --ptype $(FSELF_PTYPE) --app-version $(APP_VERSION) --fw-version $(FW_VERSION)
 
 $(BUILD):
 	@mkdir -p $(BUILD)

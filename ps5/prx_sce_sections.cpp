@@ -19,20 +19,54 @@
 
 #include <cstdint>
 
+#ifdef AMPR_PRX_STUB_INIT_FINI
+extern "C" __attribute__((section(".init"), used)) void ampr_prx_init_stub(void) {}
+extern "C" __attribute__((section(".fini"), used)) void ampr_prx_fini_stub(void) {}
+#endif
+
 // Minimal SCE-specific sections to force corresponding PHDRs.
-// Content is placeholder; layout and presence is what matters.
+// Some retail loaders validate these headers (especially .sce_module_param),
+// so keep the magic/format consistent with system SPRX stubs.
 
 __attribute__((section(".sce_module_param"), used, aligned(8)))
-static const uint8_t g_sce_module_param[0x20] = {0};
+static const uint8_t g_sce_module_param[0x20] = {
+	// uint64_t size = 0x20
+	0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	// uint32_t magic = 0x3C13F4BF ("BF F4 13 3C" little-endian)
+	0xBF, 0xF4, 0x13, 0x3C,
+	// uint32_t version = 3
+	0x03, 0x00, 0x00, 0x00,
+	// Remaining fields match libSceLibcInternal/libkernel_web (fw-versioned).
+	0x01, 0x00, 0x59, 0x11,
+	0x08, 0x00, 0x40, 0x09,
+	0x01, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00,
+};
 
 __attribute__((section(".prodg_meta_data"), used, aligned(16)))
 #ifndef AMPR_PRX_PRODG_META_SIZE
 #define AMPR_PRX_PRODG_META_SIZE 0x84
 #endif
-static const uint8_t g_prodg_meta_data[AMPR_PRX_PRODG_META_SIZE] = {0};
+static const uint8_t g_prodg_meta_data[AMPR_PRX_PRODG_META_SIZE] = {
+	// System SPRX stubs store a small header that starts with "PATH" and embeds
+	// the original build path. We keep a minimal valid header.
+	'P', 'A', 'T', 'H',
+	// uint32_t size = (segment_size - 8)
+	(uint8_t)((AMPR_PRX_PRODG_META_SIZE - 8) & 0xFF),
+	(uint8_t)(((AMPR_PRX_PRODG_META_SIZE - 8) >> 8) & 0xFF),
+	(uint8_t)(((AMPR_PRX_PRODG_META_SIZE - 8) >> 16) & 0xFF),
+	(uint8_t)(((AMPR_PRX_PRODG_META_SIZE - 8) >> 24) & 0xFF),
+	// uint32_t path_len = 0 (no path string)
+	0x00, 0x00, 0x00, 0x00,
+	// rest is zero
+};
 
 __attribute__((section(".sceversion"), used, aligned(4)))
 static const uint8_t g_sceversion[0x10] = {0};
+
+// A small empty NOTE block to match system stub layout (readelf shows it as unknown note).
+__attribute__((section(".note"), used, aligned(4)))
+static const uint8_t g_empty_note[0x30] = {0};
 
 // The retail rtld does not accept DT_GNU_HASH (0x6ffffef5). We reserve a SysV
 // hash table region and fill it during SPRX packaging (see make_fself.py).

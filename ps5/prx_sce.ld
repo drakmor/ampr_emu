@@ -22,26 +22,24 @@ ENTRY(0)
 
 PHDRS
 {
-    ph_text            PT_LOAD       FLAGS (0x1);
-    ph_ro              PT_LOAD       FLAGS (0x4);
-    ph_relro_load      PT_LOAD       FLAGS (0x2 | 0x4);
-    ph_relro           PT_GNU_RELRO  FLAGS (0x4);
-    ph_data            PT_LOAD       FLAGS (0x2 | 0x4);
+    ph_text            PT_LOAD        FLAGS (0x1);
+    ph_ro              PT_LOAD        FLAGS (0x4);
+    ph_eh_frame_hdr    PT_GNU_EH_FRAME FLAGS (0x4);
+    ph_relro_load      PT_LOAD        FLAGS (0x2 | 0x4);
+    ph_relro           PT_GNU_RELRO   FLAGS (0x4);
+    ph_tls             PT_TLS         FLAGS (0x4);
 
     /* SCE-specific program headers (numeric IDs to avoid relying on toolchain macros). */
-    ph_sce_moduleparam 0x61000002    FLAGS (0x4);
-    ph_dynamic         PT_DYNAMIC    FLAGS (0x2 | 0x4);
-    ph_tls             PT_TLS        FLAGS (0x4);
-    ph_eh_frame_hdr    PT_GNU_EH_FRAME FLAGS (0x4);
+    ph_sce_moduleparam 0x61000002     FLAGS (0x4);
+    ph_data            PT_LOAD        FLAGS (0x2 | 0x4);
 
     /* "dynlibdata" load segment used by retail PRX layout. */
-    ph_dynlibdata      PT_LOAD       FLAGS (0x0);
-    ph_sce_comment     0x6fffff00    FLAGS (0x0);
-    ph_libversion      0x6fffff01    FLAGS (0x0);
-
-    /* Split notes like the SDK script. */
-    ph_load_note       PT_NOTE       FLAGS (0x0);
-    ph_note            PT_NOTE       FLAGS (0x0);
+    ph_dynlibdata      PT_LOAD        FLAGS (0x0);
+    ph_load_note       PT_NOTE        FLAGS (0x0);
+    ph_dynamic         PT_DYNAMIC     FLAGS (0x2 | 0x4);
+    ph_sce_comment     0x6fffff00     FLAGS (0x0);
+    ph_libversion      0x6fffff01     FLAGS (0x0);
+    ph_note            PT_NOTE        FLAGS (0x0);
 }
 
 SECTIONS
@@ -172,7 +170,12 @@ SECTIONS
     PROVIDE (_end = .);
 
     /* dynlibdata: keep first section 16-byte aligned. */
-    .dynstr   : ALIGN (16) { *(.dynstr) } : ph_dynlibdata
+    .dynstr   : ALIGN (16)
+    {
+        *(.dynstr)
+        /* Extra space for make_fself.py to inject a system-like dynstr prefix. */
+        . += 0x200;
+    } : ph_dynlibdata
     .dynsym   : { *(.dynsym) } : ph_dynlibdata
     .rela.plt : { . = .; *(.dyn.rela.plt) *(.rela.plt) } : ph_dynlibdata
     .rela.dyn : { . = .; *(.rela.dyn) *(.rela.dyn.*) } : ph_dynlibdata

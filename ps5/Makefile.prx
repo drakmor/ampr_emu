@@ -26,6 +26,8 @@ PRX_SONAME := libSceAmpr.prx
 PRX := $(PRX_SONAME)
 FSELF := libSceAmpr.sprx
 FSELF_PTYPE ?= fake
+FW_VERSION ?= 0x09400001
+APP_VERSION ?= $(FW_VERSION)
 FSELF_TOOL := ../ps5/make_fself.py
 PRX_LDSCRIPT := prx_sce.ld
 EXPORTS_MAP := nid_exports.map
@@ -84,7 +86,7 @@ $(PRX): $(OBJS)
 		$(LDLIBS)
 
 fself: $(PRX)
-	python3 $(FSELF_TOOL) $(PRX) $(FSELF) --ptype $(FSELF_PTYPE)
+	python3 $(FSELF_TOOL) $(PRX) $(FSELF) --ptype $(FSELF_PTYPE) --app-version $(APP_VERSION) --fw-version $(FW_VERSION)
 
 clean:
 	rm -rf $(BUILD) $(PRX) $(FSELF)

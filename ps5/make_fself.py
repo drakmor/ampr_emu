@@ -178,6 +178,7 @@ class ElfPHdr(object):
 	PT_TLS = 0x7
 	PT_GNU_EH_FRAME = 0x6474E550
 	PT_GNU_STACK = 0x6474E551
+	PT_GNU_RELRO = 0x6474E552
 	PT_SCE_RELA = 0x60000000,
 	PT_SCE_DYNLIBDATA = 0x61000000
 	PT_SCE_PROCPARAM = 0x61000001
@@ -315,10 +316,13 @@ class ElfFile(object):
 					phdr.paddr = 0
 					phdr.filesz = 0
 					phdr.memsz = 0
-				# Notes are also treated as metadata; keep sizes but drop VM addresses.
-				if phdr.type == ElfPHdr.PT_NOTE:
-					phdr.vaddr = 0
-					phdr.paddr = 0
+				# System stubs use p_align=1 for PT_GNU_RELRO.
+				if phdr.type == ElfPHdr.PT_GNU_RELRO:
+					phdr.align = 1
+				# Notes are metadata; keep their VM addresses to match system layout.
+				# The second NOTE (custom/empty) uses memsz=0 in system stubs.
+				if phdr.type == ElfPHdr.PT_NOTE and phdr.filesz == 0x30:
+					phdr.memsz = 0
 
 				self.phdrs.append(phdr)
 				if phdr.filesz > 0:
@@ -411,6 +415,7 @@ class ElfFile(object):
 		sec_dynsym = self._find_section(".dynsym")
 		sec_dynstr = self._find_section(".dynstr")
 		sec_hash = self._find_section(".hash")
+		sec_dynpad = self._find_section(".dynamic_pad")
 		if sec_dynsym is None or sec_dynstr is None or sec_hash is None:
 			raise ElfError("missing .dynsym/.dynstr/.hash; cannot patch PRX for retail rtld")
 
@@ -482,28 +487,38 @@ class ElfFile(object):
 		else:
 			seg[hash_seg_off : hash_seg_off + hashsz] = hash_blob
 
-		# Patch DT_GNU_HASH -> DT_HASH, and add DT_SCE_{SYMTABSZ,HASHSZ} using
-		# preinit/init/fini array slots (they are zeroed by the toolchain for our PRX).
+		# Patch DT_GNU_HASH -> DT_HASH, and make room for additional SCE DT_* entries.
+		# For retail rtld, DT_GNU_HASH is not accepted.
+		DT_RELA = 0x7
+		DT_RELASZ = 0x8
+		DT_RELAENT = 0x9
+		DT_RELACOUNT = 0x6FFFFFF9
+		DT_PLTRELSZ = 0x2
+		DT_PLTGOT = 0x3
+		DT_PLTREL = 0x14
+		DT_JMPREL = 0x17
 		DT_PREINIT_ARRAY = 0x20
 		DT_PREINIT_ARRAYSZ = 0x21
 		DT_INIT_ARRAY = 0x19
 		DT_INIT_ARRAYSZ = 0x1B
 		DT_FINI_ARRAY = 0x1A
 		DT_FINI_ARRAYSZ = 0x1C
+		DT_INIT = 0xC
+		DT_FINI = 0xD
+
+		slot_gnu_hash = None
+		slot_hash = None
+		slot_strtab = None
+		slot_strsz = None
+		slot_null_end = None
 
 		dt_soname_off = None
-		slot_preinit = None
-		slot_preinitsz = None
-		slot_init = None
-		slot_initsz = None
-		slot_fini = None
-		slot_finisz = None
-		slot_hash = None
-		slot_gnu_hash = None
-		slot_sce_symtabsz = None
-		slot_sce_hashsz = None
-		slot_sce_module_info = None
-		slot_sce_orig_filename = None
+		needed_offs = []
+		dyn_tag_vals = {}
+		has_sce_symtabsz = False
+		has_sce_hashsz = False
+		has_sce_module_info = False
+		has_sce_orig_filename = False
 
 		for off in range(0, dyn_ph.filesz, 16):
 			d_tag, d_val = struct.unpack_from("<QQ", seg, dyn_seg_off + off)
@@ -511,89 +526,223 @@ class ElfFile(object):
 				slot_gnu_hash = dyn_seg_off + off
 			elif d_tag == DT_HASH:
 				slot_hash = dyn_seg_off + off
+			elif d_tag == DT_STRTAB:
+				slot_strtab = dyn_seg_off + off
+			elif d_tag == DT_STRSZ:
+				slot_strsz = dyn_seg_off + off
+			elif d_tag == DT_NEEDED:
+				needed_offs.append(d_val)
 			elif d_tag == DT_SONAME:
 				dt_soname_off = d_val
 			elif d_tag == DT_SCE_SYMTABSZ:
-				slot_sce_symtabsz = dyn_seg_off + off
+				has_sce_symtabsz = True
 			elif d_tag == DT_SCE_HASHSZ:
-				slot_sce_hashsz = dyn_seg_off + off
+				has_sce_hashsz = True
 			elif d_tag == DT_SCE_MODULE_INFO:
-				slot_sce_module_info = dyn_seg_off + off
+				has_sce_module_info = True
 			elif d_tag == DT_SCE_ORIG_FILENAME:
-				slot_sce_orig_filename = dyn_seg_off + off
-			elif d_tag == DT_PREINIT_ARRAY and d_val == 0:
-				slot_preinit = dyn_seg_off + off
-			elif d_tag == DT_PREINIT_ARRAYSZ and d_val == 0:
-				slot_preinitsz = dyn_seg_off + off
-			elif d_tag == DT_INIT_ARRAY and d_val == 0:
-				slot_init = dyn_seg_off + off
-			elif d_tag == DT_INIT_ARRAYSZ and d_val == 0:
-				slot_initsz = dyn_seg_off + off
-			elif d_tag == DT_FINI_ARRAY and d_val == 0:
-				slot_fini = dyn_seg_off + off
-			elif d_tag == DT_FINI_ARRAYSZ and d_val == 0:
-				slot_finisz = dyn_seg_off + off
+				has_sce_orig_filename = True
+
+			if d_tag not in (DT_NULL, DT_NEEDED):
+				dyn_tag_vals[d_tag] = d_val
 			if d_tag == DT_NULL:
+				slot_null_end = dyn_seg_off + off
 				break
 
 		# Ensure DT_HASH points to the sysv hash table.
+		dyn_tag_vals[DT_HASH] = sec_hash.addr
 		if slot_gnu_hash is not None:
 			struct.pack_into("<QQ", seg, slot_gnu_hash, DT_HASH, sec_hash.addr)
-			slot_hash = slot_gnu_hash
 		elif slot_hash is not None:
 			struct.pack_into("<QQ", seg, slot_hash, DT_HASH, sec_hash.addr)
 
-		# Insert or update SCE size tags.
-		def upsert(tag, val, slot_primary, slot_fallback):
-			if slot_primary is not None:
-				struct.pack_into("<QQ", seg, slot_primary, tag, val)
-				return True
-			if slot_fallback is not None:
-				struct.pack_into("<QQ", seg, slot_fallback, tag, val)
-				return True
-			return False
+		# Determine SONAME to choose the patch set per module.
+		soname_bytes = b""
+		if dt_soname_off is not None and dt_soname_off < len(dynstr):
+			end = dynstr.find(b"\x00", dt_soname_off)
+			if end != -1:
+				soname_bytes = dynstr[dt_soname_off:end]
+		is_libkernel_sys_stub = (soname_bytes == b"libkernel_sys_stub.prx")
 
-		# Prefer to overwrite preinit array slots, then init/fini, then any other.
-		if slot_sce_symtabsz is None:
-			slot_sce_symtabsz = slot_preinit or slot_init or slot_fini
-		if slot_sce_hashsz is None:
-			slot_sce_hashsz = slot_preinitsz or slot_initsz or slot_finisz
+		# For libkernel_sys stub we need import/export SCE tags. The retail rtld appears
+		# to associate DT_SCE_IMPORT_LIB* entries with the preceding DT_NEEDED entry,
+		# so we rebuild the dynamic table in the same order as system modules.
+		if is_libkernel_sys_stub:
+			if sec_dynpad is None:
+				raise ElfError("missing .dynamic_pad; cannot extend PT_DYNAMIC")
+			if sec_dynpad.addr != (dyn_ph.vaddr + dyn_ph.filesz):
+				raise ElfError("unexpected .dynamic_pad placement; expected it right after .dynamic")
+			if slot_strtab is None or slot_strsz is None:
+				raise ElfError("missing DT_STRTAB/DT_STRSZ; cannot patch dynstr")
 
-		if slot_sce_symtabsz is None or slot_sce_hashsz is None:
-			# Not fatal; rtld will likely refuse to load, but keep the PRX buildable.
-			raise ElfError("no free DT slots for DT_SCE_SYMTABSZ/DT_SCE_HASHSZ")
+			# Build a patched dynstr that matches the system stubs layout:
+			# - strtab[0] is NUL
+			# - strtab[1] is the module NID string, so strtab[9] is "QGc#A#B"
+			# - switch NEEDED from *.sprx to *.prx (keeping byte length stable)
+			# - append extra strings used by SCE DT tags
+			orig_dynstr = bytearray(dynstr)
+			orig_dynstr[:] = orig_dynstr.replace(b".sprx\x00", b".prx\x00\x00")
+			# The link script reserves extra zero padding at the end of .dynstr.
+			# Don't treat that padding as part of the existing string table.
+			trim_end = len(orig_dynstr)
+			while trim_end > 1 and orig_dynstr[trim_end - 1] == 0:
+				trim_end -= 1
+			orig_dynstr = orig_dynstr[: trim_end + 1]
 
-		struct.pack_into("<QQ", seg, slot_sce_symtabsz, DT_SCE_SYMTABSZ, sec_dynsym.size)
-		struct.pack_into("<QQ", seg, slot_sce_hashsz, DT_SCE_HASHSZ, hash_used)
+			module_nid_str = b"H2e8t5ScQGc#A#B\x00"
+			delta = len(module_nid_str)
+			module_nid_off = 1
+			lib_nid_off = module_nid_off + 8  # "QGc#A#B" substring (system: offset 0x9)
 
-		# A minimal subset of SCE dynamic tags required by retail rtld for PRX
-		# PerFileInfo parsing. Use DT_SONAME offset as a best-effort string.
-		used_slots = {slot_sce_symtabsz, slot_sce_hashsz}
-		def pick_slot(*candidates):
-			for c in candidates:
-				if c is None or c in used_slots:
-					continue
-				used_slots.add(c)
-				return c
-			return None
+			# Keep all existing strings, just shift their offsets by delta.
+			dynstr_base = b"\x00" + module_nid_str + bytes(orig_dynstr[1:])
 
-		if dt_soname_off is None:
-			# Keep it non-fatal; loader will likely reject, but avoid crashing packer.
-			dt_soname_off = 0
+			extra_dynstr = b"libkernel\x00" + b"libSceLibcInternal\x00"
+			libkernel_off = len(dynstr_base)
+			libcint_off = libkernel_off + len(b"libkernel\x00")
 
-		# Match observed system SPRX pattern: high=0x101, low=dynstr offset.
-		module_info_val = (0x101 << 32) | (dt_soname_off & 0xFFFFFFFF)
+			new_dynstr = dynstr_base + extra_dynstr
+			# Keep DT_STRTAB at the base of dynlibdata (system convention) and
+			# inject the updated string table in-place.
+			if len(new_dynstr) > sec_dynstr.size:
+				raise ElfError("reserved .dynstr is too small for system-like dynstr")
+			dynstr_map = self._vaddr_to_segment(sec_dynstr.addr, sec_dynstr.size)
+			if dynstr_map is None:
+				raise ElfError("cannot map .dynstr into PT_LOAD segment")
+			dynstr_seg_idx, dynstr_seg_off = dynstr_map
+			if dynstr_seg_idx != dyn_seg_idx:
+				dstr_seg = bytearray(self.segments[dynstr_seg_idx])
+			else:
+				dstr_seg = seg
+			dstr_seg[dynstr_seg_off : dynstr_seg_off + len(new_dynstr)] = new_dynstr
+			# Zero the remaining reserved .dynstr padding so offsets past STRSZ stay stable.
+			if len(new_dynstr) < sec_dynstr.size:
+				dstr_seg[dynstr_seg_off + len(new_dynstr) : dynstr_seg_off + sec_dynstr.size] = b"\x00" * (sec_dynstr.size - len(new_dynstr))
+			if dynstr_seg_idx != dyn_seg_idx:
+				self.segments[dynstr_seg_idx] = bytes(dstr_seg)
 
-		if slot_sce_module_info is None:
-			slot_sce_module_info = pick_slot(slot_init, slot_fini)
-		if slot_sce_orig_filename is None:
-			slot_sce_orig_filename = pick_slot(slot_initsz, slot_finisz)
+			# Update the dynamic tags to point at the in-place dynstr.
+			struct.pack_into("<QQ", seg, slot_strtab, DT_STRTAB, sec_dynstr.addr)
+			struct.pack_into("<QQ", seg, slot_strsz, DT_STRSZ, len(new_dynstr))
+			dyn_tag_vals[DT_STRTAB] = sec_dynstr.addr
+			dyn_tag_vals[DT_STRSZ] = len(new_dynstr)
 
-		if slot_sce_module_info is None or slot_sce_orig_filename is None:
-			raise ElfError("no free DT slots for DT_SCE_MODULE_INFO/DT_SCE_ORIG_FILENAME")
+			# Patch .dynsym st_name offsets to match the new dynstr layout.
+			dynsym_map = self._vaddr_to_segment(sec_dynsym.addr, sec_dynsym.size)
+			if dynsym_map is None:
+				raise ElfError("cannot map .dynsym into PT_LOAD segment")
+			dynsym_seg_idx, dynsym_seg_off = dynsym_map
+			if dynsym_seg_idx != dyn_seg_idx:
+				dsym_seg = bytearray(self.segments[dynsym_seg_idx])
+			else:
+				dsym_seg = seg
+			for symidx in range(0, nsym):
+				off = dynsym_seg_off + symidx * entsz
+				st_name = struct.unpack_from("<I", dsym_seg, off)[0]
+				if st_name != 0:
+					struct.pack_into("<I", dsym_seg, off, st_name + delta)
+			if dynsym_seg_idx != dyn_seg_idx:
+				self.segments[dynsym_seg_idx] = bytes(dsym_seg)
 
-		struct.pack_into("<QQ", seg, slot_sce_module_info, DT_SCE_MODULE_INFO, module_info_val)
-		struct.pack_into("<QQ", seg, slot_sce_orig_filename, DT_SCE_ORIG_FILENAME, dt_soname_off)
+			# Shift DT_NEEDED/DT_SONAME offsets to match the new dynstr layout.
+			needed_offs = [off + delta if off else off for off in needed_offs]
+			if dt_soname_off is not None:
+				dt_soname_off += delta
+
+			# Ensure DT_INIT/DT_FINI are present if .init/.fini exist (system-style layout).
+			sec_init = self._find_section(".init")
+			sec_fini = self._find_section(".fini")
+			if sec_init is not None and sec_init.size:
+				dyn_tag_vals[DT_INIT] = sec_init.addr
+			if sec_fini is not None and sec_fini.size:
+				dyn_tag_vals[DT_FINI] = sec_fini.addr
+
+			# Build a system-like dynamic table order.
+			new_dyn = []
+			if len(needed_offs) >= 1:
+				new_dyn.append((DT_NEEDED, needed_offs[0]))
+				new_dyn.append((DT_SCE_IMPORT_LIB, (0x00010101 << 32) | (libkernel_off & 0xFFFFFFFF)))
+				new_dyn.append((DT_SCE_IMPORT_LIB_ATTR, (0x00000001 << 32) | (libkernel_off & 0xFFFFFFFF)))
+				new_dyn.append((DT_SCE_IMPORT_LIB_VERSION, (0x00000000 << 32) | (lib_nid_off & 0xFFFFFFFF)))
+			if len(needed_offs) >= 2:
+				new_dyn.append((DT_NEEDED, needed_offs[1]))
+				new_dyn.append((DT_SCE_IMPORT_LIB, (0x00020101 << 32) | (libcint_off & 0xFFFFFFFF)))
+				new_dyn.append((DT_SCE_IMPORT_LIB_ATTR, (0x00010001 << 32) | (libcint_off & 0xFFFFFFFF)))
+				new_dyn.append((DT_SCE_IMPORT_LIB_VERSION, (0x00010000 << 32) | (lib_nid_off & 0xFFFFFFFF)))
+
+			if dt_soname_off is not None:
+				new_dyn.append((DT_SONAME, dt_soname_off))
+
+			# Module info + orig filename.
+			module_info_val = (0x101 << 32) | (libkernel_off & 0xFFFFFFFF)
+			new_dyn.append((DT_SCE_MODULE_INFO, module_info_val))
+			new_dyn.append((DT_SCE_ORIG_FILENAME, dt_soname_off if dt_soname_off is not None else 0))
+
+			# Export lib.
+			# Match system modules: the main libkernel export uses ID 8.
+			# The low 32 bits are a string offset (export lib name), and ATTR is a small flag (usually 1).
+			export_id = 8
+			new_dyn.append((DT_SCE_EXPORT_LIB, (((export_id << 16) | 1) << 32) | (libkernel_off & 0xFFFFFFFF)))
+			new_dyn.append((DT_SCE_EXPORT_LIB_ATTR, (export_id << 48) | 1))
+
+			# Standard tags in the same order as system modules.
+			for tag in [
+				DT_RELA, DT_RELASZ, DT_RELAENT, DT_RELACOUNT,
+				DT_JMPREL, DT_PLTRELSZ, DT_PLTGOT, DT_PLTREL,
+				DT_SYMTAB, DT_SYMENT, DT_STRTAB, DT_STRSZ, DT_HASH,
+				DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_FINI_ARRAY, DT_FINI_ARRAYSZ,
+				DT_INIT, DT_FINI,
+			]:
+				if tag in dyn_tag_vals:
+					new_dyn.append((tag, dyn_tag_vals[tag]))
+
+			# SCE size tags at the end (match system modules).
+			new_dyn.append((DT_SCE_SYMTABSZ, sec_dynsym.size))
+			new_dyn.append((DT_SCE_HASHSZ, hash_used))
+			new_dyn.append((DT_NULL, 0))
+
+			new_dyn_bytes = len(new_dyn) * 16
+			avail = dyn_ph.filesz + sec_dynpad.size
+			if new_dyn_bytes > avail:
+				raise ElfError("dynamic_pad is too small for rebuilt PT_DYNAMIC")
+
+			# Overwrite the existing dynamic table (and part of dynamic_pad) with our rebuilt one.
+			for i, (tag, val) in enumerate(new_dyn):
+				struct.pack_into("<QQ", seg, dyn_seg_off + i * 16, tag, val)
+
+			dyn_ph.filesz = new_dyn_bytes
+			dyn_ph.memsz = new_dyn_bytes
+		else:
+			# For other PRX, only add the minimal SCE tags required for retail rtld.
+			need_tags = []
+			if not has_sce_symtabsz:
+				need_tags.append((DT_SCE_SYMTABSZ, sec_dynsym.size))
+			if not has_sce_hashsz:
+				need_tags.append((DT_SCE_HASHSZ, hash_used))
+			if not has_sce_module_info:
+				if dt_soname_off is None:
+					dt_soname_off = 0
+				need_tags.append((DT_SCE_MODULE_INFO, (0x101 << 32) | (dt_soname_off & 0xFFFFFFFF)))
+			if not has_sce_orig_filename:
+				if dt_soname_off is None:
+					dt_soname_off = 0
+				need_tags.append((DT_SCE_ORIG_FILENAME, dt_soname_off))
+
+			if need_tags:
+				if sec_dynpad is None:
+					raise ElfError("missing .dynamic_pad; cannot extend PT_DYNAMIC")
+				if slot_null_end is None:
+					raise ElfError("missing DT_NULL terminator; cannot append SCE tags")
+				if sec_dynpad.addr != (dyn_ph.vaddr + dyn_ph.filesz):
+					raise ElfError("unexpected .dynamic_pad placement; expected it right after .dynamic")
+				extend_by = len(need_tags) * 16
+				if sec_dynpad.size < extend_by:
+					raise ElfError("dynamic_pad is too small for required SCE tags")
+				for i, (tag, val) in enumerate(need_tags):
+					struct.pack_into("<QQ", seg, slot_null_end + i * 16, tag, val)
+				struct.pack_into("<QQ", seg, slot_null_end + len(need_tags) * 16, DT_NULL, 0)
+				dyn_ph.filesz += extend_by
+				dyn_ph.memsz += extend_by
 
 		self.segments[dyn_seg_idx] = bytes(seg)
 
