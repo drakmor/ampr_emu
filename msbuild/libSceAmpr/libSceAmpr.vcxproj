@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="ReleaseHooks|Prospero">
+      <Configuration>ReleaseHooks</Configuration>
+      <Platform>Prospero</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{1C1DF483-F977-4DF2-84C7-CA97E6E9B2B2}</ProjectGuid>
+    <ProsperoSdkVersion>2.000</ProsperoSdkVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseHooks|Prospero'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="..\Prospero.Common.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='ReleaseHooks|Prospero'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <TargetName>libSceAmpr</TargetName>
+    <TargetExt>.prx</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions>LIBSCEAMPR_IMPL=1;AMPR_EMU_HAS_LIBKERNEL_HOOK_IMPL=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(SolutionDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>-fPIC %(AdditionalOptions)</AdditionalOptions>
+      <OptimizationLevel>Level3</OptimizationLevel>
+      <FastMath>true</FastMath>
+      <NoStrictAliasing>true</NoStrictAliasing>
+      <UnrollLoops>true</UnrollLoops>
+      <LinkTimeOptimization>true</LinkTimeOptimization>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(OutDir)libSceLibcInternal_stub_weak.a;libkernel_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>-Wl,--as-needed -Wl,--oformat=prx %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\src\ampr_debug_log.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_runtime_memory.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_index.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_fd_cache.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_amm.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_command_buffer.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_command_buffer_amm.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_command_buffer_apr.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_apr_command_buffer.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_apr_services.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_apr_kernel_bridge.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_apr_reactor_common.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_apr_reactor_arena.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_apr_reactor.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_command_packing.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_core.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_measure_commands.cpp" />
+    <ClCompile Include="..\..\src\ampr_libc_internal_link.cpp" />
+    <ClCompile Include="..\..\src\sceampr_exports.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\src\ampr_libkernel_hook.cpp" />
+    <ClCompile Include="..\..\src\hde64.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\include\ampr.h" />
+    <ClInclude Include="..\..\include\ampr_debug_log.h" />
+    <ClInclude Include="..\..\include\ampr_emu_config.h" />
+    <ClInclude Include="..\..\include\ampr_emu_extra.h" />
+    <ClInclude Include="..\..\include\ampr_libkernel_hook.h" />
+    <ClInclude Include="..\..\include\hde64.h" />
+    <ClInclude Include="..\..\include\table64.h" />
+    <ClInclude Include="..\..\include\ampr_libkernel_hook_targets.h" />
+    <ClInclude Include="..\..\include\ampr_emu_amm.h" />
+    <ClInclude Include="..\..\include\ampr_emu_command_buffer_dump.h" />
+    <ClInclude Include="..\..\include\ampr_emu_command_buffer_common.h" />
+    <ClInclude Include="..\..\include\ampr_emu_command_buffer_apr.h" />
+    <ClInclude Include="..\..\include\ampr_emu_command_buffer_types.h" />
+    <ClInclude Include="..\..\include\ampr_emu_command_types.h" />
+    <ClInclude Include="..\..\include\ampr_emu_errno.h" />
+    <ClInclude Include="..\..\include\ampr_emu_kernel_aio_compat.h" />
+    <ClInclude Include="..\..\include\ampr_emu_kernel_amm.h" />
+    <ClInclude Include="..\..\include\ampr_emu_kernel_file.h" />
+    <ClInclude Include="..\..\include\ampr_emu_kernel_lookup.h" />
+    <ClInclude Include="..\..\include\ampr_emu_kernel_memory.h" />
+    <ClInclude Include="..\..\include\ampr_emu_log.h" />
+    <ClInclude Include="..\..\include\ampr_emu_runtime_memory.h" />
+    <ClInclude Include="..\..\include\ampr_emu_sync.h" />
+    <ClInclude Include="..\..\include\ampr_emu_apr_services.h" />
+    <ClInclude Include="..\..\include\ampr_emu_measure_commands.h" />
+    <ClInclude Include="..\..\include\ampr_emu_apr_reactor.h" />
+    <ClInclude Include="..\..\include\ampr_emu_apr_reactor_common.h" />
+    <ClInclude Include="..\..\include\ampr_emu_apr_reactor_arena.h" />
+    <ClInclude Include="..\..\include\ampr_emu_command_packing.h" />
+    <ClInclude Include="..\..\include\ampr_emu_index.h" />
+    <ClInclude Include="..\..\include\ampr_emu_fd_cache.h" />
+    <ClInclude Include="..\..\include\ampr_emu_prot.h" />
+  </ItemGroup>
+  <Target Name="GenerateLibSceAmprLibcInternalStub" BeforeTargets="Link">
+    <Exec WorkingDirectory="$(SolutionDir)"
+          Command="python &quot;$(SolutionDir)tools\make_import_stub.py&quot; --library libc-internal --out &quot;$(OutDir)libSceLibcInternal_stub_weak.a&quot;" />
+  </Target>
+  <Target Name="CopyProsperoRuntimeModules" AfterTargets="Build">
+    <MakeDir Directories="$(OutDir)sce_module" />
+    <Copy SourceFiles="$(SolutionDir)libSceLibcInternal.sprx" DestinationFolder="$(OutDir)sce_module" Condition="Exists('$(SolutionDir)libSceLibcInternal.sprx')" SkipUnchangedFiles="true" Retries="10" RetryDelayMilliseconds="250" />
+    <Copy SourceFiles="$(OutDir)libSceAmpr.prx" DestinationFolder="$(OutDir)sce_module" SkipUnchangedFiles="true" Retries="10" RetryDelayMilliseconds="250" />
+  </Target>
+  <Target Name="GenerateLibSceAmprSprx"
+          AfterTargets="Build"
+          Inputs="$(OutDir)libSceAmpr.prx;$(SolutionDir)tools\make_fself.py"
+          Outputs="$(OutDir)libSceAmpr.sprx">
+    <Message Importance="High" Text="Generating $(OutDir)libSceAmpr.sprx from $(OutDir)libSceAmpr.prx" />
+    <Exec WorkingDirectory="$(SolutionDir)"
+          Command="python &quot;$(SolutionDir)tools\make_fself.py&quot; &quot;$(OutDir)libSceAmpr.prx&quot; &quot;$(OutDir)libSceAmpr.sprx&quot;" />
+  </Target>
+  <Import Condition="'$(ConfigurationType)' == 'Makefile' and Exists('$(VCTargetsPath)\Platforms\$(Platform)\SCE.Makefile.$(Platform).targets')" Project="$(VCTargetsPath)\Platforms\$(Platform)\SCE.Makefile.$(Platform).targets" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

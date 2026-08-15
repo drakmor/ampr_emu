@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ExpectedProsperoSdkDir>C:\SCE\Prospero SDKs\2.000</ExpectedProsperoSdkDir>
+    <AmprProsperoSdkDir>$(ExpectedProsperoSdkDir)</AmprProsperoSdkDir>
+    <AmprExtraPreprocessorDefinitions Condition="'$(AmprExtraPreprocessorDefinitions)'==''"></AmprExtraPreprocessorDefinitions>
+    <AmprOutDir>$(SolutionDir)out\$(Platform)_$(Configuration)\</AmprOutDir>
+    <OutDir>$(AmprOutDir)</OutDir>
+    <IntDir>$(SolutionDir)out\obj\$(MSBuildProjectName)\$(Platform)_$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <Target Name="ValidateProsperoSdk" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(ProsperoSdkVersion)' != '2.000'"
+           Text="This repository is pinned to ProsperoSdkVersion 2.000. Set ProsperoSdkVersion in the project Globals before Microsoft.Cpp.Default.props so the VS Prospero integration does not select another installed SDK." />
+    <Error Condition="!Exists('$(AmprProsperoSdkDir)')"
+           Text="Install the canonical Prospero SDK at $(ExpectedProsperoSdkDir) before building this repository." />
+  </Target>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>$(AmprExtraPreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>-std=c++17 -isystem "$(AmprProsperoSdkDir)\target\include" -isystem "$(AmprProsperoSdkDir)\target\include_common" %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseHooks|Prospero'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <OptimizationLevel>Level2</OptimizationLevel>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>

@@ -1,0 +1,17 @@
+* text=auto eol=crlf
+
+# Binary files must not be line-ending normalized.
+*.bin binary
+*.bmp binary
+*.gif binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.a binary
+*.elf binary
+*.o binary
+*.obj binary
+*.prx binary
+*.self binary
+*.sprx binary

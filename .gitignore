@@ -1,10 +1,6 @@
 # Build outputs
 /build/
-/build_*/
-/ps5/build/
-/ps5/build_prx/
-/original/
-
+/out/
 
 # Binaries and libraries
 *.o
@@ -24,7 +20,23 @@
 
 # IDE/editor junk
 /.vscode/
+/.vs/
 /.idea/
 *.swp
 *.swo
 .DS_Store
+*.vcxproj.user
+*.VC.db
+*.VC.opendb
+ps5/sce_stubs/
+*.sprx.c
+__pycache__
+*.log
+
+
+msbuild/**
+!msbuild/
+!msbuild/Prospero.App.props
+!msbuild/Prospero.Common.props
+!msbuild/libSceAmpr/
+!msbuild/libSceAmpr/libSceAmpr.vcxproj
