@@ -4,7 +4,6 @@
  * APR service implementation.
  */
 
-#define AMPR_EMU_CORE_IMPL 1
 #include "ampr_emu_apr_services.h"
 #include "ampr_emu_apr_reactor.h"
 #include "ampr_emu_apr_reactor_common.h"

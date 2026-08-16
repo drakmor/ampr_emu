@@ -4,7 +4,6 @@
  * Shared APR reactor helpers.
  */
 
-#define AMPR_EMU_CORE_IMPL 1
 #include "ampr_emu_apr_reactor_common.h"
 #include "ampr_emu_log.h"
 

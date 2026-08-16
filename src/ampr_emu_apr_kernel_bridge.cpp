@@ -4,12 +4,10 @@
  * APR libkernel hook bridge entrypoints.
  */
 
-#define AMPR_EMU_CORE_IMPL 1
 #include "ampr_emu_apr_reactor.h"
 #include "ampr_emu_apr_services.h"
 #include "ampr_emu_command_buffer_types.h"
 #include "ampr_emu_errno.h"
-#include "ampr_emu_index.h"
 #include "ampr_emu_kernel_lookup.h"
 #include "ampr_emu_log.h"
 #include "ampr_libkernel_hook.h"
@@ -333,15 +331,3 @@ extern "C" int sceKernelWaitCommandBufferCompletion_emul(SceAprSubmitId id) {
                              kAmprLibkernelHook_sceKernelWaitCommandBufferCompletion,
                              "generic-wait");
 }
-
-namespace sce::Ampr::Emu {
-
-void prewarmAprSubmitRuntime() {
-    startDebugLogWriter();
-    amprFlushLibkernelHookLog();
-    ampr_index_ensure_app0_index_before_apr_resolve_hook();
-    ampr_index_prewarm_runtime_state();
-    (void)apr_reactor_prestart();
-}
-
-} // namespace sce::Ampr::Emu

@@ -142,10 +142,6 @@ inline uint32_t debugLogThreadTag() {
     return tag;
 }
 
-uint32_t debugLogCurrentThreadTag() {
-    return debugLogThreadTag();
-}
-
 inline void debugLogFormatEventTime(char* out, size_t outSize) {
     if (!out || outSize == 0) {
         return;
@@ -167,31 +163,6 @@ inline void debugLogFormatEventTime(char* out, size_t outSize) {
     }
 
     snprintf(out, outSize, "%s.%06lldZ", date, static_cast<long long>(now.tv_usec));
-}
-
-inline size_t debugLogAppendNewline(char* line, size_t pos, size_t lineSize) {
-    if (!line || lineSize == 0) {
-        return 0;
-    }
-    if (lineSize == 1u) {
-        line[0] = '\0';
-        return 0;
-    }
-    if (pos >= lineSize - 1u) {
-        pos = lineSize - 2u;
-    }
-    line[pos++] = '\n';
-    line[pos] = '\0';
-    return pos;
-}
-
-inline size_t debugLogAppendSnprintfResult(size_t pos, size_t lineSize, int result) {
-    if (result <= 0 || pos >= lineSize) {
-        return pos;
-    }
-    const size_t available = lineSize - pos;
-    const size_t written = static_cast<size_t>(result);
-    return pos + (written < available ? written : available - 1u);
 }
 
 inline int debugLogKernelOpen(const char* path, int flags, SceKernelMode mode) {
@@ -718,116 +689,6 @@ inline bool debugLogEnqueueBody(const char* body,
 #endif
 }
 
-inline bool debugLogEnqueueFormatV(const char* fmt,
-                                   va_list args,
-                                   bool critical,
-                                   uint64_t* outSequence,
-                                   bool* outCritical) {
-    if (!fmt || !*fmt || !getDebugLogEnabled()) {
-        return false;
-    }
-    if (outSequence) {
-        *outSequence = 0;
-    }
-    if (outCritical) {
-        *outCritical = false;
-    }
-#if AMPR_EMU_DEBUG_LOG_LOSSLESS
-    uint32_t fullSpins = 0;
-    for (;;) {
-        auto& state = debugLogState();
-        const uint32_t threadTag = debugLogThreadTag();
-        if (!debugLogTryLockQueue(state)) {
-            return false;
-        }
-        if (state.shutdownRequested.load(std::memory_order_acquire) ||
-            !state.enabled.load(std::memory_order_relaxed)) {
-            debugLogUnlockQueue(state);
-            return false;
-        }
-        const bool wakeWriter = state.queueCount == 0;
-        debugLogQueueStartupInfoLocked(state, threadTag);
-        const uint64_t seq = state.sequence.fetch_add(1u, std::memory_order_relaxed) + 1u;
-        AmprDebugLogEntry* entry = debugLogReserveLocked(state, seq, threadTag, false);
-        if (!entry) {
-            state.sequence.fetch_sub(1u, std::memory_order_relaxed);
-            if (!debugLogCanWaitForQueueSpaceLocked(state)) {
-                ++state.droppedLines;
-                debugLogUnlockQueue(state);
-                return false;
-            }
-#if AMPR_EMU_DEBUG_LOG_LOSSLESS_SPIN_LIMIT
-            if (++fullSpins >= static_cast<uint32_t>(AMPR_EMU_DEBUG_LOG_LOSSLESS_SPIN_LIMIT)) {
-                ++state.droppedLines;
-                debugLogUnlockQueue(state);
-                return false;
-            }
-#endif
-            debugLogUnlockQueue(state);
-            __builtin_ia32_pause();
-            continue;
-        }
-        const int written = vsnprintf(entry->text, sizeof(entry->text), fmt, args);
-        if (written <= 0) {
-            debugLogDropReservedTailLocked(state);
-            debugLogUnlockQueue(state);
-            return false;
-        }
-        entry->text[sizeof(entry->text) - 1u] = '\0';
-        entry->critical = critical;
-        debugLogUnlockQueue(state);
-        if (wakeWriter) {
-            debugLogSignalWriter(state);
-        }
-        if (outSequence) {
-            *outSequence = seq;
-        }
-        if (outCritical) {
-            *outCritical = critical;
-        }
-        return true;
-    }
-#else
-    auto& state = debugLogState();
-    const uint32_t threadTag = debugLogThreadTag();
-    if (!debugLogTryLockQueue(state)) {
-        return false;
-    }
-    if (state.shutdownRequested.load(std::memory_order_acquire) ||
-        !state.enabled.load(std::memory_order_relaxed)) {
-        debugLogUnlockQueue(state);
-        return false;
-    }
-    const bool wakeWriter = state.queueCount == 0;
-    debugLogQueueStartupInfoLocked(state, threadTag);
-    const uint64_t seq = state.sequence.fetch_add(1u, std::memory_order_relaxed) + 1u;
-    AmprDebugLogEntry* entry = debugLogReserveLocked(state, seq, threadTag, false);
-    if (!entry) {
-        debugLogUnlockQueue(state);
-        return false;
-    }
-    const int written = vsnprintf(entry->text, sizeof(entry->text), fmt, args);
-    if (written <= 0) {
-        debugLogDropReservedTailLocked(state);
-        debugLogUnlockQueue(state);
-        return false;
-    }
-    entry->text[sizeof(entry->text) - 1u] = '\0';
-    entry->critical = critical;
-    debugLogUnlockQueue(state);
-    if (wakeWriter) {
-        debugLogSignalWriter(state);
-    }
-    if (outSequence) {
-        *outSequence = seq;
-    }
-    if (outCritical) {
-        *outCritical = critical;
-    }
-    return true;
-#endif
-}
-
 void shutdownDebugLog() {
     auto& state = debugLogState();
     while (!debugLogTryLockLifecycle(state)) {
@@ -867,25 +728,6 @@ void debugLogLine(const char* rawLine) {
     uint64_t sequence = 0;
     bool critical = false;
     const bool queued = debugLogEnqueueBody(rawLine, false, &sequence, &critical);
-    inLogger = false;
-    if (queued) {
-        debugLogWaitForCriticalFlush(sequence, critical);
-    }
-}
-
-void debugLogCriticalLine(const char* rawLine) {
-    static thread_local bool inLogger = false;
-    if (!rawLine || !*rawLine || !getDebugLogEnabled()) {
-        return;
-    }
-    if (inLogger) {
-        return;
-    }
-    inLogger = true;
-    debugLogKernelOutLine(rawLine, true);
-    uint64_t sequence = 0;
-    bool critical = false;
-    const bool queued = debugLogEnqueueBody(rawLine, true, &sequence, &critical);
     inLogger = false;
     if (queued) {
         debugLogWaitForCriticalFlush(sequence, critical);

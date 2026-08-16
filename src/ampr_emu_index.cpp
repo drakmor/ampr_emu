@@ -115,10 +115,6 @@ static FileIndexState* file_index_state_create() {
 static FileIndexState& file_index_state() { return *file_index_state_create(); }
 } // namespace
 
-void ampr_index_prewarm_runtime_state() {
-    ampr_fd_cache_prewarm_runtime_state();
-}
-
 static constexpr const char* kAmprApp0Root = "/app0";
 static constexpr const char* kAmprApp0IndexPath = "/app0/ampr_emu.index";
 static constexpr const char* kAmprApp0IndexTempPath = "/app0/ampr_emu.index.tmp";
@@ -1785,11 +1781,6 @@ static bool app0_file_hook_should_try_index_fallback(int directRc) {
         err = directRc < 0 ? -directRc : directRc;
     }
     return err == ENOENT || err == ENOTDIR;
-}
-
-void ampr_index_ensure_app0_index_before_apr_resolve_hook() {
-    auto& idx = file_index_state();
-    (void)ensure_app0_index_ready(idx, AMPR_EMU_APP0_INDEX_AUTOBUILD != 0);
 }
 
 // Retry failed /app0 path operations with the canonical indexed spelling.

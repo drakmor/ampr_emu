@@ -140,10 +140,6 @@ namespace sce::Ampr {
 
 // Common packed AMM/APR command encode/decode helpers.
 
-bool ampr_valid_wait_compare(WaitCompare c) {
-    return (uint32_t)c <= 6u;
-}
-
 bool ampr_valid_wait_flush(WaitFlush f) {
     switch (f) {
         case WaitFlush::kDisable:
@@ -154,8 +150,17 @@ bool ampr_valid_wait_flush(WaitFlush f) {
     }
 }
 
-bool ampr_valid_u64_addr(const volatile uint64_t* p) {
-    return p && (((uintptr_t)p & 7u) == 0);
+bool ampr_set_marker_text(Op& op, const char* text) {
+    if (!text) {
+        return false;
+    }
+    const size_t length = std::strlen(text);
+    if (length >= UINT32_MAX) {
+        return false;
+    }
+    op.text = text;
+    op.textLength = static_cast<uint32_t>(length);
+    return true;
 }
 
 int ampr_op_size_bytes_checked(const Op& op, uint32_t* outBytes);
@@ -223,41 +228,35 @@ static uint32_t ampr_marker_type(const Op& op) {
     return withColor ? 6u : 2u;
 }
 
-static uint32_t ampr_marker_dwords(uint32_t markerType, uint32_t lenWithNul) {
+struct AmprMarkerLayout {
+    uint32_t dwords{};
+    uint32_t commandCount{};
+};
+
+static AmprMarkerLayout ampr_marker_layout(uint32_t markerType, uint32_t lenWithNul) {
     const uint32_t firstPayloadBytes = 4u * (markerType < 5u) + 56u;
     const uint32_t firstDwords = (firstPayloadBytes >> 2) + (markerType >= 5u ? 1u : 0u) + 1u;
     if (lenWithNul <= firstPayloadBytes) {
-        return ((lenWithNul + 3u) >> 2) + (markerType >= 5u ? 1u : 0u) + 1u;
+        return {
+            ((lenWithNul + 3u) >> 2) + (markerType >= 5u ? 1u : 0u) + 1u,
+            1u,
+        };
     }
 
-    uint32_t dwords = firstDwords;
+    AmprMarkerLayout layout{firstDwords, 1u};
     for (uint32_t remaining = lenWithNul - firstPayloadBytes; remaining != 0u; ) {
         const uint32_t chunk = remaining < 60u ? remaining : 60u;
-        dwords += ((chunk + 3u) >> 2) + 1u;
+        layout.dwords += ((chunk + 3u) >> 2) + 1u;
+        ++layout.commandCount;
         remaining -= chunk;
     }
-    return dwords;
-}
-
-static uint32_t ampr_marker_command_count(uint32_t markerType, uint32_t lenWithNul) {
-    const uint32_t firstPayloadBytes = 4u * (markerType < 5u) + 56u;
-    if (lenWithNul <= firstPayloadBytes) {
-        return 1u;
-    }
-
-    uint32_t count = 1u;
-    for (uint32_t remaining = lenWithNul - firstPayloadBytes; remaining != 0u; ) {
-        const uint32_t chunk = remaining < 60u ? remaining : 60u;
-        ++count;
-        remaining -= chunk;
-    }
-    return count;
+    return layout;
 }
 
 uint32_t ampr_native_op_command_count(const Op& op) {
     if (op.type == OpType::MarkerSet || op.type == OpType::MarkerPush) {
         const uint32_t lenWithNul = op.textLength + 1u;
-        return ampr_marker_command_count(ampr_marker_type(op), lenWithNul);
+        return ampr_marker_layout(ampr_marker_type(op), lenWithNul).commandCount;
     }
     return 1u;
 }
@@ -296,7 +295,7 @@ static uint32_t ampr_op_size_bytes(const Op& op) {
         case OpType::MarkerSet:
         case OpType::MarkerPush: {
             const uint32_t lenWithNul = op.textLength + 1u;
-            return ampr_marker_dwords(ampr_marker_type(op), lenWithNul) * 4u;
+            return ampr_marker_layout(ampr_marker_type(op), lenWithNul).dwords * 4u;
         }
         case OpType::MarkerPop:
             return 4u;

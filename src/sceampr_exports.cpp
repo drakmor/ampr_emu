@@ -3,18 +3,19 @@
  */
 
 // C exports for the emulated libSceAmpr PRX.
-#include <cstdarg>
-#include <cstdio>
 #include <cstdint>
 #include <cstddef>
 #include <new>
 #include "ampr.h"
 #include "ampr_emu_config.h"
 #include "ampr_debug_log.h"
-#include "ampr_emu_extra.h"
+#include "ampr_emu_log.h"
 #include "ampr_emu_amm.h"
 #include "ampr_emu_apr_reactor.h"
+#include "ampr_emu_command_buffer_apr.h"
+#include "ampr_emu_command_buffer_common.h"
 #include "ampr_emu_command_buffer_types.h"
+#include "ampr_emu_command_packing.h"
 #include "ampr_emu_measure_commands.h"
 #include "ampr_libkernel_hook.h"
 
@@ -38,11 +39,6 @@ int module_stop(size_t args, const void* argp) {
     sce::Ampr::Emu::shutdownDebugLog();
     return rc;
 }
-}
-
-namespace sce::Ampr::Emu {
-int aprValidateMapBeginArgs(uint64_t va, uint64_t size, int type, int prot);
-int aprValidateMapDirectBeginArgs(uint64_t va, uint64_t dmemOffset, uint64_t size, int type, int prot);
 }
 
 /*
@@ -70,7 +66,7 @@ int aprValidateMapDirectBeginArgs(uint64_t va, uint64_t dmemOffset, uint64_t siz
  *     packing/measurement to SDK/libkernel writer helpers when possible. Submit
  *     exports forward the already packed indirect buffer to the kernel mapper.
  *   - sceAmprAprCommandBuffer* appends APR read/map/scatter-gather records.
- *     APR execution is emulated in src/ampr_emu_core.cpp through SDK AIO and
+ *     APR execution is emulated in src/ampr_emu_apr_reactor.cpp through SDK AIO and
  *     the APR index; the export layer only validates retail argument ranges
  *     and records the requested operation.
  *   - sceAmprMeasure* mirrors the SDK static-wrapper measurements. They return
@@ -80,38 +76,7 @@ int aprValidateMapDirectBeginArgs(uint64_t va, uint64_t dmemOffset, uint64_t siz
  *     width bits, so do not collapse them without checking the reference dumps.
  */
 
-#if AMPR_EMU_DEBUG_LOG
-[[maybe_unused]] static inline void ampr_export_log(const char* s) {
-    sce::Ampr::Emu::debugLogLine(s);
-}
-
-[[maybe_unused]] static inline void ampr_export_logf(const char* fmt, ...) {
-    if (!fmt || !*fmt || !sce::Ampr::Emu::getDebugLogEnabled()) {
-        return;
-    }
-    char buf[640]{};
-    va_list args;
-    va_start(args, fmt);
-    (void)::vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    ampr_export_log(buf);
-}
-#else
-#define ampr_export_log(s) ((void)0)
-#define ampr_export_logf(...) ((void)0)
-#endif
-
-#if AMPR_EMU_DEBUG_LOG && AMPR_EMU_DEBUG_LOG_TRACE
-#define ampr_export_vlogf(...) ampr_export_logf(__VA_ARGS__)
-#else
-#define ampr_export_vlogf(...) ((void)0)
-#endif
-
-#if AMPR_EMU_DEBUG_LOG && AMPR_EMU_DEBUG_LOG_TRACE
-#define ampr_export_tlogf(...) ampr_export_logf(__VA_ARGS__)
-#else
-#define ampr_export_tlogf(...) ((void)0)
-#endif
+#define ampr_export_vlogf(...) AMPR_TLOGF(__VA_ARGS__)
 
 static inline void ampr_flush_hook_log_from_export() {
     amprFlushLibkernelHookLog();
@@ -122,164 +87,25 @@ static inline int64_t ampr_export_rc32(int64_t rc) {
 }
 
 #define AMPR_EXPORT __declspec(dllexport)
-#include <cstring>
 
-static inline uint64_t ampr_marker_size(unsigned int n5, const char *a2) {
-    // computes marker command size in uint32 words.
-    int v2 = (int)std::strlen(a2) + 1;
-    int v3 = 4 * (n5 < 5) + 56;
-    int v4 = 1 - ((int)(n5 < 5) - 1);
-    if (v2 <= v3) {
-        return (uint64_t)(v4 + (unsigned int)(((uint64_t)(v2 + 3)) >> 2));
-    }
-    uint64_t result = (unsigned int)(v3 >> 2) + (unsigned int)v4;
-    bool v6 = v2 <= v3;
-    for (unsigned int i = (unsigned int)(v2 - v3); !v6; ) {
-        int n60 = 60;
-        if (i < 0x3C) n60 = (int)i;
-        v6 = (int)i <= n60;
-        result = (unsigned int)result + ((unsigned int)(n60 + 3) >> 2) + 1;
-        i -= (unsigned int)n60;
-    }
-    return result;
+static int64_t ampr_measure_op(const Op& op) {
+    uint32_t bytes = 0;
+    const int rc = sce::Ampr::ampr_op_size_bytes_checked(op, &bytes);
+    return rc == 0 ? static_cast<int64_t>(bytes) : ampr_export_rc32(rc);
 }
 
-static inline int64_t ampr_measure_marker_bytes(unsigned int n5, const char *msg) {
-    if (!msg) return ampr_export_rc32(SCE_KERNEL_ERROR_EINVAL);
-    return (int64_t)(4 * ampr_marker_size(n5, msg));
+static int64_t ampr_measure_marker(OpType type, const char* msg, bool withColor) {
+    Op op{};
+    op.type = type;
+    op.u32b = withColor ? 1u : 0u;
+    if (!sce::Ampr::ampr_set_marker_text(op, msg)) {
+        return ampr_export_rc32(SCE_KERNEL_ERROR_EINVAL);
+    }
+    return ampr_measure_op(op);
 }
 
-static constexpr uint64_t kAmprRefVaMin = 0ull;
-static constexpr uint64_t kAmprRefVaMax = 0xF00000000000ull;
-static constexpr uint64_t kAmprRefAprReadMax = 0x100000000ull;
-static constexpr uint64_t kAmprRefAprOffsetMax = 0x10000000000ull;
-
-static inline int64_t ampr_ref_validate_user_range(uint64_t buffer, uint64_t length) {
-    if (length == 0 || length > kAmprRefAprReadMax) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    if (buffer < kAmprRefVaMin || buffer > kAmprRefVaMax || length > (kAmprRefVaMax - buffer)) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
-}
-
-static inline bool ampr_ref_valid_wait_address(uint64_t address) {
-    return (address & 7ull) == 0ull &&
-           address <= kAmprRefVaMax &&
-           8ull <= (kAmprRefVaMax - address);
-}
-
-static inline bool ampr_ref_valid_write_address(uint64_t address) {
-    return address != 0ull && ampr_ref_valid_wait_address(address);
-}
-
-static inline int64_t ampr_ref_validate_wait_address_04_00(uint64_t address, uint32_t compare, uint32_t flush) {
-    if (address == 0 || !ampr_ref_valid_wait_address(address) || compare >= 7u || flush >= 2u) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
-}
-
-static inline int64_t ampr_ref_validate_wait_address(uint64_t address, uint32_t compare, uint32_t flush) {
-    if (!ampr_ref_valid_wait_address(address) || compare >= 4u || flush >= 2u) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
-}
-
-static inline int64_t ampr_ref_validate_wait_counter_04_00(uint32_t valueWidth,
-                                                           uint32_t compare,
-                                                           uint32_t extraFlag,
-                                                           uint32_t flush) {
-    if (valueWidth >= 8u || compare >= 7u || extraFlag >= 2u || flush >= 2u) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
-}
-
-static inline int64_t ampr_ref_validate_wait_counter(uint32_t counterIndex, uint32_t compare, uint32_t flush) {
-    if (counterIndex >= 0x80u || compare >= 4u || flush >= 2u) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
-}
-
-static inline int64_t ampr_ref_validate_write_address(uint64_t address, uint32_t mode, uint64_t value) {
-    if (!ampr_ref_valid_write_address(address)) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    switch (mode) {
-        case 0u:
-            return 0;
-        case 1u:
-            return value == 0 ? 0 : SCE_KERNEL_ERROR_EINVAL;
-        case 2u:
-            return value < 0x100ull ? 0 : SCE_KERNEL_ERROR_EINVAL;
-        case 3u:
-            return (value < 0x100ull && (value & 1ull) == 0ull) ? 0 : SCE_KERNEL_ERROR_EINVAL;
-        default:
-            return SCE_KERNEL_ERROR_EINVAL;
-    }
-}
-
-static inline int64_t ampr_ref_validate_write_counter_04_00(uint32_t counterIndex,
-                                                            uint32_t valueWidth,
-                                                            uint32_t counterMode) {
-    if (counterIndex >= 0x80u || valueWidth >= 8u || counterMode >= 5u) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
-}
-
-static inline int64_t ampr_ref_validate_write_counter(uint32_t counterIndex) {
-    return counterIndex < 0x80u ? 0 : SCE_KERNEL_ERROR_EINVAL;
-}
-
-static inline int64_t ampr_ref_validate_nop_measure(uint32_t numU32) {
-    return (numU32 >= 1u && numU32 <= 16u) ? 0 : SCE_KERNEL_ERROR_EINVAL;
-}
-
-static inline int64_t ampr_ref_validate_read_file(uint64_t buffer,
-                                                  int64_t length,
-                                                  uint32_t fileId,
-                                                  uint64_t offset) {
-    (void)fileId;
-    int64_t rc = ampr_ref_validate_user_range(buffer, (uint64_t)length);
-    if (rc != 0) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    if (offset >= kAmprRefAprOffsetMax) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
-}
-
-static inline int64_t ampr_ref_validate_read_file_gather(int64_t length, uint64_t offset) {
-    if (length <= 0 || (uint64_t)length > kAmprRefAprReadMax) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    if (offset >= kAmprRefAprOffsetMax) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
-}
-
-static inline int64_t ampr_ref_validate_read_file_scatter(uint64_t buffer, int64_t length) {
-    return ampr_ref_validate_user_range(buffer, (uint64_t)length);
-}
-
-static inline int64_t ampr_ref_validate_read_file_gather_scatter(uint64_t buffer,
-                                                                 int64_t length,
-                                                                 uint64_t offset) {
-    int64_t rc = ampr_ref_validate_user_range(buffer, (uint64_t)length);
-    if (rc != 0) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    if (offset >= kAmprRefAprOffsetMax) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
+static int64_t ampr_measure_einval() {
+    return ampr_export_rc32(SCE_KERNEL_ERROR_EINVAL);
 }
 
 extern "C" AMPR_EXPORT int64_t sceAmprAmmCommandBufferConstructor(sce::Ampr::AmmCommandBuffer* self) {
@@ -1028,11 +854,15 @@ extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWaitOnAddress_04_00(vola
                                                                             uint64_t refValue,
                                                                             sce::Ampr::WaitCompare compare,
                                                                             sce::Ampr::WaitFlush flush) {
-    const int64_t rc = ampr_ref_validate_wait_address_04_00((uint64_t)address, (uint32_t)compare, (uint32_t)flush);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_u64_wait_addr_04_00(reinterpret_cast<uint64_t>(address)) ||
+        !sce::Ampr::ampr_valid_wait_compare_04_00(compare) ||
+        !sce::Ampr::ampr_valid_wait_flush(flush)) {
+        return ampr_measure_einval();
     }
-    return ((refValue >> 32) == 0) ? (int64_t)(4 * (unsigned int)(refValue != 0) + 8) : 16;
+    Op op{};
+    op.type = OpType::WaitOnAddress;
+    op.u64a = refValue;
+    return ampr_measure_op(op);
 }
 
 
@@ -1041,11 +871,15 @@ extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWaitOnAddress(volatile u
                                                                       uint64_t refValue,
                                                                       sce::Ampr::WaitCompare compare,
                                                                       sce::Ampr::WaitFlush flush) {
-    const int64_t rc = ampr_ref_validate_wait_address((uint64_t)address, (uint32_t)compare, (uint32_t)flush);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_u64_wait_addr(reinterpret_cast<uint64_t>(address)) ||
+        !sce::Ampr::ampr_valid_wait_compare_modern(compare) ||
+        !sce::Ampr::ampr_valid_wait_flush(flush)) {
+        return ampr_measure_einval();
     }
-    return ((refValue >> 32) == 0) ? (int64_t)(4 * (unsigned int)(refValue != 0) + 8) : 16;
+    Op op{};
+    op.type = OpType::WaitOnAddress;
+    op.u64a = refValue;
+    return ampr_measure_op(op);
 }
 
 
@@ -1057,33 +891,22 @@ extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWaitOnCounter_04_00(uint
                                                                             uint8_t legacyExtraFlag,
                                                                             uint64_t legacyExtraValue,
                                                                             uint8_t flush) {
-    (void)counterIndex;
-    const int64_t rc = ampr_ref_validate_wait_counter_04_00(valueWidth, compare, legacyExtraFlag, flush);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_wait_counter_04_00(
+            valueWidth,
+            static_cast<sce::Ampr::WaitCompare>(compare),
+            legacyExtraFlag,
+            static_cast<sce::Ampr::WaitFlush>(flush))) {
+        return ampr_measure_einval();
     }
-    uint8_t n8 = valueWidth;
-    uint64_t n0xFFFF = refValue;
-    uint8_t n2_1 = legacyExtraFlag;
-    uint64_t n0xFFFF_1 = legacyExtraValue;
-
-    if (n8 == 1 && n0xFFFF <= 0xFF && n2_1 == 0) return 4;
-
-    if (n0xFFFF > 0xFFFF) {
-        uint64_t hi1 = n0xFFFF_1 >> 32;
-        if ((n0xFFFF >> 32) != 0 || (hi1 != 0 && n2_1 != 0))
-            return (int64_t)(8 * (unsigned int)(n2_1 != 0) + 12);
-        return (int64_t)(4 * (unsigned int)(n2_1 != 0) + 8);
-    }
-
-    // Extended legacy form.
-    if (n2_1 && n0xFFFF_1 >= 0x10000ULL) {
-        if ((n0xFFFF_1 >> 32) != 0)
-            return (int64_t)(8 * (unsigned int)(n2_1 != 0) + 12);
-        return (int64_t)(4 * (unsigned int)(n2_1 != 0) + 8);
-    }
-
-    return 8;
+    Op op{};
+    op.type = OpType::WaitOnCounter;
+    op.u8a = counterIndex;
+    op.u8b = valueWidth;
+    op.u64a = refValue;
+    op.u64b = legacyExtraValue;
+    op.u32c = (static_cast<uint32_t>(flush) & 1u) |
+              ((static_cast<uint32_t>(legacyExtraFlag) & 3u) << 8);
+    return ampr_measure_op(op);
 }
 
 
@@ -1092,91 +915,88 @@ extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWaitOnCounter(uint8_t co
                                                                       uint32_t refValue,
                                                                       sce::Ampr::WaitCompare compare,
                                                                       sce::Ampr::WaitFlush flush) {
-    const int64_t rc = ampr_ref_validate_wait_counter(counterIndex, (uint32_t)compare, (uint32_t)flush);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_wait_counter_modern(counterIndex, compare, flush)) {
+        return ampr_measure_einval();
     }
-    return (int64_t)(4 * (unsigned int)(refValue >= 0x100) + 4);
+    Op op{};
+    op.type = OpType::WaitOnCounter;
+    op.u8a = counterIndex;
+    op.u8b = 1u;
+    op.u64a = refValue;
+    op.u32c = static_cast<uint32_t>(flush) & 1u;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteAddress_04_00(volatile uint64_t* address, uint64_t value) {
-    const int64_t rc = ampr_ref_validate_write_address((uint64_t)address, 0u, value);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_u64_write_addr(reinterpret_cast<uint64_t>(address))) {
+        return ampr_measure_einval();
     }
-    return ((value >> 34) == 0) ? (int64_t)(4 * (unsigned int)(value >= 4) + 8) : 16;
+    Op op{};
+    op.type = OpType::WriteAddress;
+    op.u64a = value;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteAddressOnCompletion(volatile uint64_t* address, uint64_t value) {
-    const int64_t rc = ampr_ref_validate_write_address((uint64_t)address, 0u, value);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
-    }
-    return ((value >> 34) == 0) ? (int64_t)(4 * (unsigned int)(value >= 4) + 8) : 16;
+    return sceAmprMeasureCommandSizeWriteAddress_04_00(address, value);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteAddressFromTimeCounter_04_00(volatile uint64_t* address) {
-    const int64_t rc = ampr_ref_validate_write_address((uint64_t)address, 1u, 0);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_u64_write_addr(reinterpret_cast<uint64_t>(address))) {
+        return ampr_measure_einval();
     }
-    return 8;
+    Op op{};
+    op.type = OpType::WriteAddressFromTimeCounter;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteAddressFromTimeCounterOnCompletion(volatile uint64_t* address) {
-    const int64_t rc = ampr_ref_validate_write_address((uint64_t)address, 1u, 0);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
-    }
-    return 8;
+    return sceAmprMeasureCommandSizeWriteAddressFromTimeCounter_04_00(address);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteAddressFromCounter_04_00(volatile uint64_t* address, uint8_t counterIndex) {
-    const int64_t rc = ampr_ref_validate_write_address((uint64_t)address, 2u, counterIndex);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_u64_write_addr(reinterpret_cast<uint64_t>(address))) {
+        return ampr_measure_einval();
     }
-    return (int64_t)(4 * (unsigned int)(counterIndex >= 4) + 8);
+    Op op{};
+    op.type = OpType::WriteAddressFromCounter;
+    op.u8a = counterIndex;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteAddressFromCounterOnCompletion(volatile uint64_t* address, uint8_t counterIndex) {
-    const int64_t rc = ampr_ref_validate_write_address((uint64_t)address, 2u, counterIndex);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
-    }
-    return (int64_t)(4 * (unsigned int)(counterIndex >= 4) + 8);
+    return sceAmprMeasureCommandSizeWriteAddressFromCounter_04_00(address, counterIndex);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteAddressFromCounterPair_04_00(volatile uint64_t* address, uint8_t counterIndex) {
-    const int64_t rc = ampr_ref_validate_write_address((uint64_t)address, 3u, counterIndex);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_u64_write_addr(reinterpret_cast<uint64_t>(address)) ||
+        (counterIndex & 1u) != 0u) {
+        return ampr_measure_einval();
     }
-    return (int64_t)(4 * (unsigned int)(counterIndex >= 4) + 8);
+    Op op{};
+    op.type = OpType::WriteAddressFromCounterPair;
+    op.u8a = counterIndex;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteAddressFromCounterPairOnCompletion(volatile uint64_t* address, uint8_t counterIndex) {
-    const int64_t rc = ampr_ref_validate_write_address((uint64_t)address, 3u, counterIndex);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
-    }
-    return (int64_t)(4 * (unsigned int)(counterIndex >= 4) + 8);
+    return sceAmprMeasureCommandSizeWriteAddressFromCounterPair_04_00(address, counterIndex);
 }
 
 
@@ -1185,104 +1005,137 @@ extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteCounter_04_00(uint8
                                                                            uint8_t valueWidth,
                                                                            uint64_t value,
                                                                            uint8_t counterMode) {
-    const int64_t rc = ampr_ref_validate_write_counter_04_00(counterIndex, valueWidth, counterMode);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_write_counter_04_00(counterIndex, valueWidth, counterMode)) {
+        return ampr_measure_einval();
     }
-    const uint32_t bits = valueWidth == 0 ? 64u : (valueWidth == 1 ? 32u : (valueWidth < 4 ? 16u : 8u));
-    const uint64_t masked = bits >= 64u ? value : (value & ((1ull << bits) - 1ull));
-    const uint32_t wideDwords = ((masked >> 32) != 0) ? 3u : 2u;
-    const uint32_t dwords = (((((uint32_t)valueWidth & 7u) ^ 1u) | ((uint32_t)counterMode & 7u)) != 0 || masked >= 0x1000ull) ? wideDwords : 1u;
-    return (int64_t)(dwords * 4u);
+    Op op{};
+    op.type = OpType::WriteCounter;
+    op.u8a = counterIndex;
+    op.u8b = valueWidth;
+    op.u64a = value;
+    op.u32b = counterMode;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteCounterOnCompletion(uint8_t counterIndex, uint32_t value) {
-    const int64_t rc = ampr_ref_validate_write_counter(counterIndex);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (!sce::Ampr::ampr_valid_counter_index_signed7(counterIndex)) {
+        return ampr_measure_einval();
     }
-    return (int64_t)(4 * (unsigned int)(value >= 0x1000) + 4);
+    Op op{};
+    op.type = OpType::WriteCounter;
+    op.u8a = counterIndex;
+    op.u8b = 1u;
+    op.u64a = value;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00(SceKernelEqueue eq, int32_t id, uint64_t data) {
-    (void)eq; (void)id; (void)data;
-    return 20;
+    Op op{};
+    op.type = OpType::WriteEqueue;
+    op.u64b = reinterpret_cast<uintptr_t>(eq);
+    op.u32b = static_cast<uint32_t>(id);
+    op.u64a = data;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion(SceKernelEqueue eq, int32_t id, uint64_t data) {
-    (void)eq; (void)id; (void)data;
-    return 20;
+    return sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00(eq, id, data);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeNop(uint32_t numU32) {
-    const int64_t rc = ampr_ref_validate_nop_measure(numU32);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (numU32 == 0u || numU32 > 16u) {
+        return ampr_measure_einval();
     }
-    return (int64_t)(4 * numU32);
+    Op op{};
+    op.type = OpType::Nop;
+    op.u32a = numU32;
+    return ampr_measure_op(op);
 }
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeNopWithData(uint32_t numU32) {
-    const int64_t rc = ampr_ref_validate_nop_measure(numU32);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (numU32 == 0u || numU32 > 16u) {
+        return ampr_measure_einval();
     }
-    return (int64_t)(4 * numU32);
+    // Retail measures total record dwords here, while append receives payload
+    // dwords and adds the header. Keep that observed ABI distinction explicit.
+    Op op{};
+    op.type = OpType::Nop;
+    op.u32a = numU32 - 1u;
+    op.u32b = 1u;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeReadFile(SceAprFileId fileId, void* buffer, uint64_t length, uint64_t offset) {
-    const int64_t rc = ampr_ref_validate_read_file((uint64_t)buffer, (int64_t)length, fileId, offset);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (sce::Ampr::Emu::aprValidateReadArgs(buffer, length, offset) != 0) {
+        return ampr_measure_einval();
     }
-    return (int64_t)(4 * (unsigned int)((offset >> 32) != 0) + 20);
+    Op op{};
+    op.type = OpType::AprReadFile;
+    op.u32a = static_cast<uint32_t>(fileId);
+    op.ptra = buffer;
+    op.u64a = length;
+    op.u64b = offset;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeReadFileGather(uint64_t length, uint64_t offset) {
-    const int64_t rc = ampr_ref_validate_read_file_gather((int64_t)length, offset);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (sce::Ampr::Emu::aprValidateReadLength(length) != 0 ||
+        sce::Ampr::Emu::aprValidateReadOffset(offset) != 0) {
+        return ampr_measure_einval();
     }
-    return (int64_t)(4 * (unsigned int)(offset >= 0x40000ULL) + 8);
+    Op op{};
+    op.type = OpType::AprReadGather;
+    op.u64a = length;
+    op.u64b = offset;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeReadFileScatter(void* buffer, uint64_t length) {
-    const int64_t rc = ampr_ref_validate_read_file_scatter((uint64_t)buffer, (int64_t)length);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (sce::Ampr::Emu::aprValidateReadArgs(buffer, length, 0) != 0) {
+        return ampr_measure_einval();
     }
-    return 12;
+    Op op{};
+    op.type = OpType::AprReadScatter;
+    op.ptra = buffer;
+    op.u64a = length;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeReadFileGatherScatter(void* buffer, uint64_t length, uint64_t offset) {
-    const int64_t rc = ampr_ref_validate_read_file_gather_scatter((uint64_t)buffer, (int64_t)length, offset);
-    if (rc != 0) {
-        return ampr_export_rc32(rc);
+    if (sce::Ampr::Emu::aprValidateReadArgs(buffer, length, offset) != 0) {
+        return ampr_measure_einval();
     }
-    return (int64_t)(4 * (unsigned int)((offset >> 32) != 0) + 16);
+    Op op{};
+    op.type = OpType::AprReadGatherScatter;
+    op.ptra = buffer;
+    op.u64a = length;
+    op.u64b = offset;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeResetGatherScatterState() {
-    return 4;
+    Op op{};
+    op.type = OpType::AprResetGatherScatter;
+    return ampr_measure_op(op);
 }
 
 
@@ -1295,7 +1148,9 @@ extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeMapBegin(uint64_t va,
     if (rc != 0) {
         return ampr_export_rc32(rc);
     }
-    return 12;
+    Op op{};
+    op.type = OpType::AprMapBegin;
+    return ampr_measure_op(op);
 }
 
 
@@ -1309,13 +1164,17 @@ extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeMapDirectBegin(uint64_t 
     if (rc != 0) {
         return ampr_export_rc32(rc);
     }
-    return 16;
+    Op op{};
+    op.type = OpType::AprMapDirectBegin;
+    return ampr_measure_op(op);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeMapEnd() {
-    return 4;
+    Op op{};
+    op.type = OpType::AprMapEnd;
+    return ampr_measure_op(op);
 }
 
 
@@ -1323,30 +1182,32 @@ extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeMapEnd() {
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeSetMarkerWithColor(const char* msg, uint32_t color) {
     // signature in FW10: (char* msg, int color)
     (void)color;
-    return ampr_measure_marker_bytes(5u, msg);
+    return ampr_measure_marker(OpType::MarkerSet, msg, true);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizeSetMarker(const char* msg) {
-    return ampr_measure_marker_bytes(1u, msg);
+    return ampr_measure_marker(OpType::MarkerSet, msg, false);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizePushMarkerWithColor(const char* msg, uint32_t color) {
     (void)color;
-    return ampr_measure_marker_bytes(6u, msg);
+    return ampr_measure_marker(OpType::MarkerPush, msg, true);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizePushMarker(const char* msg) {
-    return ampr_measure_marker_bytes(2u, msg);
+    return ampr_measure_marker(OpType::MarkerPush, msg, false);
 }
 
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprMeasureCommandSizePopMarker() {
-    return 4;
+    Op op{};
+    op.type = OpType::MarkerPop;
+    return ampr_measure_op(op);
 }

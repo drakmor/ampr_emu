@@ -76,9 +76,8 @@ struct PackedOpView {
 namespace sce::Ampr {
 
 const char* ampr_op_name(OpType type);
-bool ampr_valid_wait_compare(WaitCompare c);
 bool ampr_valid_wait_flush(WaitFlush f);
-bool ampr_valid_u64_addr(const volatile uint64_t* p);
+bool ampr_set_marker_text(Op& op, const char* text);
 int ampr_op_size_bytes_checked(const Op& op, uint32_t* outBytes);
 uint32_t ampr_native_op_command_count(const Op& op);
 int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& op, uint32_t bytes);

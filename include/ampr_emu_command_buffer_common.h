@@ -40,6 +40,22 @@ inline bool cb_op_is_apr_read(OpType type) {
 
 namespace sce::Ampr {
 
+bool ampr_valid_wait_compare_04_00(WaitCompare compare);
+bool ampr_valid_wait_compare_modern(WaitCompare compare);
+bool ampr_valid_u64_wait_addr(uint64_t address);
+bool ampr_valid_u64_wait_addr_04_00(uint64_t address);
+bool ampr_valid_u64_write_addr(uint64_t address);
+bool ampr_valid_counter_index_signed7(uint8_t counterIndex);
+bool ampr_valid_wait_counter_04_00(uint8_t valueWidth,
+                                   WaitCompare compare,
+                                   uint8_t extraFlag,
+                                   WaitFlush flush);
+bool ampr_valid_wait_counter_modern(uint8_t counterIndex,
+                                    WaitCompare compare,
+                                    WaitFlush flush);
+bool ampr_valid_write_counter_04_00(uint8_t counterIndex,
+                                    uint8_t valueWidth,
+                                    uint8_t counterMode);
 int cb_append_with_type_mask(SceAmprCommandBuffer* cb, Op&& op, uint32_t setMask, uint32_t clearMask);
 int cb_append(SceAmprCommandBuffer* cb, Op&& op);
 

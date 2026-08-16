@@ -43,7 +43,6 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\..\src\ampr_debug_log.cpp" />
-    <ClCompile Include="..\..\src\ampr_emu.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_runtime_memory.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_index.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_fd_cache.cpp" />
@@ -55,10 +54,8 @@
     <ClCompile Include="..\..\src\ampr_emu_apr_services.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_apr_kernel_bridge.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_apr_reactor_common.cpp" />
-    <ClCompile Include="..\..\src\ampr_emu_apr_reactor_arena.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_apr_reactor.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_command_packing.cpp" />
-    <ClCompile Include="..\..\src\ampr_emu_core.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_measure_commands.cpp" />
     <ClCompile Include="..\..\src\ampr_libc_internal_link.cpp" />
     <ClCompile Include="..\..\src\sceampr_exports.cpp" />
@@ -71,7 +68,6 @@
     <ClInclude Include="..\..\include\ampr.h" />
     <ClInclude Include="..\..\include\ampr_debug_log.h" />
     <ClInclude Include="..\..\include\ampr_emu_config.h" />
-    <ClInclude Include="..\..\include\ampr_emu_extra.h" />
     <ClInclude Include="..\..\include\ampr_libkernel_hook.h" />
     <ClInclude Include="..\..\include\hde64.h" />
     <ClInclude Include="..\..\include\table64.h" />
@@ -83,7 +79,6 @@
     <ClInclude Include="..\..\include\ampr_emu_command_buffer_types.h" />
     <ClInclude Include="..\..\include\ampr_emu_command_types.h" />
     <ClInclude Include="..\..\include\ampr_emu_errno.h" />
-    <ClInclude Include="..\..\include\ampr_emu_kernel_aio_compat.h" />
     <ClInclude Include="..\..\include\ampr_emu_kernel_amm.h" />
     <ClInclude Include="..\..\include\ampr_emu_kernel_file.h" />
     <ClInclude Include="..\..\include\ampr_emu_kernel_lookup.h" />
@@ -95,7 +90,6 @@
     <ClInclude Include="..\..\include\ampr_emu_measure_commands.h" />
     <ClInclude Include="..\..\include\ampr_emu_apr_reactor.h" />
     <ClInclude Include="..\..\include\ampr_emu_apr_reactor_common.h" />
-    <ClInclude Include="..\..\include\ampr_emu_apr_reactor_arena.h" />
     <ClInclude Include="..\..\include\ampr_emu_command_packing.h" />
     <ClInclude Include="..\..\include\ampr_emu_index.h" />
     <ClInclude Include="..\..\include\ampr_emu_fd_cache.h" />

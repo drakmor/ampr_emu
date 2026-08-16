@@ -55,7 +55,6 @@ struct Job {
     SceAprResultBuffer* aprRes{};
 };
 
-bool apr_reactor_prestart();
 int apr_reactor_shutdown();
 int apr_reactor_wait_synthetic_submit_id(SceAprSubmitId id, bool* outHandled);
 int apr_reactor_submit(const Job& j,

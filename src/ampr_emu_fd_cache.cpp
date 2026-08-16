@@ -371,10 +371,6 @@ static void fd_runtime_note_unpin_locked(FileState& fs, FileState::RuntimeFile& 
 
 } // namespace
 
-void ampr_fd_cache_prewarm_runtime_state() {
-    (void)file_state();
-}
-
 struct FdPressureCaps {
     size_t fdBudget{};
     size_t cacheCap{};
@@ -1278,67 +1274,6 @@ void ampr_index_release_cached_fd_pin(uint32_t fileId) {
     }
 
     fd_cache_close_list(fdsToClose);
-}
-
-int ampr_index_pin_file_id(uint32_t fileId, uint32_t* outPinCount) {
-    if (outPinCount) {
-        *outPinCount = 0;
-    }
-    if (fileId == 0) {
-        return -ENOENT;
-    }
-
-    FdCloseList fdsToClose;
-    int rc = 0;
-    {
-        auto& fs = file_state();
-        AmprLockGuard lk(fs.m);
-        int reclaimedFd = -1;
-        FileState::RuntimeFile* runtime = fd_runtime_create_locked(fs, fileId, &reclaimedFd);
-        if (reclaimedFd >= 0) {
-            fdsToClose.push_back(reclaimedFd);
-        }
-        if (!runtime) {
-            rc = -ENOENT;
-        } else {
-            fd_runtime_note_pin_locked(fs, *runtime);
-            runtime->lastUseTick = fs.tick.fetch_add(1, std::memory_order_relaxed);
-            if (outPinCount) {
-                *outPinCount = runtime->pinCount;
-            }
-        }
-    }
-    fd_cache_close_list(fdsToClose, "pin-reclaim");
-    return rc;
-}
-
-int ampr_index_unpin_file_id(uint32_t fileId, uint32_t* outPinCount) {
-    if (outPinCount) {
-        *outPinCount = 0;
-    }
-    if (fileId == 0) {
-        return -ENOENT;
-    }
-
-    FdCloseList fdsToClose;
-    const uint64_t nowNs = fd_cache_time_now_ns();
-    {
-        auto& fs = file_state();
-        AmprLockGuard lk(fs.m);
-        FileState::RuntimeFile* runtime = fd_runtime_find_locked(fs, fileId);
-        if (!runtime) {
-            return 0;
-        }
-        fd_runtime_note_use_time_locked(*runtime, nowNs);
-        fd_runtime_note_unpin_locked(fs, *runtime);
-        runtime->lastUseTick = fs.tick.fetch_add(1, std::memory_order_relaxed);
-        if (outPinCount) {
-            *outPinCount = runtime->pinCount;
-        }
-        fd_cache_collect_evictions_locked(fdsToClose);
-    }
-    fd_cache_close_list(fdsToClose);
-    return 0;
 }
 
 AmprIndexFdPressureCaps ampr_index_fd_pressure_current_caps() {

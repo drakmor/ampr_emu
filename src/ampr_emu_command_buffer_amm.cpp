@@ -373,10 +373,6 @@ int AmmCommandBuffer::allocatePaForPrt(uint64_t va, uint64_t size, int type, int
         false);
 }
 
-int AmmCommandBuffer::remapIntoPrt(uint64_t vaPrtStart, uint64_t vaOldStart, uint64_t size, int prot) {
-    return remapIntoPrt(vaPrtStart, vaOldStart, size, prot, 1011u);
-}
-
 int AmmCommandBuffer::remapIntoPrt(uint64_t vaPrtStart, uint64_t vaOldStart, uint64_t size, int prot, uint32_t opcode) {
     uint64_t kernelProtValue = 0;
     const int rc = amm_prepare_cpu_visible_kernel_prot_for_cb("AmmRemapIntoPrt", &m_commandBuffer, prot, kernelProtValue);

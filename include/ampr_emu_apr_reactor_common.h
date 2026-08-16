@@ -12,10 +12,11 @@
 #include "ampr_emu_errno.h"
 #include "ampr_emu_fd_cache.h"
 #include "ampr_emu_index.h"
-#include "ampr_emu_kernel_aio_compat.h"
 #include "ampr_emu_kernel_file.h"
 #include "ampr_emu_kernel_lookup.h"
 #include "ampr_emu_kernel_memory.h"
+
+#include <_fs.h>
 
 const char* ampr_log_path_arg(const char* path);
 uint64_t time_counter_now();

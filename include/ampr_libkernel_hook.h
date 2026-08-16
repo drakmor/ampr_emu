@@ -79,7 +79,6 @@ typedef enum AmprLibkernelHookId {
 AMPR_LIBKERNEL_HOOK_EXPORT int amprInstallLibkernelHooks(void);
 AMPR_LIBKERNEL_HOOK_EXPORT int amprUninstallLibkernelHooks(void);
 AMPR_LIBKERNEL_HOOK_EXPORT int amprLibkernelHooksInstalled(void);
-AMPR_LIBKERNEL_HOOK_EXPORT unsigned long long amprLibkernelHookCapabilityMask(void);
 
 #if AMPR_EMU_LIBKERNEL_HOOK_DIAGNOSTICS
 AMPR_LIBKERNEL_HOOK_EXPORT void amprFlushLibkernelHookLog(void);
@@ -96,12 +95,6 @@ static inline int amprFormatLibkernelHookStatus(char*, unsigned long long) { ret
  */
 AMPR_LIBKERNEL_HOOK_EXPORT void* amprResolveLibkernelFunction(const char* symbol);
 
-/*
- * Return the trampoline for a hooked libkernel symbol. Callers use this to
- * forward to the unmodified original implementation from inside *_emul wrappers.
- * Returns nullptr when the symbol is not installed or the hook layer is absent.
- */
-AMPR_LIBKERNEL_HOOK_EXPORT void* amprGetOriginalLibkernelFunction(const char* symbol);
 extern AMPR_LIBKERNEL_HOOK_EXPORT void* g_amprOriginalLibkernelById[kAmprLibkernelHook_Count];
 
 #ifdef __cplusplus

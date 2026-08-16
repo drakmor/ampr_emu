@@ -4,7 +4,6 @@
  * Shared AMM/APR command-buffer API implementation.
  */
 
-#define AMPR_EMU_CORE_IMPL 1
 #include "ampr_emu_command_buffer_types.h"
 #include "ampr_emu_command_buffer_common.h"
 #include "ampr_emu_command_buffer_apr.h"
@@ -12,8 +11,6 @@
 #include "ampr_emu_errno.h"
 #include "ampr_emu_log.h"
 #include "ampr_emu_sync.h"
-
-#include <cstring>
 
 namespace {
 
@@ -32,19 +29,6 @@ static int ampr_reject_completion_write_in_apr_map(SceAmprCommandBuffer* cb) {
         return 0;
     }
     return SCE_KERNEL_ERROR_EPERM;
-}
-
-static bool ampr_set_marker_text(Op& op, const char* text) {
-    if (!text) {
-        return false;
-    }
-    const size_t length = std::strlen(text);
-    if (length >= UINT32_MAX) {
-        return false;
-    }
-    op.text = text;
-    op.textLength = static_cast<uint32_t>(length);
-    return true;
 }
 
 #if AMPR_EMU_DEBUG_LOG && AMPR_EMU_DEBUG_LOG_TRACE
@@ -151,56 +135,57 @@ static void ampr_log_op_detail(const char* phase, const Op& op) {
 #define ampr_log_op_detail(...) ((void)0)
 #endif
 
-static bool ampr_valid_wait_compare_04_00(sce::Ampr::WaitCompare c) {
+} // namespace
+
+namespace sce::Ampr {
+
+bool ampr_valid_wait_compare_04_00(WaitCompare c) {
     return (uint32_t)c <= 6u;
 }
 
-static bool ampr_valid_wait_compare_modern(sce::Ampr::WaitCompare c) {
+bool ampr_valid_wait_compare_modern(WaitCompare c) {
     return (uint32_t)c < 4u;
 }
 
-static bool ampr_valid_u64_wait_addr(uint64_t addr) {
+bool ampr_valid_u64_wait_addr(uint64_t addr) {
     return ((addr & 7ull) == 0ull) && addr <= kRetailVaMax && 8ull <= (kRetailVaMax - addr);
 }
 
-static bool ampr_valid_u64_wait_addr_04_00(uint64_t addr) {
+bool ampr_valid_u64_wait_addr_04_00(uint64_t addr) {
     return addr != 0ull && ampr_valid_u64_wait_addr(addr);
 }
 
-static bool ampr_valid_u64_write_addr(uint64_t addr) {
+bool ampr_valid_u64_write_addr(uint64_t addr) {
     return addr != 0ull && ampr_valid_u64_wait_addr(addr);
 }
 
-static bool ampr_valid_counter_index_signed7(uint8_t counterIndex) {
+bool ampr_valid_counter_index_signed7(uint8_t counterIndex) {
     return (counterIndex & 0x80u) == 0u;
 }
 
-static bool ampr_valid_wait_counter_04_00(uint8_t valueWidth,
-                                          sce::Ampr::WaitCompare eCmp,
-                                          uint8_t extraFlag,
-                                          sce::Ampr::WaitFlush eFlush) {
+bool ampr_valid_wait_counter_04_00(uint8_t valueWidth,
+                                   WaitCompare eCmp,
+                                   uint8_t extraFlag,
+                                   WaitFlush eFlush) {
     return valueWidth < 8u &&
            ampr_valid_wait_compare_04_00(eCmp) &&
            extraFlag < 2u &&
-           sce::Ampr::ampr_valid_wait_flush(eFlush);
+           ampr_valid_wait_flush(eFlush);
 }
 
-static bool ampr_valid_wait_counter_modern(uint8_t counterIndex,
-                                           sce::Ampr::WaitCompare eCmp,
-                                           sce::Ampr::WaitFlush eFlush) {
+bool ampr_valid_wait_counter_modern(uint8_t counterIndex,
+                                    WaitCompare eCmp,
+                                    WaitFlush eFlush) {
     return ampr_valid_counter_index_signed7(counterIndex) &&
            ampr_valid_wait_compare_modern(eCmp) &&
-           sce::Ampr::ampr_valid_wait_flush(eFlush);
+           ampr_valid_wait_flush(eFlush);
 }
 
-static bool ampr_valid_write_counter_04_00(uint8_t counterIndex, uint8_t valueWidth, uint8_t counterMode) {
+bool ampr_valid_write_counter_04_00(uint8_t counterIndex, uint8_t valueWidth, uint8_t counterMode) {
     return ampr_valid_counter_index_signed7(counterIndex) &&
            valueWidth < 8u &&
            counterMode < 5u;
 }
-
-} // namespace
-namespace sce::Ampr {
 
 static void cb_reset_recording_position(SceAmprCommandBuffer& cb) {
     cb.offset = 0;
@@ -459,18 +444,6 @@ int CommandBuffer::writeCounterOnCompletion(uint8_t counterIndex, uint32_t value
     return writeCounter_04_00(counterIndex, (uint8_t)CounterAccessSizeAndOffset::kSize4, value, (uint8_t)eWriteOp, false);
 }
 
-int CommandBuffer::writeCounterImmediately(uint8_t counterIndex, CounterAccessSizeAndOffset eAccessSizeAndOffset, uint64_t value, WriteCounterOperation eWriteOp) {
-    return writeCounter_04_00(counterIndex, (uint8_t)eAccessSizeAndOffset, value, (uint8_t)eWriteOp, true);
-}
-
-int CommandBuffer::writeCounterImmediately(uint8_t counterIndex, uint32_t value, WriteCounterOperation eWriteOp) {
-    return writeCounter_04_00(counterIndex, (uint8_t)CounterAccessSizeAndOffset::kSize4, value, (uint8_t)eWriteOp, true);
-}
-
-int CommandBuffer::writeCounterImmediately(uint8_t counterIndex, uint32_t value) {
-    return writeCounter_04_00(counterIndex, (uint8_t)CounterAccessSizeAndOffset::kSize4, value, (uint8_t)WriteCounterOperation::kStore, true);
-}
-
 int CommandBuffer::writeKernelEventQueue_04_00(SceKernelEqueue eq, int32_t id, uint64_t data, bool atSop) {
     if (!atSop) {
         const int mapRc = ampr_reject_completion_write_in_apr_map(&m_commandBuffer);
@@ -489,10 +462,6 @@ int CommandBuffer::writeKernelEventQueue_04_00(SceKernelEqueue eq, int32_t id, u
 
 int CommandBuffer::writeKernelEventQueueOnCompletion(SceKernelEqueue eq, int32_t id, uint64_t data) {
     return writeKernelEventQueue_04_00(eq, id, data, false);
-}
-
-int CommandBuffer::writeKernelEventQueueImmediately(SceKernelEqueue eq, int32_t id, uint64_t data) {
-    return writeKernelEventQueue_04_00(eq, id, data, true);
 }
 
 int CommandBuffer::writeAddressFromTimeCounter_04_00(volatile uint64_t* address, bool atSop) {
@@ -516,10 +485,6 @@ int CommandBuffer::writeAddressFromTimeCounterOnCompletion(volatile uint64_t* ad
     return writeAddressFromTimeCounter_04_00(address, false);
 }
 
-int CommandBuffer::writeAddressFromTimeCounterImmediately(volatile uint64_t* address) {
-    return writeAddressFromTimeCounter_04_00(address, true);
-}
-
 int CommandBuffer::writeAddressFromCounter_04_00(volatile uint64_t* address, uint8_t counterIndex, bool atSop) {
     if (!ampr_valid_u64_write_addr(reinterpret_cast<uint64_t>(address)) ||
         !ampr_valid_counter_index_signed7(counterIndex)) {
@@ -541,10 +506,6 @@ int CommandBuffer::writeAddressFromCounter_04_00(volatile uint64_t* address, uin
 
 int CommandBuffer::writeAddressFromCounterOnCompletion(volatile uint64_t* address, uint8_t counterIndex) {
     return writeAddressFromCounter_04_00(address, counterIndex, false);
-}
-
-int CommandBuffer::writeAddressFromCounterImmediately(volatile uint64_t* address, uint8_t counterIndex) {
-    return writeAddressFromCounter_04_00(address, counterIndex, true);
 }
 
 int CommandBuffer::writeAddressFromCounterPair_04_00(volatile uint64_t* address, uint8_t counterIndex, bool atSop) {
@@ -571,10 +532,6 @@ int CommandBuffer::writeAddressFromCounterPair_04_00(volatile uint64_t* address,
 
 int CommandBuffer::writeAddressFromCounterPairOnCompletion(volatile uint64_t* address, uint8_t counterIndex) {
     return writeAddressFromCounterPair_04_00(address, counterIndex, false);
-}
-
-int CommandBuffer::writeAddressFromCounterPairImmediately(volatile uint64_t* address, uint8_t counterIndex) {
-    return writeAddressFromCounterPair_04_00(address, counterIndex, true);
 }
 
 int CommandBuffer::nop(uint32_t numU32) {

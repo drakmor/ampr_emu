@@ -74,6 +74,42 @@ int64_t sceAmprAprCommandBufferMapDirectBegin(
     int type,
     int prot);
 int64_t sceAmprAprCommandBufferMapEnd(AprCommandBuffer* cb);
+int64_t sceAmprMeasureCommandSizeWaitOnAddress(
+    volatile uint64_t* address,
+    uint64_t refValue,
+    WaitCompare compare,
+    WaitFlush flush);
+int64_t sceAmprMeasureCommandSizeWaitOnCounter(
+    uint8_t counterIndex,
+    uint32_t refValue,
+    WaitCompare compare,
+    WaitFlush flush);
+int64_t sceAmprMeasureCommandSizeWriteAddressOnCompletion(
+    volatile uint64_t* address,
+    uint64_t value);
+int64_t sceAmprMeasureCommandSizeWriteCounterOnCompletion(
+    uint8_t counterIndex,
+    uint32_t value);
+int64_t sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion(
+    SceKernelEqueue eq,
+    int32_t id,
+    uint64_t data);
+int64_t sceAmprMeasureCommandSizeNop(uint32_t numU32);
+int64_t sceAmprMeasureCommandSizeNopWithData(uint32_t numU32);
+int64_t sceAmprMeasureCommandSizeReadFile(
+    SceAprFileId fileId,
+    void* buffer,
+    uint64_t length,
+    uint64_t offset);
+int64_t sceAmprMeasureCommandSizeReadFileGather(uint64_t length, uint64_t offset);
+int64_t sceAmprMeasureCommandSizeReadFileScatter(void* buffer, uint64_t length);
+int64_t sceAmprMeasureCommandSizeReadFileGatherScatter(
+    void* buffer,
+    uint64_t length,
+    uint64_t offset);
+int64_t sceAmprMeasureCommandSizeSetMarkerWithColor(const char* msg, uint32_t color);
+int64_t sceAmprMeasureCommandSizeSetMarker(const char* msg);
+int64_t sceAmprMeasureCommandSizePopMarker();
 int64_t sceAmprMeasureCommandSizeMapBegin(
     uint64_t va,
     uint64_t size,
@@ -166,6 +202,62 @@ int main() {
                              MeasureAprCommandSize::readFile(Apr::kFileIdInvalid, reinterpret_cast<void*>(0x10000), 0x100000000ull, 0) > 0);
     failures += !expect_true("sceAmprMeasureCommandSizeReadFile.max-valid",
                              sceAmprMeasureCommandSizeReadFile(Apr::kFileIdInvalid, reinterpret_cast<void*>(0x10000), 0x100000000ull, 0) > 0);
+
+    auto* const measureAddress = reinterpret_cast<volatile uint64_t*>(0x10000);
+    failures += !expect_true("measure.waitAddress.small",
+                             sceAmprMeasureCommandSizeWaitOnAddress(
+                                 measureAddress, 0, WaitCompare::kEqual, WaitFlush::kDisable) == 8);
+    failures += !expect_true("measure.waitAddress.medium",
+                             sceAmprMeasureCommandSizeWaitOnAddress(
+                                 measureAddress, 1, WaitCompare::kEqual, WaitFlush::kDisable) == 12);
+    failures += !expect_true("measure.waitAddress.large",
+                             sceAmprMeasureCommandSizeWaitOnAddress(
+                                 measureAddress, 1ull << 32, WaitCompare::kEqual, WaitFlush::kDisable) == 16);
+    failures += !expect_true("measure.waitCounter.small",
+                             sceAmprMeasureCommandSizeWaitOnCounter(
+                                 1, 0xff, WaitCompare::kEqual, WaitFlush::kDisable) == 4);
+    failures += !expect_true("measure.waitCounter.large",
+                             sceAmprMeasureCommandSizeWaitOnCounter(
+                                 1, 0x100, WaitCompare::kEqual, WaitFlush::kDisable) == 8);
+    failures += !expect_true("measure.writeAddress.small",
+                             sceAmprMeasureCommandSizeWriteAddressOnCompletion(measureAddress, 0) == 8);
+    failures += !expect_true("measure.writeAddress.medium",
+                             sceAmprMeasureCommandSizeWriteAddressOnCompletion(measureAddress, 4) == 12);
+    failures += !expect_true("measure.writeAddress.large",
+                             sceAmprMeasureCommandSizeWriteAddressOnCompletion(measureAddress, 1ull << 34) == 16);
+    failures += !expect_true("measure.writeCounter.small",
+                             sceAmprMeasureCommandSizeWriteCounterOnCompletion(1, 0xfff) == 4);
+    failures += !expect_true("measure.writeCounter.large",
+                             sceAmprMeasureCommandSizeWriteCounterOnCompletion(1, 0x1000) == 8);
+    failures += !expect_true("measure.equeue",
+                             sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion(nullptr, 0, 0) == 20);
+    failures += !expect_true("measure.nop.max",
+                             sceAmprMeasureCommandSizeNop(16) == 64);
+    failures += !expect_true("measure.nopWithData.retail-total-dwords",
+                             sceAmprMeasureCommandSizeNopWithData(16) == 64);
+    failures += !expect_true("measure.nopWithData.zero",
+                             static_cast<uint32_t>(sceAmprMeasureCommandSizeNopWithData(0)) ==
+                                 static_cast<uint32_t>(SCE_KERNEL_ERROR_EINVAL));
+    failures += !expect_true("measure.readFile.large-offset",
+                             sceAmprMeasureCommandSizeReadFile(
+                                 Apr::kFileIdInvalid,
+                                 reinterpret_cast<void*>(0x10000),
+                                 0x1000,
+                                 1ull << 32) == 24);
+    failures += !expect_true("measure.readGather.large-offset",
+                             sceAmprMeasureCommandSizeReadFileGather(0x1000, 0x40000) == 12);
+    failures += !expect_true("measure.readScatter",
+                             sceAmprMeasureCommandSizeReadFileScatter(
+                                 reinterpret_cast<void*>(0x10000), 0x1000) == 12);
+    failures += !expect_true("measure.readGatherScatter.large-offset",
+                             sceAmprMeasureCommandSizeReadFileGatherScatter(
+                                 reinterpret_cast<void*>(0x10000), 0x1000, 1ull << 32) == 20);
+    failures += !expect_true("measure.marker",
+                             sceAmprMeasureCommandSizeSetMarker("x") == 8);
+    failures += !expect_true("measure.marker.color",
+                             sceAmprMeasureCommandSizeSetMarkerWithColor("x", 0) == 12);
+    failures += !expect_true("measure.marker.pop",
+                             sceAmprMeasureCommandSizePopMarker() == 4);
     failures += !expect_true("sceAmprMeasureCommandSizeMapBegin",
                              sceAmprMeasureCommandSizeMapBegin(
                                  0x300000,

@@ -23,9 +23,6 @@ static inline T&& ampr_move(T& v) { return static_cast<T&&>(v); }
 template <typename T>
 static inline const T& ampr_min(const T& a, const T& b) { return (a < b) ? a : b; }
 
-template <typename T>
-static inline const T& ampr_max(const T& a, const T& b) { return (a > b) ? a : b; }
-
 static inline void ampr_spin_pause_or_yield(uint32_t& spins) {
     ++spins;
     if (spins < 4096u || (spins & 0xffu) != 0) {

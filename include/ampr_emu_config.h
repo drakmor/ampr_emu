@@ -357,16 +357,11 @@
 #define AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES 4
 #endif
 
-#ifndef AMPR_EMU_APR_SUBMIT_COMMAND_BUFFER_DUMP
-// Deprecated compatibility name for AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP.
+#ifndef AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP
 // Optional submit-time decoded command-buffer dump bitmask:
 //   bit 0 (1) -> dump the original game-visible command buffer
 //   bit 1 (2) -> dump APR source and native micro-submit diagnostics
-#define AMPR_EMU_APR_SUBMIT_COMMAND_BUFFER_DUMP 0
-#endif
-
-#ifndef AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP
-#define AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP AMPR_EMU_APR_SUBMIT_COMMAND_BUFFER_DUMP
+#define AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP 0
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_SLOW_WARN_MS
@@ -410,11 +405,6 @@
 #ifndef AMPR_EMU_APR_AIO_DELETE_RETRY_LIMIT
 // Fallback bound for platforms whose monotonic counter is unavailable.
 #define AMPR_EMU_APR_AIO_DELETE_RETRY_LIMIT 4096u
-#endif
-
-#ifndef AMPR_EMU_APR_AIO_SLOW_WARN_INTERVAL_NS
-// Minimum interval between repeated slow-active AIO diagnostics.
-#define AMPR_EMU_APR_AIO_SLOW_WARN_INTERVAL_NS 1000000000ull
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_SLOW_COOLDOWN_TRIGGER_MS

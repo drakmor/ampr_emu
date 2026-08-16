@@ -52,22 +52,15 @@ public:
     int writeCounterOnCompletion(uint8_t counterIndex, CounterAccessSizeAndOffset eAccessSizeAndOffset, uint64_t value, WriteCounterOperation eWriteOp);
     int writeCounterOnCompletion(uint8_t counterIndex, uint32_t value, WriteCounterOperation eWriteOp);
     int writeCounterOnCompletion(uint8_t counterIndex, uint32_t value);
-    int writeCounterImmediately(uint8_t counterIndex, CounterAccessSizeAndOffset eAccessSizeAndOffset, uint64_t value, WriteCounterOperation eWriteOp);
-    int writeCounterImmediately(uint8_t counterIndex, uint32_t value, WriteCounterOperation eWriteOp);
-    int writeCounterImmediately(uint8_t counterIndex, uint32_t value);
     int writeKernelEventQueue_04_00(SceKernelEqueue eq, int32_t id, uint64_t data, bool atSop);
     int writeKernelEventQueueOnCompletion(SceKernelEqueue eq, int32_t id, uint64_t data);
-    int writeKernelEventQueueImmediately(SceKernelEqueue eq, int32_t id, uint64_t data);
 
     int writeAddressFromTimeCounter_04_00(volatile uint64_t* address, bool atSop);
     int writeAddressFromCounter_04_00(volatile uint64_t* address, uint8_t counterIndex, bool atSop);
     int writeAddressFromCounterPair_04_00(volatile uint64_t* address, uint8_t counterIdxStartAlign2, bool atSop);
     int writeAddressFromTimeCounterOnCompletion(volatile uint64_t* address);
-    int writeAddressFromTimeCounterImmediately(volatile uint64_t* address);
     int writeAddressFromCounterOnCompletion(volatile uint64_t* address, uint8_t counterIndex);
-    int writeAddressFromCounterImmediately(volatile uint64_t* address, uint8_t counterIndex);
     int writeAddressFromCounterPairOnCompletion(volatile uint64_t* address, uint8_t counterIdxStartAlign2);
-    int writeAddressFromCounterPairImmediately(volatile uint64_t* address, uint8_t counterIdxStartAlign2);
 
     int nop(uint32_t num);
     int nop(uint32_t numU32, const uint32_t* aData /*[numU32]*/);
@@ -112,8 +105,6 @@ public:
 
     int mapAsPrt(uint64_t va, uint64_t size);
     int allocatePaForPrt(uint64_t va, uint64_t size, int type, int prot);
-
-    int remapIntoPrt(uint64_t vaPrtStart, uint64_t vaOldStart, uint64_t size, int prot);
 
     // Raw opcode form used by the PRX export layer.
     int remapIntoPrt(uint64_t vaPrtStart, uint64_t vaOldStart, uint64_t size, int prot, uint32_t opcode);

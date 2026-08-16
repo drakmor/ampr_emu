@@ -609,17 +609,6 @@ void store_u64_le(void* dst, uint64_t value) {
     }
 }
 
-bool streq(const char* lhs, const char* rhs) {
-    if (!lhs || !rhs) {
-        return false;
-    }
-    while (*lhs && *rhs && *lhs == *rhs) {
-        ++lhs;
-        ++rhs;
-    }
-    return *lhs == '\0' && *rhs == '\0';
-}
-
 [[maybe_unused]] const char* hook_fail_reason_name(uint8_t reason) {
     switch (reason) {
         case kHookFailNone: return "none";
@@ -2014,10 +2003,6 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprLibkernelHooksInstalled(void) {
     return hooks_installed() ? 1 : 0;
 }
 
-extern "C" AMPR_LIBKERNEL_HOOK_EXPORT unsigned long long amprLibkernelHookCapabilityMask(void) {
-    return static_cast<unsigned long long>(g_hookCapabilityMask);
-}
-
 #if AMPR_EMU_LIBKERNEL_HOOK_DIAGNOSTICS
 extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprFormatLibkernelHookStatus(char* out, unsigned long long outSize) {
     if (!out || outSize == 0) {
@@ -2135,18 +2120,6 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT void amprFlushLibkernelHookLog(void) {
 #endif
 }
 #endif
-
-extern "C" AMPR_LIBKERNEL_HOOK_EXPORT void* amprGetOriginalLibkernelFunction(const char* symbol) {
-    if (!symbol) {
-        return nullptr;
-    }
-    for (HookSpec& hook : g_hooks) {
-        if (streq(hook.symbol, symbol)) {
-            return hook.detour.installed ? hook.detour.trampoline : hook.detour.target;
-        }
-    }
-    return nullptr;
-}
 
 extern "C" AMPR_LIBKERNEL_HOOK_EXPORT void* amprResolveLibkernelFunction(const char* symbol) {
     return resolve_libkernel_symbol(kKnownLibkernelHandle, symbol);

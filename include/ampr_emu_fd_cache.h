@@ -31,7 +31,6 @@ struct AmprIndexFdCacheDiagCounters {
     uint64_t emfile{};
 };
 
-void ampr_fd_cache_prewarm_runtime_state();
 
 int ampr_index_acquire_cached_fd(uint64_t jobId,
                                  uint32_t id,
@@ -39,8 +38,6 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
                                  int flags,
                                  int mode);
 void ampr_index_release_cached_fd_pin(uint32_t fileId);
-int ampr_index_pin_file_id(uint32_t fileId, uint32_t* outPinCount);
-int ampr_index_unpin_file_id(uint32_t fileId, uint32_t* outPinCount);
 void ampr_index_fd_direct_note_open();
 void ampr_index_fd_direct_note_close();
 size_t ampr_index_fd_direct_open_count();

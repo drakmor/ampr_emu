@@ -16,8 +16,6 @@ struct FileEntryView {
     int64_t mtime{};
 };
 
-void ampr_index_prewarm_runtime_state();
 
 int ampr_index_get_entry_view(uint32_t id, FileEntryView* out);
 int ampr_index_resolve_path_to_id(const char* path, uint32_t* outId, size_t* outSize);
-void ampr_index_ensure_app0_index_before_apr_resolve_hook();

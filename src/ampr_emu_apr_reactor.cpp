@@ -6,9 +6,7 @@
  * native APR/AMM micro-submits for hardware-owned operations.
  */
 
-#define AMPR_EMU_CORE_IMPL 1
 #include "ampr_emu_apr_reactor.h"
-#include "ampr_emu_apr_reactor_arena.h"
 #include "ampr_emu_apr_reactor_common.h"
 #if AMPR_EMU_DEBUG_LOG && (AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP || AMPR_EMU_APR_REACTOR_STALL_WARN_ITERATIONS != 0)
 #include "ampr_emu_command_buffer_dump.h"
@@ -26,7 +24,6 @@
 #include <ampr/ampr_error.h>
 
 #include <atomic>
-#include <vector>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -788,10 +785,6 @@ public:
         return rc;
     }
 
-    bool prestart() {
-        return start_worker();
-    }
-
     int shutdown() {
         ScePthread thread{};
         {
@@ -820,8 +813,6 @@ public:
 
 
 private:
-    template <typename T>
-    using ReactorVector = std::vector<T, AmprReactorAllocator<T>>;
     static constexpr uint32_t kPendingReadQueueCapacity =
 #if AMPR_EMU_APR_PENDING_READ_QUEUE_LIMIT != 0
         AMPR_EMU_APR_PENDING_READ_QUEUE_LIMIT;
@@ -3128,14 +3119,6 @@ private:
         }
     }
 
-    void note_native_trigger_poll_scan() {
-        note_log_counter(runtimeNativeTriggerPollScans);
-    }
-
-    void note_native_trigger_poll_hit() {
-        note_log_counter(runtimeNativeTriggerPollHits);
-    }
-
     void note_deadline_heap_pick() {
         note_log_counter(runtimeDeadlineHeapPicks);
     }
@@ -3190,62 +3173,6 @@ private:
 #if AMPR_EMU_DEBUG_LOG
     static uint64_t vq_ptr_value(const void* ptr) {
         return reinterpret_cast<uint64_t>(ptr);
-    }
-
-    struct DebugU64Read {
-        uint64_t value{0};
-        int protRc{0};
-        int vqRc{0};
-        int prot{0};
-        int vqProt{0};
-        uint64_t protStart{0};
-        uint64_t protEnd{0};
-        uint32_t rangeValid{0};
-        uint32_t cpuReadable{0};
-        uint32_t amprReadable{0};
-        uint32_t valueKnown{0};
-        uint32_t vqCommitted{0};
-    };
-
-    static DebugU64Read read_u64_for_log(const volatile uint64_t* address) {
-        DebugU64Read out{};
-        if (!address) {
-            out.protRc = SCE_KERNEL_ERROR_EINVAL;
-            out.vqRc = SCE_KERNEL_ERROR_EINVAL;
-            return out;
-        }
-        const void* ptr = reinterpret_cast<const void*>(const_cast<const uint64_t*>(address));
-        const uint64_t addr = reinterpret_cast<uint64_t>(ptr);
-        void* protStart = nullptr;
-        void* protEnd = nullptr;
-        int prot = 0;
-        out.protRc = sceKernelQueryMemoryProtection(const_cast<void*>(ptr), &protStart, &protEnd, &prot);
-        out.prot = prot;
-        out.protStart = vq_ptr_value(protStart);
-        out.protEnd = vq_ptr_value(protEnd);
-
-        SceKernelVirtualQueryInfo vq{};
-        out.vqRc = sceKernelVirtualQuery(ptr, 0, &vq, sizeof(vq));
-        out.vqProt = vq.protection;
-        out.vqCommitted = vq.isCommitted ? 1u : 0u;
-
-        const bool rangeValid =
-            out.protRc == 0 &&
-            out.protStart <= addr &&
-            addr <= UINT64_MAX - sizeof(uint64_t) &&
-            out.protEnd >= addr + sizeof(uint64_t);
-        const bool cpuReadable =
-            (prot & (SCE_KERNEL_PROT_CPU_READ | SCE_KERNEL_PROT_CPU_RW | SCE_KERNEL_PROT_CPU_ALL)) != 0;
-        const bool amprReadable =
-            (prot & (SCE_KERNEL_PROT_AMPR_READ | SCE_KERNEL_PROT_AMPR_RW | SCE_KERNEL_PROT_AMPR_ALL)) != 0;
-        out.rangeValid = rangeValid ? 1u : 0u;
-        out.cpuReadable = cpuReadable ? 1u : 0u;
-        out.amprReadable = amprReadable ? 1u : 0u;
-        if (rangeValid && cpuReadable) {
-            out.value = *address;
-            out.valueKnown = 1u;
-        }
-        return out;
     }
 
     void log_aio_buffer_memory_detail(const char* prefix,
@@ -3409,6 +3336,8 @@ private:
                   perFileActive);
     }
 
+#if AMPR_EMU_APR_REACTOR_BACKLOG_WARN_THRESHOLD != 0 && \
+    AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES != 0
     struct BacklogFileSample {
         uint32_t fileId{};
         size_t pending{};
@@ -3426,6 +3355,11 @@ private:
         uint64_t maxPendingLen{};
         uint64_t maxActiveLen{};
     };
+
+    static constexpr size_t kBacklogFileSampleCapacity =
+        static_cast<size_t>(kPendingReadQueueCapacity) + kMaxActiveReads;
+    static_assert(kBacklogFileSampleCapacity != 0,
+                  "APR backlog sample storage must not be empty");
 
     static void count_read_class(DirectReadClass cls,
                                  size_t* cached,
@@ -3450,32 +3384,35 @@ private:
         }
     }
 
-    static BacklogFileSample& backlog_file_sample(ReactorVector<BacklogFileSample>& samples,
-                                                  uint32_t fileId) {
-        for (BacklogFileSample& sample : samples) {
+    BacklogFileSample& backlog_file_sample(size_t& sampleCount, uint32_t fileId) {
+        for (size_t i = 0; i < sampleCount; ++i) {
+            BacklogFileSample& sample = backlogFileSamples[i];
             if (sample.fileId == fileId) {
                 return sample;
             }
         }
-        samples.push_back(BacklogFileSample{});
-        samples.back().fileId = fileId;
-        return samples.back();
+        if (sampleCount >= kBacklogFileSampleCapacity) {
+            AMPR_CRITICAL_LOGF("apr.reactor.backlog.sample.full count=%zu capacity=%zu pendingReads=%zu activeReads=%zu",
+                               sampleCount,
+                               kBacklogFileSampleCapacity,
+                               pending_read_total(),
+                               activeReads.size());
+            __builtin_trap();
+        }
+        BacklogFileSample& sample = backlogFileSamples[sampleCount++];
+        sample = {};
+        sample.fileId = fileId;
+        return sample;
     }
+#endif
 
-    void log_backlog_file_snapshot(const char* reason, size_t pendingReadsTotal, bool pressureActive) {
-#if AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES != 0
-        ReactorVector<BacklogFileSample> samples;
-        const size_t totalReads =
-            pendingReadsTotal > SIZE_MAX - activeReads.size()
-                ? SIZE_MAX
-                : pendingReadsTotal + activeReads.size();
-        const size_t reserveHint = std::min<size_t>(
-            totalReads,
-            static_cast<size_t>(AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES) * 4u + 8u);
-        samples.reserve(reserveHint);
+    void log_backlog_file_snapshot(const char* reason, bool pressureActive) {
+#if AMPR_EMU_APR_REACTOR_BACKLOG_WARN_THRESHOLD != 0 && \
+    AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES != 0
+        size_t sampleCount = 0;
         for (size_t priority = kAprPriorityMin; priority <= kAprPriorityMax; ++priority) {
             for (const PendingRead& pending : pendingReadLanes[priority]) {
-                BacklogFileSample& sample = backlog_file_sample(samples, pending.desc.fileId);
+                BacklogFileSample& sample = backlog_file_sample(sampleCount, pending.desc.fileId);
                 ++sample.pending;
                 sample.pendingBytes += pending.desc.length;
                 sample.maxPendingLen = std::max<uint64_t>(sample.maxPendingLen, pending.desc.length);
@@ -3487,7 +3424,7 @@ private:
             }
         }
         for (const ActiveRead& active : activeReads) {
-            BacklogFileSample& sample = backlog_file_sample(samples, active.desc.fileId);
+            BacklogFileSample& sample = backlog_file_sample(sampleCount, active.desc.fileId);
             ++sample.active;
             sample.activeBytes += active.desc.length;
             sample.maxActiveLen = std::max<uint64_t>(sample.maxActiveLen, active.desc.length);
@@ -3497,18 +3434,21 @@ private:
                              &sample.activeNormal,
                              &sample.activeBulk);
         }
-        if (samples.empty()) {
+        if (sampleCount == 0) {
             return;
         }
-        std::sort(samples.begin(), samples.end(), [](const BacklogFileSample& a,
-                                                     const BacklogFileSample& b) {
+        const size_t count = std::min<size_t>(sampleCount,
+                                              AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES);
+        std::partial_sort(backlogFileSamples,
+                          backlogFileSamples + count,
+                          backlogFileSamples + sampleCount,
+                          [](const BacklogFileSample& a, const BacklogFileSample& b) {
             if (a.pending != b.pending) return a.pending > b.pending;
             if (a.active != b.active) return a.active > b.active;
             return a.fileId < b.fileId;
         });
-        const size_t count = std::min<size_t>(samples.size(), AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES);
         for (size_t i = 0; i < count; ++i) {
-            const BacklogFileSample& sample = samples[i];
+            const BacklogFileSample& sample = backlogFileSamples[i];
             const char* pathArg = file_path_log_arg(sample.fileId);
             AMPR_LOGF("apr.reactor.backlog.file reason=%s rank=%zu fileId=%u path=%s pending=%zu active=%zu pendingBytes=0x%llx activeBytes=0x%llx maxPendingLen=0x%llx maxActiveLen=0x%llx pendingCached=%zu pendingSmall=%zu pendingNormal=%zu pendingBulk=%zu activeCached=%zu activeSmall=%zu activeNormal=%zu activeBulk=%zu pressure=%u",
                       reason ? reason : "unknown",
@@ -3533,7 +3473,6 @@ private:
         }
 #else
         (void)reason;
-        (void)pendingReadsTotal;
         (void)pressureActive;
 #endif
     }
@@ -3654,39 +3593,10 @@ private:
                   activeBulk,
                   (unsigned long long)oldestAgeMs);
         log_pending_backlog_detail(reason, pendingReadsTotal);
-        log_backlog_file_snapshot(reason, pendingReadsTotal, false);
+        log_backlog_file_snapshot(reason, false);
         log_oldest_active_read_detail("apr.reactor.aio.backlogActive", reason, now);
     }
 #endif
-
-    bool read_parse_aio_window_full(const char* reason, uint64_t length) {
-        const size_t queuedReads = pending_read_total();
-        const size_t activeReadCount = activeReads.size();
-        const size_t neededReads = length == 0 ? 0u : 1u;
-        if (neededReads == 0) {
-            return false;
-        }
-        const size_t outstandingReads =
-            activeReadCount > SIZE_MAX - queuedReads ? SIZE_MAX : activeReadCount + queuedReads;
-        if (neededReads <= kPendingReadQueueCapacity &&
-            outstandingReads <= kPendingReadQueueCapacity - neededReads) {
-            return false;
-        }
-#if AMPR_EMU_DEBUG_LOG && AMPR_EMU_APR_REACTOR_BACKLOG_WARN_THRESHOLD != 0
-        maybe_log_reactor_backlog(reason, queuedReads);
-#else
-        (void)reason;
-#endif
-        AMPR_VLOGF("apr.reactor.parse.aioWindowFull reason=%s pendingReads=%zu activeReads=%zu need=%zu limit=%u activeLimit=%u outstanding=%zu",
-                  reason ? reason : "unknown",
-                  queuedReads,
-                  activeReadCount,
-                  neededReads,
-                  (unsigned)kPendingReadQueueCapacity,
-                  (unsigned)aio_active_read_limit(),
-                  outstandingReads);
-        return true;
-    }
 
     uint64_t oldest_active_read_age_ms(uint64_t now) const {
         uint64_t oldest = 0;
@@ -7768,15 +7678,13 @@ private:
                   (unsigned long long)runtimeAioAcceptedRequestCountByPriority[6],
                   (unsigned long long)runtimeAioAcceptedBytesByPriority[6],
                   (unsigned long long)counterWindowMs);
-        AMPR_LOGF("apr.reactor.counters.runtime reason=%s aioPollCalls=%llu aioPollBackoffSkips=%llu aioPollBudgetYields=%llu aioPollWorkNs=%llu aioPollSleepNs=%llu nativeTriggerPollScans=%llu nativeTriggerPollHits=%llu deadlineHeapPicks=%llu deadlineHeapFutureStops=%llu activeReadDuePolls=%llu activeReadNotDueSkips=%llu workerWakeups=%llu workerWakeupsPerSec=%llu idlePollPasses=%llu idlePollPassesPerSec=%llu emfile=%llu directEmfile=%llu efaultRetry=%llu efaultRetryLimit=%llu fdCacheHit=%llu fdCacheMiss=%llu fdCacheEmfile=%llu activeDirect=%zu activeDirectSmall=%zu activeDirectNormal=%zu activeDirectBulk=%zu fdCacheMinFileBytes=%llu aioLimit=%u aioInitState=%u aioInitLastRc=0x%x aioInitAttempts=%llu aioInitOk=%llu aioInitBusy=%llu aioInitFail=%llu aioSubmitEagain=%llu",
+        AMPR_LOGF("apr.reactor.counters.runtime reason=%s aioPollCalls=%llu aioPollBackoffSkips=%llu aioPollBudgetYields=%llu aioPollWorkNs=%llu aioPollSleepNs=%llu deadlineHeapPicks=%llu deadlineHeapFutureStops=%llu activeReadDuePolls=%llu activeReadNotDueSkips=%llu workerWakeups=%llu workerWakeupsPerSec=%llu idlePollPasses=%llu idlePollPassesPerSec=%llu emfile=%llu directEmfile=%llu efaultRetry=%llu efaultRetryLimit=%llu fdCacheHit=%llu fdCacheMiss=%llu fdCacheEmfile=%llu activeDirect=%zu activeDirectSmall=%zu activeDirectNormal=%zu activeDirectBulk=%zu fdCacheMinFileBytes=%llu aioLimit=%u aioInitState=%u aioInitLastRc=0x%x aioInitAttempts=%llu aioInitOk=%llu aioInitBusy=%llu aioInitFail=%llu aioSubmitEagain=%llu",
                   reason ? reason : "unknown",
                   (unsigned long long)runtimeAioPollCalls,
                   (unsigned long long)runtimeAioPollBackoffSkips,
                   (unsigned long long)runtimeAioPollBudgetYields,
                   (unsigned long long)runtimeAioPollWorkNs,
                   (unsigned long long)runtimeAioPollSleepNs,
-                  (unsigned long long)runtimeNativeTriggerPollScans,
-                  (unsigned long long)runtimeNativeTriggerPollHits,
                   (unsigned long long)runtimeDeadlineHeapPicks,
                   (unsigned long long)runtimeDeadlineHeapFutureStops,
                   (unsigned long long)runtimeActiveReadDuePolls,
@@ -7820,8 +7728,6 @@ private:
             runtimeAioPollBudgetYields = 0;
             runtimeAioPollWorkNs = 0;
             runtimeAioPollSleepNs = 0;
-            runtimeNativeTriggerPollScans = 0;
-            runtimeNativeTriggerPollHits = 0;
             runtimeDeadlineHeapPicks = 0;
             runtimeDeadlineHeapFutureStops = 0;
             runtimeActiveReadDuePolls = 0;
@@ -8565,8 +8471,6 @@ private:
     uint64_t runtimeAioPollBudgetYields{0};
     uint64_t runtimeAioPollWorkNs{0};
     uint64_t runtimeAioPollSleepNs{0};
-    uint64_t runtimeNativeTriggerPollScans{0};
-    uint64_t runtimeNativeTriggerPollHits{0};
     uint64_t runtimeDeadlineHeapPicks{0};
     uint64_t runtimeDeadlineHeapFutureStops{0};
     uint64_t runtimeActiveReadDuePolls{0};
@@ -8615,6 +8519,10 @@ private:
     size_t lastBacklogLogPending{0};
     uint64_t lastBacklogLogTimeNs{0};
 #endif
+#if AMPR_EMU_DEBUG_LOG && AMPR_EMU_APR_REACTOR_BACKLOG_WARN_THRESHOLD != 0 && \
+    AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES != 0
+    BacklogFileSample backlogFileSamples[kBacklogFileSampleCapacity]{};
+#endif
 };
 
 AprAioReactor::AprAioReactor() {
@@ -8661,10 +8569,6 @@ static AprAioReactor& apr_aio_reactor() {
 }
 
 } // namespace
-
-bool apr_reactor_prestart() {
-    return apr_aio_reactor().prestart();
-}
 
 int apr_reactor_shutdown() {
     AprAioReactor* const reactor =

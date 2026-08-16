@@ -20,9 +20,7 @@ bool aprCommandBufferHasMapState(SceAmprCommandBuffer* cb);
 int aprValidateReadLength(uint64_t length);
 int aprValidateReadOffset(uint64_t offset);
 int aprValidateReadArgs(const void* buffer, uint64_t length, uint64_t offset);
-int aprValidateMapBeginShape(uint64_t va, uint64_t size);
 int aprValidateMapBeginArgs(uint64_t va, uint64_t size, int type, int prot);
-int aprValidateMapDirectBeginShape(uint64_t va, uint64_t dmemOffset, uint64_t size);
 int aprValidateMapDirectBeginArgs(uint64_t va, uint64_t dmemOffset, uint64_t size, int type, int prot);
 int aprCommandMapProt(int prot);
 

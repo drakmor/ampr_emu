@@ -4,7 +4,6 @@
  * Runtime memory and SDK CPU allocation module.
  */
 
-#define AMPR_EMU_RUNTIME_IMPL 1
 #include "ampr_emu_runtime_memory.h"
 #include "ampr_emu_kernel_memory.h"
 #include "ampr_emu_log.h"
@@ -13,12 +12,6 @@
 #include <atomic>
 #include <cstring>
 
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunused-function"
-#pragma clang diagnostic ignored "-Wunused-const-variable"
-#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
-#endif
 namespace {
 static constexpr size_t kAmprInternalAmmPoolSize =
     static_cast<size_t>(AMPR_EMU_INTERNAL_AMM_POOL_SIZE);
@@ -170,8 +163,9 @@ static bool ampr_internal_amm_pool_has_capacity_locked(size_t size,
     return false;
 }
 
-static bool ampr_internal_amm_pool_ready_has_capacity_impl(size_t size,
-                                                      size_t alignment = SCE_KERNEL_PAGE_SIZE) {
+} // namespace
+
+bool ampr_internal_amm_pool_ready_has_capacity(size_t size, size_t alignment) {
     AmprSpinLock poolLock(&g_internal_amm_pool_lock);
     return g_internal_amm_pool_ready &&
            g_internal_amm_pool_base &&
@@ -231,7 +225,7 @@ static AmprInternalAmmPoolSnapshot ampr_internal_amm_pool_snapshot() {
 }
 #endif
 
-static void ampr_internal_amm_pool_log_summary_impl(const char* reason) {
+void ampr_internal_amm_pool_log_summary(const char* reason) {
 #if AMPR_EMU_DEBUG_LOG
     if (!ampr_debug_log_runtime_enabled()) {
         return;
@@ -255,10 +249,7 @@ static void ampr_internal_amm_pool_log_summary_impl(const char* reason) {
 #endif
 }
 
-static void ampr_prewarm_late_runtime_state();
-static void prewarm_apr_submit_runtime(bool flushRuntimeLogs = true);
-
-static bool ampr_internal_amm_pool_ensure_impl(size_t requiredSize, const char* reason) {
+bool ampr_internal_amm_pool_ensure(size_t requiredSize, const char* reason) {
     const size_t requiredPoolSize = ampr_internal_align_up_size_impl(requiredSize,
                                                                 SCE_KERNEL_PAGE_SIZE);
     if (requiredPoolSize == 0 || requiredPoolSize == SIZE_MAX) {
@@ -343,11 +334,11 @@ static bool ampr_internal_amm_pool_ensure_impl(size_t requiredSize, const char* 
               (unsigned long long)kAmprInternalAmmStaticPoolSize,
               (unsigned long long)requiredSize,
               kStaticPoolProt);
-    ampr_internal_amm_pool_log_summary_impl("init.bss");
+    ampr_internal_amm_pool_log_summary("init.bss");
     return true;
 }
 
-static bool ampr_internal_amm_pool_prepare_static_storage_impl(const char* reason) {
+bool ampr_internal_amm_pool_prepare_static_storage(const char* reason) {
     {
         AmprSpinLock poolLock(&g_internal_amm_pool_lock);
         if (g_internal_amm_pool_ready) {
@@ -355,15 +346,15 @@ static bool ampr_internal_amm_pool_prepare_static_storage_impl(const char* reaso
                    g_internal_amm_pool_apr_visible;
         }
     }
-    return ampr_internal_amm_pool_ensure_impl(SCE_KERNEL_PAGE_SIZE,
+    return ampr_internal_amm_pool_ensure(SCE_KERNEL_PAGE_SIZE,
                                          reason ? reason : "mem.static_pool");
 }
 
-static void* ampr_internal_amm_pool_alloc_impl(size_t size,
-                                           size_t* outMappedSize,
-                                           const char* tag,
-                                           bool criticalOnFail = true,
-                                           size_t alignment = SCE_KERNEL_PAGE_SIZE) {
+void* ampr_internal_amm_pool_alloc(size_t size,
+                                   size_t* outMappedSize,
+                                   const char* tag,
+                                   bool criticalOnFail,
+                                   size_t alignment) {
 #if !AMPR_EMU_DEBUG_LOG
     (void)tag;
     (void)criticalOnFail;
@@ -560,7 +551,7 @@ static void* ampr_internal_amm_pool_alloc_impl(size_t size,
     return ptr;
 }
 
-static bool ampr_internal_amm_pool_free_impl(void* ptr, const char* tag) {
+bool ampr_internal_amm_pool_free(void* ptr, const char* tag) {
 #if !AMPR_EMU_DEBUG_LOG
     (void)tag;
 #endif
@@ -668,40 +659,22 @@ static bool ampr_internal_amm_pool_free_impl(void* ptr, const char* tag) {
     return true;
 }
 
-enum class AmprRuntimeMemoryOwner : uint8_t {
-    None,
-    Pool,
-    SmallSlab,
-    Flexible,
-};
-
-struct AmprRuntimeMemoryBlock {
-    void* base{};
-    size_t size{};
-    AmprRuntimeMemoryOwner owner{AmprRuntimeMemoryOwner::None};
-};
-
-enum class AmprSdkCpuMemoryClass : uint8_t {
-    Persistent,
-    Transient,
-};
-
 static std::atomic<uint32_t> g_sdk_cpu_memory_stats_lock{0};
 static size_t g_sdk_cpu_persistent_live = 0;
 static size_t g_sdk_cpu_persistent_peak = 0;
 static size_t g_sdk_cpu_transient_live = 0;
 static size_t g_sdk_cpu_transient_peak = 0;
 
-static const char* ampr_sdk_cpu_memory_class_name_impl(AmprSdkCpuMemoryClass memoryClass) {
-    return memoryClass == AmprSdkCpuMemoryClass::Transient ? "transient" : "persistent";
+const char* ampr_sdk_cpu_memory_class_name(AmprSharedSdkCpuMemoryClass memoryClass) {
+    return memoryClass == AmprSharedSdkCpuMemoryClass::Transient ? "transient" : "persistent";
 }
 
-static void ampr_sdk_cpu_memory_note_alloc_impl(AmprSdkCpuMemoryClass memoryClass, size_t size) {
+void ampr_sdk_cpu_memory_note_alloc(AmprSharedSdkCpuMemoryClass memoryClass, size_t size) {
     AmprSpinLock lock(&g_sdk_cpu_memory_stats_lock);
-    size_t* live = memoryClass == AmprSdkCpuMemoryClass::Transient
+    size_t* live = memoryClass == AmprSharedSdkCpuMemoryClass::Transient
         ? &g_sdk_cpu_transient_live
         : &g_sdk_cpu_persistent_live;
-    size_t* peak = memoryClass == AmprSdkCpuMemoryClass::Transient
+    size_t* peak = memoryClass == AmprSharedSdkCpuMemoryClass::Transient
         ? &g_sdk_cpu_transient_peak
         : &g_sdk_cpu_persistent_peak;
     if (*live <= SIZE_MAX - size) {
@@ -714,15 +687,15 @@ static void ampr_sdk_cpu_memory_note_alloc_impl(AmprSdkCpuMemoryClass memoryClas
     }
 }
 
-static void ampr_sdk_cpu_memory_note_free_impl(AmprSdkCpuMemoryClass memoryClass, size_t size) {
+void ampr_sdk_cpu_memory_note_free(AmprSharedSdkCpuMemoryClass memoryClass, size_t size) {
     AmprSpinLock lock(&g_sdk_cpu_memory_stats_lock);
-    size_t* live = memoryClass == AmprSdkCpuMemoryClass::Transient
+    size_t* live = memoryClass == AmprSharedSdkCpuMemoryClass::Transient
         ? &g_sdk_cpu_transient_live
         : &g_sdk_cpu_persistent_live;
     *live = size <= *live ? *live - size : 0;
 }
 
-static void ampr_sdk_cpu_memory_log_summary_impl(const char* reason) {
+void ampr_sdk_cpu_memory_log_summary(const char* reason) {
 #if AMPR_EMU_DEBUG_LOG
     if (!ampr_debug_log_runtime_enabled()) {
         return;
@@ -780,10 +753,6 @@ static size_t ampr_small_slab_class_index(size_t size, size_t alignment) {
     return SIZE_MAX;
 }
 
-static bool ampr_small_slab_eligible_impl(size_t size, size_t alignment) {
-    return ampr_small_slab_class_index(size, alignment) != SIZE_MAX;
-}
-
 static AmprSharedExactSlabPool* ampr_small_slab_pool() {
     ampr_exact_slab_pool_init(&g_small_slab_pool,
                                      g_small_slab_blocks,
@@ -791,11 +760,11 @@ static AmprSharedExactSlabPool* ampr_small_slab_pool() {
     return &g_small_slab_pool;
 }
 
-static void* ampr_small_slab_alloc_impl(size_t size,
-                                   size_t alignment,
-                                   size_t* outSlotSize,
-                                   const char* tag,
-                                   bool mayCreatePool) {
+void* ampr_small_slab_alloc(size_t size,
+                            size_t alignment,
+                            size_t* outSlotSize,
+                            const char* tag,
+                            bool mayCreatePool) {
     if (outSlotSize) {
         *outSlotSize = 0;
     }
@@ -814,7 +783,7 @@ static void* ampr_small_slab_alloc_impl(size_t size,
                                         false);
 }
 
-static bool ampr_small_slab_free_impl(void* ptr, const char* tag, size_t* outSlotSize = nullptr) {
+bool ampr_small_slab_free(void* ptr, const char* tag, size_t* outSlotSize) {
     return ampr_exact_slab_free(ampr_small_slab_pool(), ptr, tag, outSlotSize, true);
 }
 
@@ -933,10 +902,10 @@ static void* ampr_exact_slab_alloc_block(size_t slotSize,
         return nullptr;
     }
     if (mayCreatePool) {
-        if (!ampr_internal_amm_pool_ensure_impl(blockBytes, tag)) {
+        if (!ampr_internal_amm_pool_ensure(blockBytes, tag)) {
             return nullptr;
         }
-    } else if (!ampr_internal_amm_pool_ready_has_capacity_impl(blockBytes)) {
+    } else if (!ampr_internal_amm_pool_ready_has_capacity(blockBytes)) {
         return nullptr;
     }
     if (requireAprVisible) {
@@ -947,14 +916,14 @@ static void* ampr_exact_slab_alloc_block(size_t slotSize,
     }
 
     size_t actualBytes = 0;
-    void* block = ampr_internal_amm_pool_alloc_impl(blockBytes,
+    void* block = ampr_internal_amm_pool_alloc(blockBytes,
                                                &actualBytes,
                                                tag,
                                                false,
                                                SCE_KERNEL_PAGE_SIZE);
     if (!block || actualBytes < blockBytes) {
         if (block) {
-            (void)ampr_internal_amm_pool_free_impl(block, tag);
+            (void)ampr_internal_amm_pool_free(block, tag);
         }
         return nullptr;
     }
@@ -964,181 +933,17 @@ static void* ampr_exact_slab_alloc_block(size_t slotSize,
     return block;
 }
 
-static void* ampr_runtime_alloc_from_pool_only_impl(const char* tag,
-                                               size_t size,
-                                               AmprRuntimeMemoryBlock* out,
-                                               size_t alignment = alignof(std::max_align_t)) {
-    if (out) *out = {};
-    size_t slabSize = 0;
-    void* slab = ampr_small_slab_alloc_impl(size, alignment, &slabSize, tag, true);
-    if (slab) {
-        std::memset(slab, 0, slabSize);
-        if (out) {
-            out->base = slab;
-            out->size = slabSize;
-            out->owner = AmprRuntimeMemoryOwner::SmallSlab;
-        }
-        return slab;
-    }
-
-    size_t poolSize = 0;
-    void* pool = ampr_internal_amm_pool_alloc_impl(size, &poolSize, tag, true, alignment);
-    if (!pool) {
-        return nullptr;
-    }
-    std::memset(pool, 0, poolSize);
-    if (out) {
-        out->base = pool;
-        out->size = poolSize;
-        out->owner = AmprRuntimeMemoryOwner::Pool;
-    }
-    return pool;
-}
-
-static std::atomic<uint32_t> g_lazy_state_init_lock{0};
-
-struct AmprLazyStateInitLock {
-    explicit AmprLazyStateInitLock(std::atomic<uint32_t>& state) : state_(state) {
-        for (;;) {
-            uint32_t expected = 0;
-            if (state_.compare_exchange_weak(expected,
-                                             1u,
-                                             std::memory_order_acquire,
-                                             std::memory_order_relaxed)) {
-                return;
-            }
-            uint32_t spins = 0;
-            while (state_.load(std::memory_order_relaxed) != 0) {
-                ampr_spin_pause_or_yield(spins);
-            }
-        }
-    }
-
-    ~AmprLazyStateInitLock() {
-        state_.store(0, std::memory_order_release);
-    }
-
-    AmprLazyStateInitLock(const AmprLazyStateInitLock&) = delete;
-    AmprLazyStateInitLock& operator=(const AmprLazyStateInitLock&) = delete;
-
-private:
-    std::atomic<uint32_t>& state_;
-};
-
-template <typename T>
-static T* ampr_lazy_state_ptr(std::atomic<T*>* slot) {
-    // Lazy state avoids global ctor/dtor ordering in the PRX.
-    T* p = slot->load(std::memory_order_acquire);
-    if (p) return p;
-
-    AmprLazyStateInitLock initLock(g_lazy_state_init_lock);
-    p = slot->load(std::memory_order_acquire);
-    if (p) return p;
-
-    void* storage = ampr_runtime_alloc_from_pool_only_impl("lazy.state",
-                                                      sizeof(T),
-                                                      nullptr,
-                                                      alignof(T));
-    if (!storage) {
-        alignas(T) static unsigned char staticStorage[sizeof(T)];
-        static bool staticUsed = false;
-        if (staticUsed) {
-            return nullptr;
-        }
-        storage = staticStorage;
-        staticUsed = true;
-        std::memset(storage, 0, sizeof(T));
-        AMPR_CRITICAL_LOGF("mem.lazy.static tag=lazy.state typeSize=0x%llx",
-                           (unsigned long long)sizeof(T));
-    }
-    T* np = new (storage) T();
-    slot->store(np, std::memory_order_release);
-    return np;
-}
-
-template <typename T>
-static T& ampr_lazy_state_ref(std::atomic<T*>* slot) {
-    T* p = ampr_lazy_state_ptr(slot);
-    if (!p) __builtin_trap();
-    return *p;
-}
-} // namespace
-
-
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
-
-static AmprSdkCpuMemoryClass ampr_memory_class_to_runtime(AmprSharedSdkCpuMemoryClass memoryClass) {
-    return memoryClass == AmprSharedSdkCpuMemoryClass::Transient
-        ? AmprSdkCpuMemoryClass::Transient
-        : AmprSdkCpuMemoryClass::Persistent;
-}
-
-size_t ampr_internal_align_up_size(size_t value, size_t alignment) {
-    return ampr_internal_align_up_size_impl(value, alignment);
-}
-
-bool ampr_internal_amm_pool_ensure(size_t requiredSize, const char* reason) {
-    return ampr_internal_amm_pool_ensure_impl(requiredSize, reason);
-}
-
-bool ampr_internal_amm_pool_ready_has_capacity(size_t size, size_t alignment) {
-    return ampr_internal_amm_pool_ready_has_capacity_impl(size, alignment);
-}
-
-bool ampr_internal_amm_pool_apr_visible() {
-    AmprSpinLock poolLock(&g_internal_amm_pool_lock);
-    return g_internal_amm_pool_ready && g_internal_amm_pool_apr_visible;
-}
-
-void* ampr_internal_amm_pool_alloc(size_t size,
-                                          size_t* outSize,
-                                          const char* tag,
-                                          bool mayCreatePool,
-                                          size_t alignment) {
-    return ampr_internal_amm_pool_alloc_impl(size, outSize, tag, mayCreatePool, alignment);
-}
-
-bool ampr_internal_amm_pool_free(void* ptr, const char* tag) {
-    return ampr_internal_amm_pool_free_impl(ptr, tag);
-}
-
-void ampr_internal_amm_pool_log_summary(const char* reason) {
-    ampr_internal_amm_pool_log_summary_impl(reason);
-}
-
-bool ampr_internal_amm_pool_prepare_static_storage(const char* reason) {
-    return ampr_internal_amm_pool_prepare_static_storage_impl(reason);
-}
-
 void ampr_runtime_memory_log_heartbeat(const char* reason) {
 #if AMPR_EMU_DEBUG_LOG
     if (!ampr_debug_log_runtime_enabled()) {
         return;
     }
     const char* const tag = reason ? reason : "heartbeat";
-    ampr_internal_amm_pool_log_summary_impl(tag);
-    ampr_sdk_cpu_memory_log_summary_impl(tag);
+    ampr_internal_amm_pool_log_summary(tag);
+    ampr_sdk_cpu_memory_log_summary(tag);
 #else
     (void)reason;
 #endif
-}
-
-bool ampr_small_slab_eligible(size_t size, size_t alignment) {
-    return ampr_small_slab_eligible_impl(size, alignment);
-}
-
-void* ampr_small_slab_alloc(size_t size,
-                                   size_t alignment,
-                                   size_t* outSlotSize,
-                                   const char* tag,
-                                   bool mayCreatePool) {
-    return ampr_small_slab_alloc_impl(size, alignment, outSlotSize, tag, mayCreatePool);
-}
-
-bool ampr_small_slab_free(void* ptr, const char* tag, size_t* outSlotSize) {
-    return ampr_small_slab_free_impl(ptr, tag, outSlotSize);
 }
 
 void ampr_exact_slab_pool_init(AmprSharedExactSlabPool* pool,
@@ -1223,14 +1028,14 @@ void* ampr_exact_slab_alloc(AmprSharedExactSlabPool* pool,
             }
         }
         if (extraBlock) {
-            (void)ampr_internal_amm_pool_free_impl(extraBlock, tag);
+            (void)ampr_internal_amm_pool_free(extraBlock, tag);
             newBlock = nullptr;
         }
         if (result) {
             return result;
         }
         if (newBlock) {
-            (void)ampr_internal_amm_pool_free_impl(newBlock, tag);
+            (void)ampr_internal_amm_pool_free(newBlock, tag);
         }
         return nullptr;
     }
@@ -1313,7 +1118,7 @@ bool ampr_exact_slab_free(AmprSharedExactSlabPool* pool,
         }
     }
     if (blockToRelease) {
-        (void)ampr_internal_amm_pool_free_impl(blockToRelease, tag);
+        (void)ampr_internal_amm_pool_free(blockToRelease, tag);
     }
     if (!found) {
         AMPR_LOGF("mem.exact_slab.free skip tag=%s ptr=%p reason=not-owned",
@@ -1321,52 +1126,4 @@ bool ampr_exact_slab_free(AmprSharedExactSlabPool* pool,
                   ptr);
     }
     return found;
-}
-
-const char* ampr_sdk_cpu_memory_class_name(AmprSharedSdkCpuMemoryClass memoryClass) {
-    return ampr_sdk_cpu_memory_class_name_impl(ampr_memory_class_to_runtime(memoryClass));
-}
-
-void ampr_sdk_cpu_memory_note_alloc(AmprSharedSdkCpuMemoryClass memoryClass, size_t size) {
-    ampr_sdk_cpu_memory_note_alloc_impl(ampr_memory_class_to_runtime(memoryClass), size);
-}
-
-void ampr_sdk_cpu_memory_note_free(AmprSharedSdkCpuMemoryClass memoryClass, size_t size) {
-    ampr_sdk_cpu_memory_note_free_impl(ampr_memory_class_to_runtime(memoryClass), size);
-}
-
-void ampr_sdk_cpu_memory_log_summary(const char* reason) {
-    ampr_sdk_cpu_memory_log_summary_impl(reason);
-}
-
-void* ampr_runtime_alloc_from_pool_only(const char* tag,
-                                               size_t size,
-                                               AmprSharedRuntimeMemoryBlock* out,
-                                               size_t alignment) {
-    if (out) *out = {};
-
-    size_t slabSize = 0;
-    void* slab = ampr_small_slab_alloc_impl(size, alignment, &slabSize, tag, true);
-    if (slab) {
-        std::memset(slab, 0, slabSize);
-        if (out) {
-            out->base = slab;
-            out->size = slabSize;
-            out->owner = AmprSharedRuntimeMemoryOwner::SmallSlab;
-        }
-        return slab;
-    }
-
-    size_t poolSize = 0;
-    void* pool = ampr_internal_amm_pool_alloc_impl(size, &poolSize, tag, true, alignment);
-    if (!pool) {
-        return nullptr;
-    }
-    std::memset(pool, 0, poolSize);
-    if (out) {
-        out->base = pool;
-        out->size = poolSize;
-        out->owner = AmprSharedRuntimeMemoryOwner::Pool;
-    }
-    return pool;
 }
