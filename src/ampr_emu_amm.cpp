@@ -895,6 +895,7 @@ int ammGetVirtualAddressRangesLeaf(uint64_t* vaStart,
               (unsigned long long)params[5],
               (unsigned long long)params[6]);
     if (rc != 0) {
+        AMPR_KLOGF("ampr.abort reason=amm.leaf.getVirtualAddressRanges.mapper-failed rc=0x%x file=%s line=%d", rc, __FILE__, __LINE__);
         abort();
     }
 

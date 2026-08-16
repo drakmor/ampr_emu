@@ -17,6 +17,8 @@ static inline void ampr_debug_int3_trap() {
 #endif
 }
 
+#define AMPR_KLOGF(...) sce::Ampr::Emu::kernelDebugLogf(__VA_ARGS__)
+
 static inline bool ampr_debug_log_runtime_enabled() {
 #if AMPR_EMU_DEBUG_LOG
     return sce::Ampr::Emu::getDebugLogEnabled();

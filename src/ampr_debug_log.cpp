@@ -8,6 +8,47 @@
 #include "ampr_emu_kernel_lookup.h"
 #include "ampr_libkernel_hook.h"
 
+#include <cstdarg>
+#include <cstdio>
+#include <_kernel.h>
+
+namespace sce::Ampr::Emu {
+
+void kernelDebugLogf(const char* fmt, ...) {
+    if (!fmt || !*fmt) {
+        return;
+    }
+
+    char body[896]{};
+    va_list args;
+    va_start(args, fmt);
+    const int bodyLen = vsnprintf(body, sizeof(body), fmt, args);
+    va_end(args);
+    if (bodyLen <= 0) {
+        return;
+    }
+    body[sizeof(body) - 1u] = '\0';
+
+    char line[1024]{};
+    const int lineLen = snprintf(line, sizeof(line), "[AMPR_EMU] %s\n", body);
+    if (lineLen <= 0) {
+        return;
+    }
+    line[sizeof(line) - 1u] = '\0';
+
+    using KernelDebugOutTextFn = int (*)(int, const char*);
+    void* address = nullptr;
+    const int dlsymRc = sceKernelDlsym(static_cast<SceKernelModule>(0x2001),
+                                       "sceKernelDebugOutText",
+                                       &address);
+    if (dlsymRc == 0 && address) {
+        auto* const debugOut = reinterpret_cast<KernelDebugOutTextFn>(address);
+        (void)debugOut(AMPR_EMU_DEBUG_LOG_KERNEL_OUT_CHANNEL, line);
+    }
+}
+
+} // namespace sce::Ampr::Emu
+
 #if AMPR_EMU_DEBUG_LOG
 
 #include <atomic>

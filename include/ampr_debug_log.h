@@ -9,6 +9,11 @@
 
 namespace sce::Ampr::Emu {
 
+// Always-on kernel debug output for fatal/invariant diagnostics. This path is
+// independent of the optional file logger so a message can be emitted immediately
+// before abort/trap paths even when AMPR_EMU_DEBUG_LOG is compiled out.
+void kernelDebugLogf(const char* fmt, ...);
+
 #if !AMPR_EMU_DEBUG_LOG
 
 inline const char* getDebugLogPath() { return AMPR_EMU_DEBUG_LOG_PATH; }

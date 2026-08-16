@@ -108,22 +108,104 @@
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_INFLIGHT
-// Maximum number of per-read SDK AIO submit IDs owned by the APR reactor at one
-// time. The reactor keeps these requests in flight across APR command buffers
-// and releases each id immediately after completion/delete.
-#define AMPR_EMU_APR_AIO_INFLIGHT 96
+// Normal/base number of per-read SDK AIO submit IDs owned by the APR reactor.
+// Age-based backpressure may temporarily reduce this value, while the optional
+// small-read boost below may temporarily increase it.
+#define AMPR_EMU_APR_AIO_INFLIGHT 32
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_PER_FILE_INFLIGHT
 // Soft number of active SDK AIO read IDs for one APR fileId. Files below this
 // level are filled first; once no ready file remains below it, pending files may
 // borrow the unused global window. 0 disables the per-file preference.
-#define AMPR_EMU_APR_AIO_PER_FILE_INFLIGHT 36
+#define AMPR_EMU_APR_AIO_PER_FILE_INFLIGHT 16
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_SMALL_READ_INFLIGHT
+// Temporary active-read window used only when the already-active workload is
+// dominated by small reads. Extra slots above AMPR_EMU_APR_AIO_INFLIGHT are
+// filled with small requests only, so bulk traffic cannot consume the boost.
+// Set to AMPR_EMU_APR_AIO_INFLIGHT (or 0) to disable the boost.
+#define AMPR_EMU_APR_AIO_SMALL_READ_INFLIGHT 48
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_SMALL_READ_MAX_BYTES
+// A request at or below this size is considered small for dynamic AIO-window
+// growth. The threshold applies to the actual SDK AIO slice, not file size.
+#define AMPR_EMU_APR_AIO_SMALL_READ_MAX_BYTES 0x10000u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_SMALL_READ_MIN_PERCENT
+// Minimum percentage of currently active requests that must be small before
+// the reactor may grow from the base window to SMALL_READ_INFLIGHT.
+#define AMPR_EMU_APR_AIO_SMALL_READ_MIN_PERCENT 75u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_SMALL_READ_MAX_OLDEST_MS
+// Never enable the small-read boost when an already-submitted request is older
+// than this value. Age-based backpressure always has priority over the boost.
+#define AMPR_EMU_APR_AIO_SMALL_READ_MAX_OLDEST_MS 50u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_SMALL_READ_BOOST_RECOVERY_COOLDOWN_MS
+// After age-based backpressure returns to Normal, keep the reactor at the base
+// window for this long before small-read growth may be enabled again. This
+// prevents short threshold excursions from immediately bouncing 24 -> 32 -> 48
+// and feeding the SDK queue before it has stabilized.
+#define AMPR_EMU_APR_AIO_SMALL_READ_BOOST_RECOVERY_COOLDOWN_MS 250u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_THROTTLE_MEDIUM_AGE_MS
+// Live SDK-queue backpressure. When the oldest outstanding request reaches this
+// age, admission stops refilling above the medium window.
+#define AMPR_EMU_APR_AIO_THROTTLE_MEDIUM_AGE_MS 250u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_THROTTLE_SEVERE_AGE_MS
+// Severe threshold for an outstanding AIO that is being starved/reordered.
+#define AMPR_EMU_APR_AIO_THROTTLE_SEVERE_AGE_MS 500u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_THROTTLE_EMERGENCY_AGE_MS
+// Emergency threshold. Once an already-submitted request has remained
+// outstanding for this long, stop refilling above the emergency window and
+// give the SDK/storage scheduler room to drain its oldest work.
+#define AMPR_EMU_APR_AIO_THROTTLE_EMERGENCY_AGE_MS 1000u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_THROTTLE_MEDIUM_INFLIGHT
+#define AMPR_EMU_APR_AIO_THROTTLE_MEDIUM_INFLIGHT 24u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_THROTTLE_SEVERE_INFLIGHT
+#define AMPR_EMU_APR_AIO_THROTTLE_SEVERE_INFLIGHT 16u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_THROTTLE_EMERGENCY_INFLIGHT
+#define AMPR_EMU_APR_AIO_THROTTLE_EMERGENCY_INFLIGHT 8u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_THROTTLE_RECOVER_NORMAL_MS
+// Hysteresis: a medium throttle is released only after the oldest request has
+// fallen below this age.
+#define AMPR_EMU_APR_AIO_THROTTLE_RECOVER_NORMAL_MS 50u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_THROTTLE_RECOVER_MEDIUM_MS
+// Hysteresis: a severe throttle steps back to medium below this age.
+#define AMPR_EMU_APR_AIO_THROTTLE_RECOVER_MEDIUM_MS 100u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_THROTTLE_RECOVER_SEVERE_MS
+// Hysteresis: an emergency throttle steps back to severe only after the oldest
+// request falls below this age. This preserves a real 8 -> 16 -> 24 -> 32
+// recovery ladder instead of jumping directly out of emergency mode.
+#define AMPR_EMU_APR_AIO_THROTTLE_RECOVER_SEVERE_MS 250u
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_SDK_SCHED_HEADROOM
-// Extra SDK AIO scheduler/delayed slots above the reactor's active read window.
-// The reactor clamps the final SDK parameter values to SDK caps.
+// Extra SDK AIO scheduler/delayed slots above the reactor's maximum dynamic
+// active-read window. The reactor clamps the final values to SDK caps.
 #define AMPR_EMU_APR_AIO_SDK_SCHED_HEADROOM 32
 #endif
 
@@ -160,13 +242,13 @@
 
 #ifndef AMPR_EMU_APR_AIO_POLL_BACKOFF_MIN_NS
 // First no-completion poll backoff for an active AIO request.
-#define AMPR_EMU_APR_AIO_POLL_BACKOFF_MIN_NS 25000
+#define AMPR_EMU_APR_AIO_POLL_BACKOFF_MIN_NS 10000
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_POLL_FAST_WINDOW_NS
 // Request age window that keeps polling at the minimum backoff. After this
 // likely-completion window, the per-request backoff grows adaptively.
-#define AMPR_EMU_APR_AIO_POLL_FAST_WINDOW_NS 100000
+#define AMPR_EMU_APR_AIO_POLL_FAST_WINDOW_NS 250000
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_POLL_BACKOFF_MAX_NS
@@ -178,7 +260,7 @@
 #ifndef AMPR_EMU_APR_AIO_POLL_DEPENDENT_BACKOFF_MAX_NS
 // Maximum per-request poll backoff for reads that can hold APR result/fence
 // publication. Pure background reads may still use the larger max above.
-#define AMPR_EMU_APR_AIO_POLL_DEPENDENT_BACKOFF_MAX_NS 200000
+#define AMPR_EMU_APR_AIO_POLL_DEPENDENT_BACKOFF_MAX_NS 100000
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_POLL_STAGED_EOP_BACKOFF_MAX_NS
@@ -198,15 +280,10 @@
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_CROSS_EOP_MAX_FENCES
-// Maximum number of source-ordered completion fences retained by one job and
-// non-read boundaries crossed in one scanner pass while read-ahead is enabled.
+// Maximum number of source-ordered completion fences retained by one job.
+// Read-ahead itself is deliberately not depth-tunable: the reactor may execute
+// at most one speculative command per priority lane in each reactor tick.
 #define AMPR_EMU_APR_AIO_CROSS_EOP_MAX_FENCES 64
-#endif
-
-#ifndef AMPR_EMU_APR_AIO_CROSS_EOP_READS_PER_PASS
-// Maximum number of new logical reads admitted by read-ahead in one parser
-// pass. Later passes resume at the saved lookahead cursor.
-#define AMPR_EMU_APR_AIO_CROSS_EOP_READS_PER_PASS 8
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_POLL_SMALL_BACKGROUND_BYTES
@@ -221,25 +298,8 @@
 #define AMPR_EMU_APR_AIO_POLL_SMALL_BACKGROUND_BACKOFF_MAX_NS 500000
 #endif
 
-#ifndef AMPR_EMU_APR_AIO_SUBMIT_PRE_DRAIN_PASSES
-// Completion-drain passes used before admission only when the active window is
-// already full.
-#define AMPR_EMU_APR_AIO_SUBMIT_PRE_DRAIN_PASSES 2
-#endif
-
-#ifndef AMPR_EMU_APR_AIO_SUBMIT_POST_DRAIN_PASSES
-// Completion-drain passes after the admission loop has filled all ready slots.
-#define AMPR_EMU_APR_AIO_SUBMIT_POST_DRAIN_PASSES 1
-#endif
-
-#ifndef AMPR_EMU_APR_PENDING_READ_IDLE_SLEEP_NS
-// Reactor sleep when pending reads exist but no progress was possible in this
-// pass, usually because a temporary AIO/FD/backpressure gate is active.
-#define AMPR_EMU_APR_PENDING_READ_IDLE_SLEEP_NS 50000
-#endif
-
 #ifndef AMPR_EMU_APR_AIO_SUBMIT_RETRY_DELAY_NS
-// Avoid immediately resubmitting the same pending read when the process-wide
+// Avoid immediately resubmitting the same active read when the process-wide
 // SDK AIO id/window pool reports transient exhaustion.
 #define AMPR_EMU_APR_AIO_SUBMIT_RETRY_DELAY_NS 50000
 #endif
@@ -247,13 +307,13 @@
 #ifndef AMPR_EMU_APR_ACTIVE_LANE_IDLE_SLEEP_NS
 // Reactor sleep when command-buffer lanes are active but no parser or
 // completion progress happened.
-#define AMPR_EMU_APR_ACTIVE_LANE_IDLE_SLEEP_NS 100000
+#define AMPR_EMU_APR_ACTIVE_LANE_IDLE_SLEEP_NS 10000
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_DISPATCH_QUANTUM_BYTES
 // A53 package reads yield after eight 64 KiB NSID2 device operations. One
 // software-visible AIO request represents that fixed 512 KiB yield quantum.
-#define AMPR_EMU_APR_AIO_DISPATCH_QUANTUM_BYTES 0x100000u // 0x80000u
+#define AMPR_EMU_APR_AIO_DISPATCH_QUANTUM_BYTES 0x80000u
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_DIRECT_SMALL_FULL_FILE_BYTES
@@ -283,15 +343,6 @@
 #define AMPR_EMU_APR_FD_PRESSURE_SCORE_MAX 4
 #endif
 
-#ifndef AMPR_EMU_APR_REACTOR_JOB_BATCH_LIMIT
-// Maximum APR jobs parsed before the reactor returns to pending AIO submission.
-// This prevents a large burst of tiny command buffers from starving reads that
-// were already queued by earlier jobs in the same reactor cycle. When the limit
-// is reached with pending reads or several populated lanes, the next parser pass
-// resumes at the following priority. A sole active lane remains uninterrupted.
-#define AMPR_EMU_APR_REACTOR_JOB_BATCH_LIMIT 32
-#endif
-
 #ifndef AMPR_EMU_APR_REACTOR_THREAD_PRIORITY
 // Prospero FIFO priorities: lower numbers are higher priority; default is 700.
 // Raise a default-priority APR AIO owner ahead of ordinary loader spin loops,
@@ -304,12 +355,6 @@
 // 0x3f is the SDK user-CPU mask used here to avoid inheriting a narrow loader
 // thread affinity.
 #define AMPR_EMU_APR_REACTOR_THREAD_AFFINITY 0x3f
-#endif
-
-#ifndef AMPR_EMU_APR_PENDING_READ_QUEUE_LIMIT
-// Fixed backing capacity for deferred APR reads. Normal parsing is gated by the
-// active AIO window, so this only needs headroom for retry/defer cases.
-#define AMPR_EMU_APR_PENDING_READ_QUEUE_LIMIT 512
 #endif
 
 #ifndef AMPR_EMU_INTERNAL_AMM_POOL_SIZE
@@ -424,7 +469,7 @@
 
 // Version
 #ifndef AMPR_EMU_VERSION
-#define AMPR_EMU_VERSION "0.3.1.1 (public beta) (c) Drakmor"
+#define AMPR_EMU_VERSION "0.3.2 (public beta) (c) Drakmor"
 #endif
 
 #ifndef AMPR_EMU_DEBUG_LOG

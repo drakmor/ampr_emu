@@ -211,6 +211,7 @@ class AprOrderEvent:
     blocker_source: str
     blocker_op: str
     pending_reads: int
+    read_chains: int
     active_reads: int
     active_jobs: int
     incoming: int
@@ -306,6 +307,7 @@ class ReactorStateSample:
     reason: str
     active_jobs: int
     pending_reads: int
+    read_chains: int
     active_reads: int
     pending: int
     incoming: int
@@ -317,6 +319,8 @@ class ReactorStateSample:
     op_index: int
     commands: int
     op: str
+    job_cursor_read: int
+    job_speculative_read: int
     job_pending: int
     job_active: int
     job_ready_completions: int
@@ -592,10 +596,12 @@ class LogStats:
     stall_ops: Counter = field(default_factory=Counter)
     stall_max_active_jobs: int = 0
     stall_max_pending_reads: int = 0
+    stall_max_read_chains: int = 0
     stall_max_active_reads: int = 0
     stall_max_aio_age_ms: int = 0
     max_reactor_active_jobs: int = 0
     max_reactor_pending_reads: int = 0
+    max_reactor_read_chains: int = 0
     max_reactor_active_reads: int = 0
     max_reactor_incoming: int = 0
     stall_aio_samples: Dict[int, AioStallSample] = field(default_factory=dict)
@@ -622,6 +628,7 @@ class LogStats:
     pending_read_queue_submit_latency: WindowLatencyAggregate = field(
         default_factory=WindowLatencyAggregate
     )
+    saw_cursor_direct_read_metrics: bool = False
     reactor_active_loop_gap_latency: WindowLatencyAggregate = field(
         default_factory=WindowLatencyAggregate
     )
@@ -675,6 +682,10 @@ def parse_int(value: Optional[str]) -> Optional[int]:
     if value is None:
         return None
     value = value.rstrip(",")
+    # Occupancy counters are commonly logged as current/capacity. Callers of
+    # parse_int want the current value; the capacity is reported separately.
+    if "/" in value:
+        value = value.split("/", 1)[0]
     try:
         return int(value, 0)
     except ValueError:
@@ -702,6 +713,27 @@ def add_window_latency(
         aggregate.max_window_p99_us,
         parse_int(kv.get(f"{stem}P99Us")) or 0,
     )
+
+
+def add_window_latency_alias(
+    aggregate: WindowLatencyAggregate,
+    kv: Dict[str, str],
+    *stems: str,
+) -> Optional[str]:
+    """Parse the first latency stem present, allowing old and cursor-direct logs."""
+    for stem in stems:
+        if any(
+            key in kv
+            for key in (
+                f"{stem}Count",
+                f"{stem}TotalUs",
+                f"{stem}AvgUs",
+                f"{stem}MaxUs",
+            )
+        ):
+            add_window_latency(aggregate, kv, stem)
+            return stem
+    return None
 
 
 def priority_admission_latency(
@@ -999,6 +1031,7 @@ def add_apr_order_sample(stats: LogStats, sample: AprOrderEvent, limit: int = 20
     if len(stats.apr_order_samples) > limit:
         del stats.apr_order_samples[0 : len(stats.apr_order_samples) - limit]
     stats.max_reactor_pending_reads = max(stats.max_reactor_pending_reads, sample.pending_reads)
+    stats.max_reactor_read_chains = max(stats.max_reactor_read_chains, sample.read_chains)
     stats.max_reactor_active_reads = max(stats.max_reactor_active_reads, sample.active_reads)
     stats.max_reactor_active_jobs = max(stats.max_reactor_active_jobs, sample.active_jobs)
     stats.max_reactor_incoming = max(stats.max_reactor_incoming, sample.incoming)
@@ -1227,6 +1260,7 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
         pending = parse_int(kv.get("pending"))
         active_lanes = parse_active_lanes(kv)
         pending_reads = parse_int(kv.get("pendingReads"))
+        read_chains = parse_int(kv.get("readChains"))
         active_reads = parse_int(kv.get("activeReads"))
         if pending is not None:
             stats.apr_submit_backpressure_max_pending = max(
@@ -1393,6 +1427,7 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
                 blocker_source=blocker_source,
                 blocker_op=kv.get("blockerOp", ""),
                 pending_reads=parse_int(kv.get("pendingReads")) or 0,
+                read_chains=parse_int(kv.get("readChains")) or 0,
                 active_reads=parse_int(kv.get("activeReads")) or 0,
                 active_jobs=parse_active_lanes(kv) or 0,
                 incoming=parse_int(kv.get("incoming")) or 0,
@@ -1422,6 +1457,7 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
                 blocker_source="same-job-seq",
                 blocker_op="pending-read",
                 pending_reads=parse_int(kv.get("pendingReads")) or 0,
+                read_chains=parse_int(kv.get("readChains")) or 0,
                 active_reads=parse_int(kv.get("activeReads")) or 0,
                 active_jobs=0,
                 incoming=0,
@@ -1697,6 +1733,7 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
                 blocker_source="incoming-map-op",
                 blocker_op=kv.get("blockerOp", ""),
                 pending_reads=parse_int(kv.get("pendingReads")) or 0,
+                read_chains=parse_int(kv.get("readChains")) or 0,
                 active_reads=parse_int(kv.get("activeReads")) or 0,
                 active_jobs=parse_active_lanes(kv) or 0,
                 incoming=parse_int(kv.get("incoming")) or 0,
@@ -1712,11 +1749,13 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
 
     elif prefix == "apr.reactor.counters.admission":
         add_window_latency(stats.job_queue_first_aio_latency, kv, "jobQueueFirstAio")
-        add_window_latency(
+        stem = add_window_latency_alias(
             stats.pending_read_queue_submit_latency,
             kv,
+            "readReadyAio",
             "pendingReadQueueSubmit",
         )
+        stats.saw_cursor_direct_read_metrics |= stem == "readReadyAio"
 
     elif prefix == "apr.reactor.counters.admission.stage":
         add_window_latency(
@@ -1724,11 +1763,13 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
             kv,
             "jobQueueFirstRead",
         )
-        add_window_latency(
+        stem = add_window_latency_alias(
             stats.first_read_queue_first_aio_latency,
             kv,
+            "firstReadReadyFirstAio",
             "firstReadQueueFirstAio",
         )
+        stats.saw_cursor_direct_read_metrics |= stem == "firstReadReadyFirstAio"
 
     elif prefix == "apr.reactor.counters.loop":
         add_window_latency(
@@ -1745,29 +1786,41 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
     elif prefix == "apr.reactor.counters.admission.prio.job":
         priority = parse_int(kv.get("aprPrio"))
         if priority is not None and 0 <= priority < APR_PRIORITY_LANES:
-            for stage, stem in (
-                ("job_queue_first_read", "jobQueueFirstRead"),
-                ("first_read_queue_first_aio", "firstReadQueueFirstAio"),
-                ("job_queue_first_aio", "jobQueueFirstAio"),
-            ):
-                add_window_latency(
-                    priority_admission_latency(stats, priority, stage),
-                    kv,
-                    stem,
-                )
+            add_window_latency(
+                priority_admission_latency(stats, priority, "job_queue_first_read"),
+                kv,
+                "jobQueueFirstRead",
+            )
+            stem = add_window_latency_alias(
+                priority_admission_latency(stats, priority, "first_read_queue_first_aio"),
+                kv,
+                "firstReadReadyFirstAio",
+                "firstReadQueueFirstAio",
+            )
+            stats.saw_cursor_direct_read_metrics |= stem == "firstReadReadyFirstAio"
+            add_window_latency(
+                priority_admission_latency(stats, priority, "job_queue_first_aio"),
+                kv,
+                "jobQueueFirstAio",
+            )
 
-    elif prefix == "apr.reactor.counters.admission.prio.pending":
+    elif prefix in (
+        "apr.reactor.counters.admission.prio.read",
+        "apr.reactor.counters.admission.prio.pending",
+    ):
         priority = parse_int(kv.get("aprPrio"))
         if priority is not None and 0 <= priority < APR_PRIORITY_LANES:
-            add_window_latency(
+            stem = add_window_latency_alias(
                 priority_admission_latency(
                     stats,
                     priority,
                     "pending_read_queue_submit",
                 ),
                 kv,
+                "readReadyAio",
                 "pendingReadQueueSubmit",
             )
+            stats.saw_cursor_direct_read_metrics |= stem == "readReadyAio"
 
     elif prefix == "apr.reactor.counters.batch":
         batch = stats.aio_batch_metrics
@@ -1833,6 +1886,7 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
                 reason=kv.get("reason", "unknown"),
                 active_jobs=parse_active_lanes(kv) or 0,
                 pending_reads=parse_int(kv.get("pendingReads")) or 0,
+                read_chains=parse_int(kv.get("readChains")) or 0,
                 active_reads=parse_int(kv.get("activeReads")) or 0,
                 pending=parse_int(kv.get("pending")) or 0,
                 incoming=parse_int(kv.get("incoming")) or 0,
@@ -1844,6 +1898,8 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
                 op_index=parse_int(kv.get("opIndex")) or 0,
                 commands=parse_int(kv.get("commands")) or 0,
                 op=kv.get("op", ""),
+                job_cursor_read=parse_int(kv.get("jobCursorRead")) or 0,
+                job_speculative_read=parse_int(kv.get("jobSpeculativeRead")) or 0,
                 job_pending=parse_int(kv.get("jobPending")) or 0,
                 job_active=parse_int(kv.get("jobActive")) or 0,
                 job_ready_completions=parse_int(kv.get("jobReadyCompletions")) or 0,
@@ -2124,6 +2180,9 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
         if pending_reads is not None:
             stats.stall_max_pending_reads = max(stats.stall_max_pending_reads, pending_reads)
             stats.max_apr_backlog = max(stats.max_apr_backlog, pending_reads)
+        if read_chains is not None:
+            stats.stall_max_read_chains = max(stats.stall_max_read_chains, read_chains)
+            stats.max_reactor_read_chains = max(stats.max_reactor_read_chains, read_chains)
         if active_reads is not None:
             stats.stall_max_active_reads = max(stats.stall_max_active_reads, active_reads)
             stats.max_aio_active = max(stats.max_aio_active, active_reads)
@@ -2142,6 +2201,10 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
             job.last_stall_active_reads = parse_int(kv.get("jobActive"))
         add_stall_aio_sample(stats, line_no, seq, kv, "first", "first")
         add_stall_aio_sample(stats, line_no, seq, kv, "oldest", "oldest")
+
+    read_chains = parse_int(kv.get("readChains"))
+    if read_chains is not None:
+        stats.max_reactor_read_chains = max(stats.max_reactor_read_chains, read_chains)
 
     if prefix == "apr.index":
         if " building runtime index" in body:
@@ -2742,10 +2805,15 @@ def build_findings(stats: LogStats) -> List[str]:
             f"pending={stats.max_done_pending}, pendingWaits={stats.max_done_pending_waits}."
         )
     if stats.max_reactor_active_jobs >= 64 or stats.max_apr_backlog >= 128 or stats.max_reactor_incoming >= 64:
+        read_backlog = (
+            f"readChains={stats.max_reactor_read_chains}"
+            if stats.saw_cursor_direct_read_metrics or stats.max_reactor_read_chains
+            else f"pendingReads={stats.max_reactor_pending_reads}"
+        )
         findings.append(
             f"APR reactor backlog peaked at {active_label}={stats.max_reactor_active_jobs}, "
             f"pending={stats.max_apr_backlog}, incoming={stats.max_reactor_incoming}, "
-            f"pendingReads={stats.max_reactor_pending_reads}, activeReads={stats.max_reactor_active_reads}."
+            f"{read_backlog}, activeReads={stats.max_reactor_active_reads}."
         )
     if stats.pending_detail_samples:
         latest = stats.pending_detail_samples[-1]
@@ -2792,11 +2860,22 @@ def build_findings(stats: LogStats) -> List[str]:
                 f"waitable:{latest_state.job_waitable}, completionQueues="
                 f"{latest_state.job_ready_completions}/{latest_state.job_completion_ops}"
             )
+        state_reads = (
+            f"readChains={latest_state.read_chains}"
+            if stats.saw_cursor_direct_read_metrics or latest_state.read_chains
+            else f"pendingReads={latest_state.pending_reads}"
+        )
+        cursor_flags = ""
+        if stats.saw_cursor_direct_read_metrics or latest_state.read_chains:
+            cursor_flags = (
+                f", cursorRead={latest_state.job_cursor_read}, "
+                f"speculativeRead={latest_state.job_speculative_read}"
+            )
         findings.append(
             f"Latest APR reactor state ({latest_state.reason}): {active_label}={latest_state.active_jobs}, "
-            f"pendingReads={latest_state.pending_reads}, activeReads={latest_state.active_reads}, "
+            f"{state_reads}, activeReads={latest_state.active_reads}, "
             f"pending={latest_state.pending}, incoming={latest_state.incoming}, firstJob=0x{latest_state.first_job:x}, "
-            f"op={latest_state.op}, firstAioAge={latest_state.first_aio_age_ms} ms{job_flags}."
+            f"op={latest_state.op}{cursor_flags}, firstAioAge={latest_state.first_aio_age_ms} ms{job_flags}."
         )
     if stats.stall_max_pending_reads:
         findings.append(
@@ -3016,7 +3095,10 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
     print(f"  max APR backlog:     {stats.max_apr_backlog}")
     print(f"  max reactor active:  {stats.max_reactor_active_jobs} ({active_label})")
     print(f"  max pending/incoming:{stats.max_apr_backlog}/{stats.max_reactor_incoming}")
-    print(f"  max reads pend/act:  {stats.max_reactor_pending_reads}/{stats.max_reactor_active_reads}")
+    if stats.saw_cursor_direct_read_metrics or stats.max_reactor_read_chains:
+        print(f"  max read chains/act: {stats.max_reactor_read_chains}/{stats.max_reactor_active_reads}")
+    else:
+        print(f"  max reads pend/act:  {stats.max_reactor_pending_reads}/{stats.max_reactor_active_reads}")
     print(f"  max submit backlog:  {stats.max_submit_backlog}")
     first_read_admission = stats.job_queue_first_read_latency
     first_submit_admission = stats.first_read_queue_first_aio_latency
@@ -3062,8 +3144,8 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
             f"{first_read_admission.max_window_p99_us}"
         )
         print(
-            "  first queued->AIO us:"
-            f" count={first_submit_admission.count} avg={first_submit_avg:.1f} "
+            ("  first ready->AIO us:" if stats.saw_cursor_direct_read_metrics else "  first queued->AIO us:")
+            + f" count={first_submit_admission.count} avg={first_submit_avg:.1f} "
             f"max={first_submit_admission.max_us} maxWindowP95/P99="
             f"{first_submit_admission.max_window_p95_us}/"
             f"{first_submit_admission.max_window_p99_us}"
@@ -3075,8 +3157,8 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
             f"{job_admission.max_window_p99_us}"
         )
         print(
-            "  pending->submit us: "
-            f"count={pending_admission.count} avg={pending_avg:.1f} "
+            ("  read ready->AIO us: " if stats.saw_cursor_direct_read_metrics else "  pending->submit us: ")
+            + f"count={pending_admission.count} avg={pending_avg:.1f} "
             f"max={pending_admission.max_us} maxWindowP95/P99="
             f"{pending_admission.max_window_p95_us}/{pending_admission.max_window_p99_us}"
         )
@@ -3098,11 +3180,13 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
         for priority in sorted(stats.admission_priority_latency):
             stages = stats.admission_priority_latency[priority]
             parts = []
+            first_label = "ready->AIO" if stats.saw_cursor_direct_read_metrics else "queue->AIO"
+            read_label = "read-ready->AIO" if stats.saw_cursor_direct_read_metrics else "pending->submit"
             for label, stage in (
-                ("job->queue", "job_queue_first_read"),
-                ("queue->AIO", "first_read_queue_first_aio"),
+                ("job->read", "job_queue_first_read"),
+                (first_label, "first_read_queue_first_aio"),
                 ("job->AIO", "job_queue_first_aio"),
-                ("pending->submit", "pending_read_queue_submit"),
+                (read_label, "pending_read_queue_submit"),
             ):
                 aggregate = stages.get(stage, WindowLatencyAggregate())
                 average = aggregate.total_us / aggregate.count if aggregate.count else 0.0
@@ -3622,12 +3706,18 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
             "first_read_queue_first_aio": window_latency_to_json(
                 stats.first_read_queue_first_aio_latency
             ),
+            "first_read_ready_first_aio": window_latency_to_json(
+                stats.first_read_queue_first_aio_latency
+            ) if stats.saw_cursor_direct_read_metrics else None,
             "job_queue_first_aio": window_latency_to_json(
                 stats.job_queue_first_aio_latency
             ),
             "pending_read_queue_submit": window_latency_to_json(
                 stats.pending_read_queue_submit_latency
             ),
+            "read_ready_aio": window_latency_to_json(
+                stats.pending_read_queue_submit_latency
+            ) if stats.saw_cursor_direct_read_metrics else None,
             "active_loop_gap": window_latency_to_json(
                 stats.reactor_active_loop_gap_latency
             ),
@@ -3971,6 +4061,7 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
         "max_reactor_active_lanes": stats.max_reactor_active_jobs,
         "max_reactor_active_jobs": stats.max_reactor_active_jobs,
         "max_reactor_pending_reads": stats.max_reactor_pending_reads,
+        "max_reactor_read_chains": stats.max_reactor_read_chains,
         "max_reactor_active_reads": stats.max_reactor_active_reads,
         "max_reactor_incoming": stats.max_reactor_incoming,
         "max_submit_backlog": stats.max_submit_backlog,
@@ -4006,6 +4097,7 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
                     "blocker_source": item.blocker_source,
                     "blocker_op": item.blocker_op,
                     "pending_reads": item.pending_reads,
+                    "read_chains": item.read_chains,
                     "active_reads": item.active_reads,
                     "active_lanes": item.active_jobs,
                     "active_jobs": item.active_jobs,
@@ -4249,6 +4341,7 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
         "stall_max_active_lanes": stats.stall_max_active_jobs,
         "stall_max_active_jobs": stats.stall_max_active_jobs,
         "stall_max_pending_reads": stats.stall_max_pending_reads,
+        "stall_max_read_chains": stats.stall_max_read_chains,
         "stall_max_active_reads": stats.stall_max_active_reads,
         "stall_max_aio_age_ms": stats.stall_max_aio_age_ms,
         "stall_ops": dict(stats.stall_ops),
