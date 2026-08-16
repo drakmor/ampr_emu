@@ -114,11 +114,48 @@
 #define AMPR_EMU_APR_AIO_INFLIGHT 32
 #endif
 
-#ifndef AMPR_EMU_APR_AIO_PER_FILE_INFLIGHT
-// Soft number of active SDK AIO read IDs for one APR fileId. Files below this
-// level are filled first; once no ready file remains below it, pending files may
-// borrow the unused global window. 0 disables the per-file preference.
-#define AMPR_EMU_APR_AIO_PER_FILE_INFLIGHT 16
+#ifndef AMPR_EMU_APR_READ_CHUNK_QUANTUM
+// Maximum number of new host AIO requests one APR priority lane may admit in
+// one scheduler pass. The byte budget below is applied at the same time, so
+// four request slots are shared across consecutive jobs in the same priority
+// lane. The byte budget still prevents a large sequential burst.
+#define AMPR_EMU_APR_READ_CHUNK_QUANTUM 8u
+#endif
+
+#ifndef AMPR_EMU_APR_READ_PASS_MAX_BYTES
+// Execution-cursor reads and cross-EOP read-ahead share this charged-byte
+// budget for one APR priority-lane scheduler pass. A request is never split
+// merely to fit the unused tail of the budget.
+#define AMPR_EMU_APR_READ_PASS_MAX_BYTES 0x80000u
+#endif
+
+#ifndef AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES
+// Scheduler/admission byte accounting granule only. Actual AIO request lengths
+// are unchanged: 1..64 KiB costs 64 KiB of credit, 64 KiB+1..128 KiB costs
+// 128 KiB, and so on.
+#define AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES 0x10000u
+#endif
+
+#ifndef AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
+// Maximum simultaneously live AIO IDs owned by one logical readFile ReadChain.
+// The byte window below is enforced at the same time.
+#define AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS 8u
+#endif
+
+#ifndef AMPR_EMU_APR_PER_READ_ACTIVE_BYTES
+// Maximum charged in-flight bytes for one logical readFile. Each request is
+// rounded up to AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES for admission only.
+// Thus a full 512 KiB chunk behaves like 1 x 512 KiB, while up to eight <=64 KiB
+// requests can coexist in the same 512 KiB window.
+#define AMPR_EMU_APR_PER_READ_ACTIVE_BYTES 0x80000u
+#endif
+
+#ifndef AMPR_EMU_APR_GROUP_SOFT_TARGETS
+// Approximate A53's three NSID2 package-read groups over the single userspace
+// AIO window: priority 0 -> U, priorities 1..3 -> H, priorities 4..6 -> N.
+// Targets are soft: unused capacity is borrowable, but a group above target
+// yields new admissions while another ready group is still below target.
+#define AMPR_EMU_APR_GROUP_SOFT_TARGETS 1
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_SMALL_READ_INFLIGHT
@@ -126,7 +163,7 @@
 // dominated by small reads. Extra slots above AMPR_EMU_APR_AIO_INFLIGHT are
 // filled with small requests only, so bulk traffic cannot consume the boost.
 // Set to AMPR_EMU_APR_AIO_INFLIGHT (or 0) to disable the boost.
-#define AMPR_EMU_APR_AIO_SMALL_READ_INFLIGHT 48
+#define AMPR_EMU_APR_AIO_SMALL_READ_INFLIGHT 64
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_SMALL_READ_MAX_BYTES
@@ -206,7 +243,7 @@
 #ifndef AMPR_EMU_APR_AIO_SDK_SCHED_HEADROOM
 // Extra SDK AIO scheduler/delayed slots above the reactor's maximum dynamic
 // active-read window. The reactor clamps the final values to SDK caps.
-#define AMPR_EMU_APR_AIO_SDK_SCHED_HEADROOM 32
+#define AMPR_EMU_APR_AIO_SDK_SCHED_HEADROOM 48
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_POLL_IDLE_SLEEP_NS
@@ -469,7 +506,7 @@
 
 // Version
 #ifndef AMPR_EMU_VERSION
-#define AMPR_EMU_VERSION "0.3.2 (public beta) (c) Drakmor"
+#define AMPR_EMU_VERSION "0.3.3 (public beta) (c) Drakmor"
 #endif
 
 #ifndef AMPR_EMU_DEBUG_LOG

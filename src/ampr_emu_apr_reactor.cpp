@@ -945,6 +945,25 @@ private:
     static_assert(AMPR_EMU_APR_AIO_CROSS_EOP_MAX_FENCES > 0,
                   "APR cross-EOP read-ahead needs at least one fence slot");
 #endif
+    static_assert(AMPR_EMU_APR_READ_CHUNK_QUANTUM >= 1u &&
+                  AMPR_EMU_APR_READ_CHUNK_QUANTUM <= 8u,
+                  "A53 bridge read request quantum must stay in the 1..8 host range");
+    static_assert(AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES != 0 &&
+                  (AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES &
+                   (AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES - 1u)) == 0,
+                  "A53 bridge read credit granule must be a power of two");
+    static_assert(AMPR_EMU_APR_READ_PASS_MAX_BYTES >= kSoftwareReadChunkMax,
+                  "A53 bridge pass byte budget must fit one maximum AIO chunk");
+    static_assert(AMPR_EMU_APR_READ_PASS_MAX_BYTES %
+                      AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES == 0,
+                  "A53 bridge pass byte budget must align to the credit granule");
+    static_assert(AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS >= 1u,
+                  "A53 bridge per-read active request window must be non-zero");
+    static_assert(AMPR_EMU_APR_PER_READ_ACTIVE_BYTES >= kSoftwareReadChunkMax,
+                  "A53 bridge per-read byte window must fit one maximum AIO chunk");
+    static_assert(AMPR_EMU_APR_PER_READ_ACTIVE_BYTES %
+                      AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES == 0,
+                  "A53 bridge per-read byte window must align to the credit granule");
     static_assert(AMPR_EMU_APR_AIO_GATING_SPIN_POLLS <= kAioPollBatchLimit,
                   "APR AIO gating spin polls must fit the poll batch");
     static_assert(AMPR_EMU_APR_AIO_POLL_SMALL_BACKGROUND_BACKOFF_MAX_NS >= AMPR_EMU_APR_AIO_POLL_BACKOFF_MIN_NS,
@@ -971,12 +990,33 @@ private:
         uint64_t seq{};
         size_t commandIndex{};
         uint32_t activeCount{};
+        // 64 KiB-rounded admission credit held by live slices, not literal I/O bytes.
+        uint64_t activeBytes{};
         uint32_t poolSlot{UINT32_MAX};
         bool allIssued{false};
 #if AMPR_EMU_DEBUG_LOG
         uint64_t nativeTriggerTimeNs{};
         uint64_t sliceReadyTimeNs{};
 #endif
+    };
+
+    struct ReadIssueBudget {
+        uint32_t requestsLeft{};
+        // Remaining 64 KiB-rounded admission credit for this lane pass.
+        uint64_t bytesLeft{};
+
+        bool can_admit(uint64_t bytes) const {
+            return requestsLeft != 0 && bytes != 0 && bytes <= bytesLeft;
+        }
+
+        void consume(uint64_t bytes) {
+            if (requestsLeft == 0 || bytes == 0 || bytes > bytesLeft) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.readBudget.consume.invalid file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            --requestsLeft;
+            bytesLeft -= bytes;
+        }
     };
 
     struct ReadChainSlot {
@@ -1280,6 +1320,7 @@ private:
         int aioPrio{SCE_KERNEL_AIO_PRIORITY_MID};
         uint64_t seq{};
         size_t commandIndex{};
+        uint64_t readCreditBytes{};
         uint64_t submitTimeNs{};
 #if AMPR_EMU_DEBUG_LOG
         uint64_t nativeTriggerTimeNs{};
@@ -1303,7 +1344,6 @@ private:
         bool hotPollQueued{false};
         bool retrySlice{false};
         bool awaitingResubmit{false};
-        bool activeFileCounted{false};
     };
 
     struct HotPollEntry {
@@ -1653,10 +1693,6 @@ private:
     ActiveReadIt erase_active_read(ActiveReadIt it) {
         if (it == activeReads.end()) {
             return activeReads.end();
-        }
-        if (it->activeFileCounted) {
-            activeFileCounts.decrement(it->desc.fileId);
-            it->activeFileCounted = false;
         }
         remove_poll_deadline(*it);
         unlink_active_read_from_job(*it);
@@ -3652,16 +3688,39 @@ private:
         }
     }
 
-    static void increment_read_chain_active(ReadChain* chain) {
-        if (chain && chain->activeCount != UINT32_MAX) {
-            ++chain->activeCount;
+    static uint64_t read_credit_bytes(uint64_t requestBytes) {
+        const uint64_t granule =
+            static_cast<uint64_t>(AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES);
+        if (requestBytes == 0) {
+            return 0;
         }
+        const uint64_t remainder = requestBytes & (granule - 1ull);
+        return remainder == 0 ? requestBytes : requestBytes + (granule - remainder);
     }
 
-    static void decrement_read_chain_active(ReadChain* chain) {
-        if (chain && chain->activeCount != 0) {
-            --chain->activeCount;
+    static void increment_read_chain_active(ReadChain* chain, uint64_t bytes) {
+        if (!chain) {
+            return;
         }
+        if (chain->activeCount == UINT32_MAX ||
+            chain->activeBytes > (std::numeric_limits<uint64_t>::max)() - bytes) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.readChain.active.overflow file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        ++chain->activeCount;
+        chain->activeBytes += bytes;
+    }
+
+    static void decrement_read_chain_active(ReadChain* chain, uint64_t bytes) {
+        if (!chain) {
+            return;
+        }
+        if (chain->activeCount == 0 || chain->activeBytes < bytes) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.readChain.active.underflow file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        --chain->activeCount;
+        chain->activeBytes -= bytes;
     }
 
     void abandon_unsubmitted_read_chain(ReadChain*& slot) {
@@ -3908,7 +3967,8 @@ private:
         // Error handling can remove the last future slice and retire the chain
         // synchronously. Treat a repeated finish attempt as a no-op instead of
         // touching a slot that has already returned to the fixed pool.
-        if (!read_chain_is_live(chain) || chain->activeCount != 0) {
+        if (!read_chain_is_live(chain) || chain->activeCount != 0 ||
+            chain->activeBytes != 0) {
             return;
         }
         JobPtr job = chain->job;
@@ -4039,18 +4099,144 @@ private:
         }
     }
 
-    bool has_waiting_cursor_file_under_limit(uint32_t fileId,
-                                             uint32_t perFileLimit) const {
-        for (size_t priority = 0; priority < kPriorityCount; ++priority) {
-            const CursorReadWaitHint& hint = cursorReadWaitHints[priority];
-            if (!hint.valid || hint.fileId == fileId) {
+
+    enum class A53ReadGroup : uint8_t {
+        Urgent = 0,
+        High = 1,
+        Normal = 2,
+        Count = 3,
+    };
+
+    struct A53ReadGroupCounts {
+        uint32_t values[static_cast<size_t>(A53ReadGroup::Count)]{};
+    };
+
+    static A53ReadGroup read_group_for_priority(uint8_t priority) {
+        if (priority == 0) {
+            return A53ReadGroup::Urgent;
+        }
+        if (priority <= 3) {
+            return A53ReadGroup::High;
+        }
+        return A53ReadGroup::Normal;
+    }
+
+    static size_t read_group_index(A53ReadGroup group) {
+        return static_cast<size_t>(group);
+    }
+
+    A53ReadGroupCounts active_read_group_counts() const {
+        A53ReadGroupCounts counts{};
+        for (auto it = activeReads.begin(); it != activeReads.end(); ++it) {
+            if (!it->job || it->job->prioIndex >= kPriorityCount) {
                 continue;
             }
-            if (activeFileCounts.get(hint.fileId) < perFileLimit) {
-                return true;
+            const A53ReadGroup group =
+                read_group_for_priority(it->job->prioIndex);
+            ++counts.values[read_group_index(group)];
+        }
+        return counts;
+    }
+
+    bool group_has_waiting_cursor(A53ReadGroup group) const {
+        for (size_t priority = 0; priority < kPriorityCount; ++priority) {
+            if (!cursorReadWaitHints[priority].valid ||
+                read_group_for_priority(static_cast<uint8_t>(priority)) != group) {
+                continue;
             }
+            return true;
         }
         return false;
+    }
+
+    static uint32_t scaled_group_target(uint32_t limit,
+                                             uint32_t numerator) {
+        return (limit * numerator + 16u) / 32u;
+    }
+
+    A53ReadGroupCounts read_group_targets(
+        uint32_t limit,
+        const A53ReadGroupCounts& active) const {
+        A53ReadGroupCounts targets{};
+        if (limit == 0) {
+            return targets;
+        }
+
+        const size_t u = read_group_index(A53ReadGroup::Urgent);
+        const size_t h = read_group_index(A53ReadGroup::High);
+        const size_t n = read_group_index(A53ReadGroup::Normal);
+        const bool urgentDemand =
+            active.values[u] != 0 || group_has_waiting_cursor(A53ReadGroup::Urgent);
+
+        if (!urgentDemand) {
+            uint32_t high = scaled_group_target(limit, 20u);
+            if (limit > 1u) {
+                high = (std::max)(1u, (std::min)(high, limit - 1u));
+            } else {
+                high = limit;
+            }
+            targets.values[h] = high;
+            targets.values[n] = limit - high;
+            return targets;
+        }
+
+        uint32_t urgent = scaled_group_target(limit, 4u);
+        uint32_t high = scaled_group_target(limit, 18u);
+        if (limit >= 3u) {
+            urgent = (std::max)(1u, urgent);
+            high = (std::max)(1u, high);
+            if (urgent + high >= limit) {
+                high = limit - urgent - 1u;
+            }
+            targets.values[u] = urgent;
+            targets.values[h] = high;
+            targets.values[n] = limit - urgent - high;
+        } else {
+            targets.values[u] = 1u;
+            targets.values[h] = limit > 1u ? 1u : 0u;
+            targets.values[n] = 0u;
+        }
+        return targets;
+    }
+
+    bool group_soft_target_available(uint8_t priority,
+                                         uint32_t effectiveLimit) const {
+#if !AMPR_EMU_APR_GROUP_SOFT_TARGETS
+        (void)priority;
+        (void)effectiveLimit;
+        return true;
+#else
+        if (effectiveLimit <= 1u) {
+            return true;
+        }
+        const A53ReadGroupCounts active = active_read_group_counts();
+        const A53ReadGroupCounts targets =
+            read_group_targets(effectiveLimit, active);
+        const A53ReadGroup requested = read_group_for_priority(priority);
+        const size_t requestedIndex = read_group_index(requested);
+        if (active.values[requestedIndex] < targets.values[requestedIndex]) {
+            return true;
+        }
+
+        // Targets model A53's separate U/H/N resource pools over one host AIO
+        // window. Capacity remains borrowable while the other groups are idle;
+        // once another group has a cursor waiting below its target, stop further
+        // borrowing until that group receives its share.
+        for (size_t index = 0;
+             index < static_cast<size_t>(A53ReadGroup::Count);
+             ++index) {
+            if (index == requestedIndex ||
+                targets.values[index] == 0 ||
+                active.values[index] >= targets.values[index]) {
+                continue;
+            }
+            const A53ReadGroup other = static_cast<A53ReadGroup>(index);
+            if (group_has_waiting_cursor(other)) {
+                return false;
+            }
+        }
+        return true;
+#endif
     }
 
     enum class DirectReadSubmitResult : uint8_t {
@@ -4070,7 +4256,8 @@ private:
         }
     };
 
-    bool direct_read_admission_available(const AprAioReadDesc& ownerDesc,
+    bool direct_read_admission_available(uint8_t priority,
+                                         const AprAioReadDesc& ownerDesc,
                                          const AprAioReadDesc& sliceDesc,
                                          uint64_t nowNs) {
         update_aio_age_throttle(nowNs);
@@ -4082,25 +4269,13 @@ private:
         if (activeCount >= limit) {
             return false;
         }
+        if (!group_soft_target_available(priority, limit)) {
+            return false;
+        }
         // Slots above the normal window are exclusively for small SDK reads.
         if (activeCount >= aio_active_read_limit() &&
             !aio_desc_is_small_for_boost(sliceDesc)) {
             return false;
-        }
-        if (AMPR_EMU_APR_AIO_PER_FILE_INFLIGHT != 0) {
-            const uint32_t perFileLimit =
-                static_cast<uint32_t>(AMPR_EMU_APR_AIO_PER_FILE_INFLIGHT);
-            const uint32_t activeForFile = activeFileCounts.get(sliceDesc.fileId);
-            // Preserve the old soft per-file cap: a file may borrow otherwise
-            // unused capacity, but not while another active file is below the
-            // fairness window.
-            if (activeForFile >= perFileLimit &&
-                (activeFileCounts.has_other_under_limit(sliceDesc.fileId,
-                                                        perFileLimit) ||
-                 has_waiting_cursor_file_under_limit(sliceDesc.fileId,
-                                                     perFileLimit))) {
-                return false;
-            }
         }
         return fd_budget_available_for_read(ownerDesc,
                                             nullptr,
@@ -4110,7 +4285,8 @@ private:
     }
 
     DirectReadSubmitOutcome submit_read_chain_slice(JobPtr& job,
-                                                     ReadChain& chain) {
+                                                     ReadChain& chain,
+                                                     ReadIssueBudget& issueBudget) {
         constexpr SceKernelAioSubmitId kUnsetAioId =
             static_cast<SceKernelAioSubmitId>(-1);
         if (!job || job_failed(*job) || chain.job != job || chain.remaining == 0) {
@@ -4118,8 +4294,35 @@ private:
         }
 
         AprAioReadDesc sliceDesc = read_chain_next_desc(chain);
+        const uint64_t sliceBytes = sliceDesc.length;
+        const uint64_t sliceCreditBytes = read_credit_bytes(sliceBytes);
+        if (sliceCreditBytes == 0) {
+            return {DirectReadSubmitResult::Failed,
+                    "aio-read-credit-zero",
+                    SCE_KERNEL_ERROR_EINVAL,
+                    sliceDesc.errorOff};
+        }
+
+        // Count and charged bytes are separate credits. Actual I/O length is
+        // unchanged. <=64 KiB requests each cost 64 KiB; 65..128 KiB cost
+        // 128 KiB, etc. A full 512 KiB request consumes the whole byte window.
+        if (chain.activeCount >=
+                static_cast<uint32_t>(AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS) ||
+            sliceCreditBytes >
+                static_cast<uint64_t>(AMPR_EMU_APR_PER_READ_ACTIVE_BYTES) ||
+            chain.activeBytes >
+                static_cast<uint64_t>(AMPR_EMU_APR_PER_READ_ACTIVE_BYTES) -
+                    sliceCreditBytes) {
+            return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
+        }
+        if (!issueBudget.can_admit(sliceCreditBytes)) {
+            return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
+        }
         uint64_t nowNs = time_counter_now();
-        if (!direct_read_admission_available(chain.ownerDesc, sliceDesc, nowNs)) {
+        if (!direct_read_admission_available(job->prioIndex,
+                                             chain.ownerDesc,
+                                             sliceDesc,
+                                             nowNs)) {
             return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
         }
 
@@ -4182,6 +4385,7 @@ private:
         active.chain = &chain;
         active.seq = seqCandidate;
         active.commandIndex = chain.commandIndex;
+        active.readCreditBytes = sliceCreditBytes;
 #if AMPR_EMU_DEBUG_LOG
         active.nativeTriggerTimeNs = chain.nativeTriggerTimeNs;
         active.sliceReadyTimeNs = chain.sliceReadyTimeNs;
@@ -4190,14 +4394,12 @@ private:
         active.request = {};
         link_active_read_to_job(active, *job);
         increment_active_read_count(job);
-        increment_read_chain_active(&chain);
+        increment_read_chain_active(&chain, active.readCreditBytes);
         active.request.offset = static_cast<off_t>(active.desc.offset);
         active.request.nbyte = static_cast<size_t>(active.desc.length);
         active.request.buf = active.desc.buffer;
         active.request.result = &active.result;
         active.request.fd = active.desc.fd;
-        active.activeFileCounted = true;
-        activeFileCounts.increment(active.desc.fileId);
 
 #if AMPR_EMU_DEBUG_LOG && AMPR_EMU_DEBUG_LOG_TRACE
         log_aio_buffer_memory_detail("apr.reactor.aio.bufVa",
@@ -4234,7 +4436,7 @@ private:
             const uint32_t errorOff = active.desc.errorOff;
             apr_release_aio_read_desc(active.desc);
             decrement_active_read_count(job);
-            decrement_read_chain_active(&chain);
+            decrement_read_chain_active(&chain, active.readCreditBytes);
             erase_active_read(activeIt);
             if (apr_aio_submit_sce_rc_is_deferred(submitSceRc)) {
                 return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
@@ -4245,6 +4447,8 @@ private:
                     apr_backend_read_error_to_apr(submitSceRc),
                     errorOff};
         }
+
+        issueBudget.consume(active.readCreditBytes);
 
         if (chain.seq == 0) {
             chain.seq = seqCandidate;
@@ -4528,11 +4732,16 @@ private:
                              size_t commandIndex,
                              bool advanceSource = true,
                              bool deferValidationError = false,
-                             bool* outLogicalIssued = nullptr) {
+                             bool* outLogicalIssued = nullptr,
+                             ReadIssueBudget* issueBudget = nullptr) {
         if (outLogicalIssued) {
             *outLogicalIssued = false;
         }
         if (!job) {
+            return false;
+        }
+        if (issueBudget &&
+            (issueBudget->requestsLeft == 0 || issueBudget->bytesLeft == 0)) {
             return false;
         }
         if (read.length == 0 || read.length > kSoftwareReadLengthMax) {
@@ -4653,54 +4862,74 @@ private:
         if (advanceSource) {
             set_cursor_read_wait_hint(job->prioIndex, read.fileId);
         }
-        const DirectReadSubmitOutcome outcome = submit_read_chain_slice(job, *chain);
-        if (outcome.result == DirectReadSubmitResult::Deferred) {
-            return false;
-        }
-        if (outcome.result == DirectReadSubmitResult::Failed ||
-            outcome.has_error() || job_failed(*job)) {
+
+        ReadIssueBudget singleRequestBudget{1u, kSoftwareReadChunkMax};
+        ReadIssueBudget& budget = issueBudget ? *issueBudget : singleRequestBudget;
+        bool submittedAny = false;
+        while (budget.requestsLeft != 0 && budget.bytesLeft != 0) {
+            const DirectReadSubmitOutcome outcome =
+                submit_read_chain_slice(job, *chain, budget);
+            if (outcome.result == DirectReadSubmitResult::Deferred) {
+                return submittedAny;
+            }
+            if (outcome.result == DirectReadSubmitResult::Failed ||
+                outcome.has_error() || job_failed(*job)) {
+                if (advanceSource) {
+                    clear_cursor_read_wait_hint(job->prioIndex);
+                }
+
+                // Detach cursor ownership before publishing an error. Error
+                // publication may call set_fail(), which abandons cursor chains and
+                // can synchronously return an unsubmitted chain to the fixed pool.
+                // After maybe_finish_read_chain(), do not dereference `chain`.
+                chain->allIssued = true;
+                chainSlot = nullptr;
+                maybe_finish_read_chain(chain);
+
+                if (outcome.has_error() && !job_failed(*job)) {
+                    set_or_defer_read_command_error(*job,
+                                                    outcome.errorReason,
+                                                    outcome.errorRc,
+                                                    outcome.errorOffset);
+                }
+                return submittedAny;
+            }
+
+            submittedAny = true;
+
+            if (!chain->allIssued) {
+                // Bounded A53-like allocation batch: up to eight requests,
+                // with a shared 512 KiB byte budget for the entire lane pass.
+                continue;
+            }
+
+            chainSlot = nullptr;
+            update_software_gs_cursor(gs, read);
             if (advanceSource) {
                 clear_cursor_read_wait_hint(job->prioIndex);
+                advance_job_source(*job, opBytes);
             }
-
-            // Detach cursor ownership before publishing an error. Error
-            // publication may call set_fail(), which abandons cursor chains and
-            // can synchronously return an unsubmitted chain to the fixed pool.
-            // After maybe_finish_read_chain(), do not dereference `chain`.
-            chain->allIssued = true;
-            chainSlot = nullptr;
-            maybe_finish_read_chain(chain);
-
-            if (outcome.has_error() && !job_failed(*job)) {
-                set_or_defer_read_command_error(*job,
-                                                outcome.errorReason,
-                                                outcome.errorRc,
-                                                outcome.errorOffset);
+            if (outLogicalIssued) {
+                *outLogicalIssued = true;
             }
-            return false;
-        }
-
-        if (!chain->allIssued) {
-            // One SDK slice per priority lane and reactor cycle. Keep the
-            // logical command under the cursor until every slice is accepted.
             return true;
         }
 
-        chainSlot = nullptr;
-        update_software_gs_cursor(gs, read);
-        if (advanceSource) {
-            clear_cursor_read_wait_hint(job->prioIndex);
-            advance_job_source(*job, opBytes);
-        } else if (outLogicalIssued) {
-            *outLogicalIssued = true;
-        }
-        return true;
+        // The read remains under its execution/speculative cursor and resumes
+        // on the next priority-ordered reactor pass.
+        return submittedAny;
     }
 
 #if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
-    bool issue_reads_across_eop(JobPtr& job, GatherScatterState& gs) {
+    bool issue_reads_across_eop(JobPtr& job,
+                                GatherScatterState& gs,
+                                ReadIssueBudget& readIssueBudget) {
         if (!job || job_failed(*job) ||
             job->crossEopDeferredErrorOffset != UINT32_MAX) {
+            return false;
+        }
+        if (readIssueBudget.requestsLeft == 0 ||
+            readIssueBudget.bytesLeft == 0) {
             return false;
         }
         if (!job->crossEopScanActive ||
@@ -4724,8 +4953,8 @@ private:
         }
 
         // Readahead has its own speculative cursor, but it follows the same
-        // scheduling rule as the execution cursor: at most one command (or one
-        // SDK slice of a large read command) per priority lane and reactor tick.
+        // scheduling rule as the execution cursor and shares the same request +
+        // byte budget for the current priority-lane pass.
         Op op{};
         uint32_t opBytes = 0;
         uint32_t errorOffset = job->crossEopScanOffset;
@@ -4794,7 +5023,8 @@ private:
                                  job->crossEopScanCommandIndex,
                                  false,
                                  true,
-                                 &logicalIssued)) {
+                                 &logicalIssued,
+                                 &readIssueBudget)) {
             return false;
         }
         if (!logicalIssued) {
@@ -5546,7 +5776,8 @@ private:
     bool progress_job(JobPtr& job,
                       bool priorReadFencePending,
                       bool priorNativeBatchPending,
-                      bool& speculativeCommandUsed) {
+                      bool& speculativeCommandUsed,
+                      ReadIssueBudget& readIssueBudget) {
         if (!job) {
             return false;
         }
@@ -5578,7 +5809,9 @@ private:
             !speculativeCommandUsed) {
             speculativeCommandUsed = true;
             progressed |= issue_reads_across_eop(
-                job, gatherScatterStates[job->prioIndex]);
+                job,
+                gatherScatterStates[job->prioIndex],
+                readIssueBudget);
         }
 #endif
         if (job->nativeBatchReleasePending) {
@@ -5656,6 +5889,7 @@ private:
             return true;
         }
         GatherScatterState& gs = gatherScatterStates[job->prioIndex];
+        bool continueReadBatch = false;
         while (job->sourceOffset < job->sourceBytes) {
             if (publish_deferred_cross_eop_error(*job)) {
                 progressed = true;
@@ -5696,6 +5930,16 @@ private:
             }
             const Op& op = *opPtr;
 
+            // A byte-aware read quantum may span consecutive readFile packets,
+            // but never crosses a non-read command in the same scheduler pass.
+            // This makes 8 x <=64 KiB useful without pulling waits/EOP/native
+            // side effects forward merely because read credit remains.
+            if (continueReadBatch && !cb_op_is_apr_read(op.type)) {
+                cache_decoded_op(*job, op, opBytes);
+                break;
+            }
+            continueReadBatch = false;
+
             if (cb_op_is_apr_read(op.type)) {
 #if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
                 if (job->crossEopReadChain != nullptr &&
@@ -5704,7 +5948,7 @@ private:
                     // The execution cursor caught a partially-issued
                     // speculative logical read. Continue that same chain;
                     // creating a cursor chain here would duplicate I/O.
-                    progressed |= issue_reads_across_eop(job, gs);
+                    progressed |= issue_reads_across_eop(job, gs, readIssueBudget);
                     if (job->crossEopReadChain != nullptr) {
                         cache_decoded_op(*job, op, opBytes);
                         break;
@@ -5731,18 +5975,34 @@ private:
                                                      op.bufOffsetBytes);
                     break;
                 }
+                bool logicalIssued = false;
                 if (!issue_software_read(job,
                                          gs,
                                          read,
                                          opBytes,
                                          op.bufOffsetBytes,
-                                         job->sourceCommandIndex)) {
+                                         job->sourceCommandIndex,
+                                         true,
+                                         false,
+                                         &logicalIssued,
+                                         &readIssueBudget)) {
                     if (!job_failed(*job)) {
                         cache_decoded_op(*job, op, opBytes);
                     }
                     break;
                 }
                 progressed = true;
+                // Keep FIFO ownership, but let consecutive readFile packets use
+                // the remaining bounded request/byte quantum. A non-read packet
+                // stops the batch before it is executed, so waits/EOP/native
+                // boundaries retain their previous pass-to-pass behavior.
+                if (logicalIssued &&
+                    readIssueBudget.requestsLeft != 0 &&
+                    readIssueBudget.bytesLeft >=
+                        static_cast<uint64_t>(AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES)) {
+                    continueReadBatch = true;
+                    continue;
+                }
                 break;
             }
 
@@ -5785,7 +6045,7 @@ private:
                      softwareCompletionOrderingPending) &&
                     !speculativeCommandUsed) {
                     speculativeCommandUsed = true;
-                    progressed |= issue_reads_across_eop(job, gs);
+                    progressed |= issue_reads_across_eop(job, gs, readIssueBudget);
                     completionReadSequence =
                         cross_eop_read_fence_for_cursor(*job);
                 }
@@ -6037,14 +6297,18 @@ private:
             }
         }
 
-        // Priority 0 is visited first on every reactor tick. Every lane still
-        // gets one cursor opportunity per tick, while a nearly-full AIO window
-        // naturally gives earlier/higher APR priorities first refusal.
+        // A53-style front-end order: every new scheduler pass starts again at
+        // the highest APR priority. A blocked lane never stops independent lower
+        // priorities, but FIFO order inside one priority is preserved. Each lane
+        // has a bounded host-AIO read-chunk quantum for its current logical read.
         for (size_t lane = 0; lane < kPriorityCount; ++lane) {
             clear_cursor_read_wait_hint(lane);
             bool priorReadFencePending = false;
             bool priorNativeBatchPending = false;
             bool speculativeCommandUsed = false;
+            ReadIssueBudget readIssueBudget{
+                static_cast<uint32_t>(AMPR_EMU_APR_READ_CHUNK_QUANTUM),
+                static_cast<uint64_t>(AMPR_EMU_APR_READ_PASS_MAX_BYTES)};
             JobPtr job = laneHeads[lane];
             while (job) {
                 if (native_batch_wait_pending(static_cast<uint32_t>(lane))) {
@@ -6053,34 +6317,41 @@ private:
                 JobPtr const next =
                     job->priorityNext.load(std::memory_order_acquire);
 
-                const bool sourceWasFullyIssued =
-                    job->sourceOffset == job->sourceBytes;
                 const bool jobProgressed = progress_job(job,
                                                         priorReadFencePending,
                                                         priorNativeBatchPending,
-                                                        speculativeCommandUsed);
+                                                        speculativeCommandUsed,
+                                                        readIssueBudget);
                 progressed |= jobProgressed;
 
-                // A job that still owned a source cursor at entry consumes this
-                // lane's one command/read-slice opportunity, even when it was
-                // blocked. Do not let a later job in the same priority leapfrog
-                // that cursor during the same reactor cycle.
-                if (!sourceWasFullyIssued) {
+                // FIFO ownership is decided from the cursor state AFTER this
+                // job had its chance to run. If the head was blocked or only
+                // partially admitted, it keeps the lane and later same-priority
+                // jobs cannot leapfrog it. If it reached the end of its source,
+                // however, the remaining request/byte budget may be consumed by
+                // the next FIFO job during this same scheduler pass. This makes
+                // bounded read admission a priority-lane property across submit
+                // boundaries without changing ordering or completion fences.
+                if (!job) {
+                    // A synchronously released/failed head is deliberately a
+                    // pass boundary. The next scheduler pass will observe the
+                    // new head; do not infer successor safety after ownership
+                    // has already been returned to the pool.
+                    break;
+                }
+                if (job->sourceOffset != job->sourceBytes) {
                     break;
                 }
 
-                if (job) {
-                    const bool nativeSubmitted =
-                        job->nativeSubmitted.load(std::memory_order_acquire);
-                    if (!job_allows_priority_successor(*job,
-                                                       nativeSubmitted)) {
-                        break;
-                    }
-                    priorReadFencePending |= job_has_outstanding_reads(*job);
-                    priorNativeBatchPending |=
-                        nativeSubmitted &&
-                        job->nativeMicroEngine == NativeMicroEngine::AprBatch;
+                const bool nativeSubmitted =
+                    job->nativeSubmitted.load(std::memory_order_acquire);
+                if (!job_allows_priority_successor(*job, nativeSubmitted)) {
+                    break;
                 }
+                priorReadFencePending |= job_has_outstanding_reads(*job);
+                priorNativeBatchPending |=
+                    nativeSubmitted &&
+                    job->nativeMicroEngine == NativeMicroEngine::AprBatch;
                 job = next;
             }
             if (!seal_open_native_apr_batch_group(
@@ -6114,7 +6385,7 @@ private:
                 }
                 apr_release_aio_read_desc(active.desc);
                 decrement_active_read_count(job);
-                decrement_read_chain_active(chain);
+                decrement_read_chain_active(chain, active.readCreditBytes);
                 auto next = erase_active_read(it);
                 maybe_finish_read_chain(chain);
                 maybe_release_reactor_job(job);
@@ -6185,7 +6456,7 @@ private:
             chain->allIssued = true;
             apr_release_aio_read_desc(active.desc);
             decrement_active_read_count(job);
-            decrement_read_chain_active(chain);
+            decrement_read_chain_active(chain, active.readCreditBytes);
             auto next = erase_active_read(it);
             maybe_finish_read_chain(chain);
             maybe_release_reactor_job(job);
@@ -6354,108 +6625,6 @@ private:
         return completedAny;
     }
 
-    struct ActiveFileCounts {
-        static constexpr size_t kCapacity = kMaxActiveReads * 2u;
-        struct Entry {
-            uint32_t fileId{};
-            uint32_t count{};
-            bool occupied{};
-        };
-
-        Entry entries[kCapacity]{};
-
-        static size_t first_slot(uint32_t fileId) {
-            return static_cast<size_t>(fileId * 2654435761u) % kCapacity;
-        }
-
-        uint32_t get(uint32_t fileId) const {
-            size_t slot = first_slot(fileId);
-            for (size_t probe = 0; probe < kCapacity; ++probe) {
-                const Entry& entry = entries[slot];
-                if (!entry.occupied) {
-                    return 0;
-                }
-                if (entry.fileId == fileId) {
-                    return entry.count;
-                }
-                slot = (slot + 1u) % kCapacity;
-            }
-            return 0;
-        }
-
-        bool has_other_under_limit(uint32_t fileId, uint32_t limit) const {
-            if (limit == 0) {
-                return false;
-            }
-            for (const Entry& entry : entries) {
-                if (entry.occupied && entry.fileId != fileId &&
-                    entry.count != 0 && entry.count < limit) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        void increment(uint32_t fileId) {
-            size_t slot = first_slot(fileId);
-            size_t reusableSlot = kCapacity;
-            for (size_t probe = 0; probe < kCapacity; ++probe) {
-                Entry& entry = entries[slot];
-                if (!entry.occupied) {
-                    Entry& target = entries[reusableSlot != kCapacity ? reusableSlot : slot];
-                    target.fileId = fileId;
-                    target.count = 1;
-                    target.occupied = true;
-                    return;
-                }
-                if (entry.fileId == fileId) {
-                    if (entry.count == UINT32_MAX) {
-                        AMPR_CRITICAL_LOGF("apr.reactor.activeFileCounts.overflow fileId=%u",
-                                           fileId);
-                        ampr_debug_int3_trap();
-                        return;
-                    }
-                    ++entry.count;
-                    return;
-                }
-                if (entry.count == 0 && reusableSlot == kCapacity) {
-                    reusableSlot = slot;
-                }
-                slot = (slot + 1u) % kCapacity;
-            }
-            if (reusableSlot != kCapacity) {
-                Entry& entry = entries[reusableSlot];
-                entry.fileId = fileId;
-                entry.count = 1;
-                return;
-            }
-            AMPR_CRITICAL_LOGF("apr.reactor.activeFileCounts.full fileId=%u capacity=%zu",
-                               fileId,
-                               kCapacity);
-            ampr_debug_int3_trap();
-        }
-
-        void decrement(uint32_t fileId) {
-            size_t slot = first_slot(fileId);
-            for (size_t probe = 0; probe < kCapacity; ++probe) {
-                Entry& entry = entries[slot];
-                if (!entry.occupied) {
-                    break;
-                }
-                if (entry.fileId == fileId) {
-                    if (entry.count == 0) {
-                        break;
-                    }
-                    --entry.count;
-                    return;
-                }
-                slot = (slot + 1u) % kCapacity;
-            }
-            AMPR_CRITICAL_LOGF("apr.reactor.activeFileCounts.underflow fileId=%u",
-                               fileId);
-            ampr_debug_int3_trap();
-        }
-    };
 
     bool finish_active_read(ActiveReadIt it, int state) {
         ActiveRead& active = *it;
@@ -6552,7 +6721,7 @@ private:
         if (!job || !chain) {
             apr_release_aio_read_desc(active.desc);
             decrement_active_read_count(job);
-            decrement_read_chain_active(chain);
+            decrement_read_chain_active(chain, active.readCreditBytes);
             maybe_finish_read_chain(chain);
             return false;
         }
@@ -6797,7 +6966,7 @@ private:
 #endif
 
         decrement_active_read_count(job);
-        decrement_read_chain_active(chain);
+        decrement_read_chain_active(chain, active.readCreditBytes);
         maybe_finish_read_chain(chain);
 
         AMPR_TLOGF("apr.reactor.aio.complete job=0x%llx seq=0x%llx aioId=%d rc=0x%x state=0x%x return=0x%llx deleteRc=0x%x active=%u completedSeq=0x%llx",
@@ -6831,11 +7000,11 @@ private:
         return false;
     }
 
-    bool wait_aio_once() {
+    bool wait_aio_once(bool sleepWhenIdle) {
         if (activeReads.empty()) {
             return false;
         }
-        return poll_active_aio_reads_once(true);
+        return poll_active_aio_reads_once(sleepWhenIdle);
     }
 
     void note_reactor_progress(bool progressed) {
@@ -7133,8 +7302,14 @@ private:
         const size_t observedOpen = fdStats.open + directOpen;
         const bool fdPressure = fdPressureUntilNs != 0 && now < fdPressureUntilNs;
         const uint32_t effectiveLimit = aio_effective_read_limit(now);
+        const A53ReadGroupCounts groupActive = active_read_group_counts();
+        const A53ReadGroupCounts groupTargets =
+            read_group_targets(effectiveLimit, groupActive);
+        const size_t groupU = read_group_index(A53ReadGroup::Urgent);
+        const size_t groupH = read_group_index(A53ReadGroup::High);
+        const size_t groupN = read_group_index(A53ReadGroup::Normal);
 
-        AMPR_LOGF("apr.reactor.occupancy reason=%s activeJobs=%zu/%u readChains=%u/%u activeReads=%zu/%u aioBase=%u aioMax=%u aioThrottle=%u aioSlowCooldown=%u aioBoostCooldown=%u pollDeadlines=%u nativeMicroReady=%u fdEntries=%zu/%u fdOpen=%zu directOpen=%zu observedOpen=%zu fdBudget=%zu fdCacheCap=%zu fdDirectCap=%zu fdPinnedOpen=%zu fdPins=%zu fdEvictable=%zu fdPressure=%u fdPressureLevel=%u",
+        AMPR_LOGF("apr.reactor.occupancy reason=%s activeJobs=%zu/%u readChains=%u/%u activeReads=%zu/%u aioBase=%u aioMax=%u aioThrottle=%u aioSlowCooldown=%u aioBoostCooldown=%u aioU=%u/%u aioH=%u/%u aioN=%u/%u readQuantumReq=%u readQuantumBytes=%u readActiveReqWindow=%u readActiveByteWindow=%u readCreditGranule=%u pollDeadlines=%u nativeMicroReady=%u fdEntries=%zu/%u fdOpen=%zu directOpen=%zu observedOpen=%zu fdBudget=%zu fdCacheCap=%zu fdDirectCap=%zu fdPinnedOpen=%zu fdPins=%zu fdEvictable=%zu fdPressure=%u fdPressureLevel=%u",
                   tag,
                   active_lane_count_locked(),
                   (unsigned)kJobStatePoolCapacity,
@@ -7147,6 +7322,17 @@ private:
                   (unsigned)aioAgeThrottleLevel,
                   slow_aio_cooldown_active(now) ? 1u : 0u,
                   aio_small_read_boost_recovery_cooldown_active(now) ? 1u : 0u,
+                  groupActive.values[groupU],
+                  groupTargets.values[groupU],
+                  groupActive.values[groupH],
+                  groupTargets.values[groupH],
+                  groupActive.values[groupN],
+                  groupTargets.values[groupN],
+                  (unsigned)AMPR_EMU_APR_READ_CHUNK_QUANTUM,
+                  (unsigned)AMPR_EMU_APR_READ_PASS_MAX_BYTES,
+                  (unsigned)AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS,
+                  (unsigned)AMPR_EMU_APR_PER_READ_ACTIVE_BYTES,
+                  (unsigned)AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES,
                   activePollDeadlineHeapSize,
                   nativeReady,
                   fdStats.entries,
@@ -7737,7 +7923,14 @@ private:
             }
 
             if (has_submitted_active_reads()) {
-                progressed |= wait_aio_once();
+                // Do not let an AIO poll deadline insert a sleep between two
+                // productive command-cursor passes. If this reactor tick
+                // already advanced retry/native/job state, poll submitted AIO
+                // non-blocking and immediately give the priority lanes their
+                // next cursor opportunity. Timed AIO sleep is only allowed
+                // when the reactor made no useful progress in this tick.
+                const bool madeProgressBeforeAioPoll = progressed;
+                progressed |= wait_aio_once(!madeProgressBeforeAioPoll);
                 note_reactor_progress(progressed);
                 continue;
             }
@@ -7806,7 +7999,6 @@ private:
     std::atomic<uint64_t> invariantJobPoolFull{0};
     std::atomic<uint64_t> invariantReadChainPoolFull{0};
     ActiveReadList activeReads;
-    ActiveFileCounts activeFileCounts;
     CursorReadWaitHint cursorReadWaitHints[kPriorityCount]{};
     AioAgeThrottleLevel aioAgeThrottleLevel{AioAgeThrottleLevel::Normal};
     uint64_t aioSmallReadBoostBlockedUntilNs{0};
