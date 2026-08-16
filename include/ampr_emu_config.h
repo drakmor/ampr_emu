@@ -424,7 +424,7 @@
 
 // Version
 #ifndef AMPR_EMU_VERSION
-#define AMPR_EMU_VERSION "0.3.0 (public beta) (c) Drakmor"
+#define AMPR_EMU_VERSION "0.3.1.1 (public beta) (c) Drakmor"
 #endif
 
 #ifndef AMPR_EMU_DEBUG_LOG
