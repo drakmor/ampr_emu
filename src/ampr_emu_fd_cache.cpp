@@ -17,6 +17,18 @@
     return path ? path : "(null)";
 }
 namespace {
+static void fd_cache_invariant_violation(const char* reason,
+                                         size_t value = 0,
+                                         size_t expected = 0) {
+    (void)reason;
+    (void)value;
+    (void)expected;
+    AMPR_CRITICAL_LOGF("apr.fdcache.invariant reason=%s value=%zu expected=%zu",
+                       reason ? reason : "unknown",
+                       value,
+                       expected);
+}
+
 struct FileState {
     AmprMutex m;
     static constexpr uint32_t kInvalidRuntimeIndex = UINT32_MAX;
@@ -287,19 +299,31 @@ static int fd_runtime_detach_fd_locked(FileState& fs, FileState::RuntimeFile& en
     }
     const int fd = entry.fd;
     if (entry.pinCount != 0) {
-        if (fs.pinnedOpenCount != 0) {
+        if (fs.pinnedOpenCount == 0) {
+            fd_cache_invariant_violation("detach-pinned-open-underflow",
+                                         fs.pinnedOpenCount, 1);
+        } else {
             --fs.pinnedOpenCount;
         }
-        fs.openPinCount = fs.openPinCount > entry.pinCount
-                              ? fs.openPinCount - entry.pinCount
-                              : 0;
+        if (fs.openPinCount < entry.pinCount) {
+            fd_cache_invariant_violation("detach-open-pin-underflow",
+                                         fs.openPinCount, entry.pinCount);
+            fs.openPinCount = 0;
+        } else {
+            fs.openPinCount -= entry.pinCount;
+        }
     } else {
         fd_runtime_lru_unlink_locked(fs, entry);
-        if (fs.evictableOpenCount != 0) {
+        if (fs.evictableOpenCount == 0) {
+            fd_cache_invariant_violation("detach-evictable-underflow",
+                                         fs.evictableOpenCount, 1);
+        } else {
             --fs.evictableOpenCount;
         }
     }
-    if (fs.openCount != 0) {
+    if (fs.openCount == 0) {
+        fd_cache_invariant_violation("detach-open-underflow", fs.openCount, 1);
+    } else {
         --fs.openCount;
     }
     entry.fd = -1;
@@ -328,6 +352,10 @@ static void fd_runtime_activate_locked(FileState& fs, FileState::RuntimeFile& en
 
 static void fd_runtime_note_pin_locked(FileState& fs, FileState::RuntimeFile& entry) {
     const uint32_t oldPins = entry.pinCount;
+    if (oldPins == UINT32_MAX) {
+        fd_cache_invariant_violation("pin-count-overflow", oldPins, UINT32_MAX - 1u);
+        return;
+    }
     ++entry.pinCount;
     if (entry.fd < 0) {
         if (oldPins == 0) {
@@ -335,10 +363,17 @@ static void fd_runtime_note_pin_locked(FileState& fs, FileState::RuntimeFile& en
         }
         return;
     }
-    ++fs.openPinCount;
+    if (fs.openPinCount == SIZE_MAX) {
+        fd_cache_invariant_violation("open-pin-count-overflow", fs.openPinCount, SIZE_MAX - 1u);
+    } else {
+        ++fs.openPinCount;
+    }
     if (oldPins == 0) {
         fd_runtime_lru_unlink_locked(fs, entry);
-        if (fs.evictableOpenCount != 0) {
+        if (fs.evictableOpenCount == 0) {
+            fd_cache_invariant_violation("pin-evictable-underflow",
+                                         fs.evictableOpenCount, 1);
+        } else {
             --fs.evictableOpenCount;
         }
         ++fs.pinnedOpenCount;
@@ -347,6 +382,7 @@ static void fd_runtime_note_pin_locked(FileState& fs, FileState::RuntimeFile& en
 
 static void fd_runtime_note_unpin_locked(FileState& fs, FileState::RuntimeFile& entry) {
     if (entry.pinCount == 0) {
+        fd_cache_invariant_violation("unpin-pin-count-underflow", entry.pinCount, 1);
         return;
     }
     const uint32_t oldPins = entry.pinCount;
@@ -357,11 +393,16 @@ static void fd_runtime_note_unpin_locked(FileState& fs, FileState::RuntimeFile& 
         }
         return;
     }
-    if (fs.openPinCount != 0) {
+    if (fs.openPinCount == 0) {
+        fd_cache_invariant_violation("unpin-open-pin-underflow", fs.openPinCount, 1);
+    } else {
         --fs.openPinCount;
     }
     if (oldPins == 1) {
-        if (fs.pinnedOpenCount != 0) {
+        if (fs.pinnedOpenCount == 0) {
+            fd_cache_invariant_violation("unpin-pinned-open-underflow",
+                                         fs.pinnedOpenCount, 1);
+        } else {
             --fs.pinnedOpenCount;
         }
         ++fs.evictableOpenCount;
@@ -560,11 +601,17 @@ void ampr_index_fd_direct_note_open() {
 
 void ampr_index_fd_direct_note_close() {
     size_t oldValue = g_fd_direct_open_count.load(std::memory_order_relaxed);
-    while (oldValue != 0 &&
-           !g_fd_direct_open_count.compare_exchange_weak(oldValue,
+    for (;;) {
+        if (oldValue == 0) {
+            fd_cache_invariant_violation("direct-open-count-underflow", oldValue, 1);
+            return;
+        }
+        if (g_fd_direct_open_count.compare_exchange_weak(oldValue,
                                                          oldValue - 1,
                                                          std::memory_order_relaxed,
                                                          std::memory_order_relaxed)) {
+            return;
+        }
     }
 }
 
@@ -791,6 +838,7 @@ static size_t fd_cache_collect_watermark_evictions_locked(FdCloseList& fdsToClos
 }
 
 static void fd_cache_close_list(FdCloseList& fdsToClose, const char* reason = "fdcache") {
+    (void)reason;
     if (!fdsToClose.empty()) {
         AMPR_TLOGF("apr.fdcache.close-list.enter reason=%s count=%zu",
                   reason ? reason : "unknown",
@@ -861,34 +909,6 @@ bool ampr_index_fd_common_open_budget_headroom_available(size_t reserve,
         return true;
     }
     return stats.evictable >= observed + reserve - budget;
-}
-
-bool ampr_index_fd_cached_open_budget_headroom_available(uint32_t fileId,
-                                                         size_t* outObserved,
-                                                         size_t* outBudget,
-                                                         size_t* outEvictable) {
-    auto& fs = file_state();
-    AmprLockGuard lk(fs.m);
-    FileState::RuntimeFile* e = fd_runtime_find_locked(fs, fileId);
-    const FdCacheStats stats = fd_cache_stats_locked();
-    const size_t budget = ampr_index_fd_open_budget_effective_cap();
-    const size_t observed = fd_observed_open_count(stats);
-    if (outObserved) {
-        *outObserved = observed;
-    }
-    if (outBudget) {
-        *outBudget = budget;
-    }
-    if (outEvictable) {
-        *outEvictable = stats.evictable;
-    }
-    if (e && e->fd >= 0) {
-        return true;
-    }
-    if (observed + 1 <= budget) {
-        return true;
-    }
-    return stats.evictable >= observed + 1 - budget;
 }
 
 size_t ampr_index_fd_cache_release_idle_percent(unsigned percent) {
@@ -977,7 +997,9 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
                                  uint32_t id,
                                  const FileEntryView& entry,
                                  int flags,
-                                 int mode) {
+                                 int mode,
+                                 bool allowOpen) {
+    (void)jobId;
     if (!entry.path) {
         AMPR_LOGF("apr.fdcache.acquire miss job=0x%llx fileId=%u",
                   (unsigned long long)jobId,
@@ -1044,15 +1066,22 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
                 e->lastUseTick = fs.tick.fetch_add(1, std::memory_order_relaxed);
                 fd_runtime_note_use_time_locked(*e, nowNs);
             }
-            pathToOpen = entry.path;
-            fd_cache_collect_current_limit_evictions_locked(fdsToClose, 1);
-            (void)fd_cache_collect_watermark_evictions_locked(fdsToClose, 1);
+            if (allowOpen) {
+                fd_cache_collect_current_limit_evictions_locked(fdsToClose, 1);
+                (void)fd_cache_collect_watermark_evictions_locked(fdsToClose, 1);
+                if (fs.openCount < fd_cache_open_cap_for_current_budget()) {
+                    pathToOpen = entry.path;
+                }
+            }
 #if AMPR_EMU_DEBUG_LOG && AMPR_EMU_DEBUG_LOG_TRACE
             if (ampr_debug_log_runtime_enabled()) {
                 const FdCacheStats stats = fd_cache_stats_locked();
-                AMPR_TLOGF("apr.fdcache.lock.leave job=0x%llx fileId=%u stage=miss reserve=1 evictClose=%zu open=%zu entries=%zu pinned=%zu pins=%zu evictable=%zu",
+                AMPR_TLOGF("apr.fdcache.lock.leave job=0x%llx fileId=%u stage=miss allowOpen=%u openAdmitted=%u reserve=%u evictClose=%zu open=%zu entries=%zu pinned=%zu pins=%zu evictable=%zu",
                           (unsigned long long)jobId,
                           id,
+                          allowOpen ? 1u : 0u,
+                          pathToOpen ? 1u : 0u,
+                          allowOpen ? 1u : 0u,
                           fdsToClose.size(),
                           stats.open,
                           stats.entries,
@@ -1077,6 +1106,12 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
                               fd);
         return fd;
     }
+    if (!pathToOpen) {
+        AMPR_TLOGF("apr.fdcache.acquire.defer job=0x%llx fileId=%u reason=new-fd-blocked",
+                  (unsigned long long)jobId,
+                  id);
+        return -EAGAIN;
+    }
 
     AMPR_TLOGF("apr.fdcache.open.enter job=0x%llx fileId=%u path=%s flags=0x%x",
               (unsigned long long)jobId,
@@ -1084,84 +1119,69 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
               pathToOpen,
               flags);
     int opened = ampr_real_sceKernelOpen(pathToOpen, flags, static_cast<SceKernelMode>(mode));
+    const int openErrno = opened < 0 ? errno : 0;
     AMPR_TLOGF("apr.fdcache.open.leave job=0x%llx fileId=%u path=%s fd=%d errno=%d",
               (unsigned long long)jobId,
               id,
               pathToOpen,
               opened,
-              opened < 0 ? errno : 0);
-    if (opened < 0) {
-        int err = errno;
-        if (err == EMFILE) {
+              openErrno);
+    if (opened < 0 && openErrno == EMFILE) {
 #if AMPR_EMU_DEBUG_LOG
-            if (ampr_debug_log_runtime_enabled()) {
-                g_fd_cache_diag_emfile.fetch_add(1, std::memory_order_relaxed);
-            }
-#endif
-            const FdCacheStats beforeStats = fd_cache_stats();
-            const size_t observedOpen = fd_observed_open_count(beforeStats);
-            const FdPressureCaps pressureCaps = fd_cache_mark_open_pressure(observedOpen);
-            const size_t closedStale = fd_cache_release_stale_for_pressure();
-            const size_t closedIdle =
-                ampr_index_fd_cache_release_idle_percent(AMPR_EMU_FD_CACHE_EMFILE_IDLE_CLOSE_PERCENT);
-            const FdCacheStats afterStats = fd_cache_stats();
-            (void)pressureCaps;
-            (void)closedStale;
-            (void)closedIdle;
-            (void)afterStats;
-            AMPR_TLOGF("apr.fdcache.open.retry.enter job=0x%llx fileId=%u path=%s",
-                      (unsigned long long)jobId,
-                      id,
-                      pathToOpen);
-            opened = ampr_real_sceKernelOpen(pathToOpen, flags, static_cast<SceKernelMode>(mode));
-            err = opened < 0 ? errno : 0;
-            AMPR_TLOGF("apr.fdcache.open.retry.leave job=0x%llx fileId=%u path=%s fd=%d errno=%d",
-                      (unsigned long long)jobId,
-                      id,
-                      pathToOpen,
-                      opened,
-                      err);
-            if (opened >= 0) {
-                AMPR_LOGF("apr.fdcache.acquire.open retry-emfile job=0x%llx fileId=%u path=%s fd=%d observedOpen=%zu fdBudget=%zu cacheCap=%zu directCap=%zu closedStale=%zu closedIdle=%zu cacheBefore=%zu/%zu directBefore=%zu pinned=%zu pins=%zu evictable=%zu cacheAfter=%zu/%zu directAfter=%zu pinnedAfter=%zu pinsAfter=%zu evictableAfter=%zu",
-                          (unsigned long long)jobId,
-                          id,
-                          pathToOpen,
-                          opened,
-                          observedOpen,
-                          pressureCaps.fdBudget,
-                          pressureCaps.cacheCap,
-                          pressureCaps.directCap,
-                          closedStale,
-                          closedIdle,
-                          beforeStats.open,
-                          beforeStats.entries,
-                          observedOpen >= beforeStats.open ? observedOpen - beforeStats.open : 0,
-                          beforeStats.pinnedOpen,
-                          beforeStats.pins,
-                          beforeStats.evictable,
-                          afterStats.open,
-                          afterStats.entries,
-                          ampr_index_fd_direct_open_count(),
-                          afterStats.pinnedOpen,
-                          afterStats.pins,
-                          afterStats.evictable);
-            }
+        if (ampr_debug_log_runtime_enabled()) {
+            g_fd_cache_diag_emfile.fetch_add(1, std::memory_order_relaxed);
         }
-    }
-    if (opened < 0) {
-        const int err = errno;
-        AMPR_CRITICAL_LOGF("apr.fdcache.acquire.open status=failed job=0x%llx fileId=%u path=%s rc=0x%x",
+#endif
+        const FdCacheStats beforeStats = fd_cache_stats();
+        const size_t observedOpen = fd_observed_open_count(beforeStats);
+        const FdPressureCaps pressureCaps = fd_cache_mark_open_pressure(observedOpen);
+        const size_t closedStale = fd_cache_release_stale_for_pressure();
+        const size_t closedIdle =
+            ampr_index_fd_cache_release_idle_percent(AMPR_EMU_FD_CACHE_EMFILE_IDLE_CLOSE_PERCENT);
+        const FdCacheStats afterStats = fd_cache_stats();
+        (void)pressureCaps;
+        (void)closedStale;
+        (void)closedIdle;
+        (void)afterStats;
+        AMPR_LOGF("apr.fdcache.acquire.open defer-emfile job=0x%llx fileId=%u path=%s observedOpen=%zu fdBudget=%zu cacheCap=%zu directCap=%zu closedStale=%zu closedIdle=%zu cacheBefore=%zu/%zu directBefore=%zu pinned=%zu pins=%zu evictable=%zu cacheAfter=%zu/%zu directAfter=%zu pinnedAfter=%zu pinsAfter=%zu evictableAfter=%zu",
                   (unsigned long long)jobId,
                   id,
                   pathToOpen,
-                  -err);
-        AMPR_FILE_STATUS_LOGF("apr.file.open status=failed reason=fd-cache-open job=0x%llx fileId=%u path=%s errno=%d rc=0x%x",
+                  observedOpen,
+                  pressureCaps.fdBudget,
+                  pressureCaps.cacheCap,
+                  pressureCaps.directCap,
+                  closedStale,
+                  closedIdle,
+                  beforeStats.open,
+                  beforeStats.entries,
+                  observedOpen >= beforeStats.open ? observedOpen - beforeStats.open : 0,
+                  beforeStats.pinnedOpen,
+                  beforeStats.pins,
+                  beforeStats.evictable,
+                  afterStats.open,
+                  afterStats.entries,
+                  ampr_index_fd_direct_open_count(),
+                  afterStats.pinnedOpen,
+                  afterStats.pins,
+                  afterStats.evictable);
+    }
+    if (opened < 0) {
+        if (openErrno != EMFILE) {
+            AMPR_CRITICAL_LOGF("apr.fdcache.acquire.open status=failed job=0x%llx fileId=%u path=%s rc=0x%x",
+                      (unsigned long long)jobId,
+                      id,
+                      pathToOpen,
+                      -openErrno);
+        }
+        AMPR_FILE_STATUS_LOGF("apr.file.open status=%s reason=fd-cache-open job=0x%llx fileId=%u path=%s errno=%d rc=0x%x",
+                              openErrno == EMFILE ? "deferred" : "failed",
                               (unsigned long long)jobId,
                               id,
                               pathToOpen,
-                              err,
-                              -err);
-        return -err;
+                              openErrno,
+                              -openErrno);
+        return -openErrno;
     }
 
     int fdToClose = -1;

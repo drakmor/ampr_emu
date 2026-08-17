@@ -106,7 +106,7 @@ static void ampr_pack_wait_counter_words(
     uint8_t flush) {
     const uint32_t dwords = ampr_wait_counter_dwords(valueWidth, refValue, extraFlag, extraValue);
     words[0] = ((uint32_t)(uint8_t)refValue << 16)
-             | ((((uint16_t)dwords << 8) + 3840u) & 0xF00u)
+             | (((static_cast<uint32_t>(dwords) << 8) + 3840u) & 0xF00u)
              | (((uint32_t)compare & 7u) << 13)
              | (((uint32_t)flush & 1u) << 12)
              | ((uint32_t)counterIndex << 24)
@@ -163,8 +163,6 @@ bool ampr_set_marker_text(Op& op, const char* text) {
     return true;
 }
 
-int ampr_op_size_bytes_checked(const Op& op, uint32_t* outBytes);
-
 static uint32_t ampr_write_address_dwords(uint64_t value) {
     if (value < 4ull) return 2u;
     if (value < 0x400000000ull) return 3u;
@@ -182,7 +180,7 @@ static void ampr_pack_write_address_words(
     const uint32_t lengthBits = static_cast<uint16_t>((dwords << 14) + 0x8000u);
 
     words[0] = (uint32_t)((address >> 16) & 0xFFFF0000ull)
-             | ((((uint16_t)dwords << 8) + 3840u) & 0xF00u)
+             | (((static_cast<uint32_t>(dwords) << 8) + 3840u) & 0xF00u)
              | opcode
              | ((uint32_t)(value & 3ull) << 12)
              | lengthBits;
@@ -207,7 +205,7 @@ static void ampr_pack_write_counter_words(
     const uint32_t opcode = atSop ? 118u : 6u;
 
     words[0] = opcode
-             | ((((uint16_t)dwords << 8) + 3840u) & 0xF00u)
+             | (((static_cast<uint32_t>(dwords) << 8) + 3840u) & 0xF00u)
              | ((uint32_t)counterIndex << 24)
              | (((uint32_t)masked << 12) & 0xFFF000u);
     if (dwords >= 2u) {
@@ -229,39 +227,54 @@ static uint32_t ampr_marker_type(const Op& op) {
 }
 
 struct AmprMarkerLayout {
-    uint32_t dwords{};
-    uint32_t commandCount{};
+    uint64_t dwords{};
+    uint64_t commandCount{};
 };
 
-static AmprMarkerLayout ampr_marker_layout(uint32_t markerType, uint32_t lenWithNul) {
-    const uint32_t firstPayloadBytes = 4u * (markerType < 5u) + 56u;
-    const uint32_t firstDwords = (firstPayloadBytes >> 2) + (markerType >= 5u ? 1u : 0u) + 1u;
+static AmprMarkerLayout ampr_marker_layout(uint32_t markerType, uint64_t lenWithNul) {
+    const uint64_t firstPayloadBytes = 4ull * (markerType < 5u) + 56ull;
+    const uint64_t firstDwords = (firstPayloadBytes >> 2) +
+        (markerType >= 5u ? 1ull : 0ull) + 1ull;
     if (lenWithNul <= firstPayloadBytes) {
         return {
-            ((lenWithNul + 3u) >> 2) + (markerType >= 5u ? 1u : 0u) + 1u,
-            1u,
+            ((lenWithNul + 3ull) >> 2) + (markerType >= 5u ? 1ull : 0ull) + 1ull,
+            1ull,
         };
     }
 
-    AmprMarkerLayout layout{firstDwords, 1u};
-    for (uint32_t remaining = lenWithNul - firstPayloadBytes; remaining != 0u; ) {
-        const uint32_t chunk = remaining < 60u ? remaining : 60u;
-        layout.dwords += ((chunk + 3u) >> 2) + 1u;
+    const uint64_t remaining = lenWithNul - firstPayloadBytes;
+    const uint64_t fullChunks = remaining / 60ull;
+    const uint64_t tailBytes = remaining % 60ull;
+    AmprMarkerLayout layout{};
+    layout.dwords = firstDwords + fullChunks * 16ull;
+    layout.commandCount = 1ull + fullChunks;
+    if (tailBytes != 0) {
+        layout.dwords += ((tailBytes + 3ull) >> 2) + 1ull;
         ++layout.commandCount;
-        remaining -= chunk;
     }
     return layout;
 }
 
-uint32_t ampr_native_op_command_count(const Op& op) {
-    if (op.type == OpType::MarkerSet || op.type == OpType::MarkerPush) {
-        const uint32_t lenWithNul = op.textLength + 1u;
-        return ampr_marker_layout(ampr_marker_type(op), lenWithNul).commandCount;
+static bool ampr_marker_layout_fits_native(const Op& op,
+                                           AmprMarkerLayout* outLayout = nullptr) {
+    if (!op.text || op.textLength == UINT32_MAX) {
+        return false;
     }
-    return 1u;
+    const uint64_t lenWithNul = static_cast<uint64_t>(op.textLength) + 1ull;
+    const AmprMarkerLayout layout = ampr_marker_layout(ampr_marker_type(op), lenWithNul);
+    if (layout.dwords == 0 ||
+        layout.dwords > static_cast<uint64_t>(UINT32_MAX) / 4ull ||
+        layout.commandCount == 0 ||
+        layout.commandCount > static_cast<uint64_t>(INT32_MAX)) {
+        return false;
+    }
+    if (outLayout) {
+        *outLayout = layout;
+    }
+    return true;
 }
 
-static uint32_t ampr_op_size_bytes(const Op& op) {
+static uint32_t ampr_fixed_op_size_bytes(const Op& op) {
     switch (op.type) {
         case OpType::WaitOnAddress: {
             uint64_t ref = op.u64a;
@@ -292,11 +305,6 @@ static uint32_t ampr_op_size_bytes(const Op& op) {
             if (op.u32b) return (n + 1u) * 4u;
             return n * 4u;
         }
-        case OpType::MarkerSet:
-        case OpType::MarkerPush: {
-            const uint32_t lenWithNul = op.textLength + 1u;
-            return ampr_marker_layout(ampr_marker_type(op), lenWithNul).dwords * 4u;
-        }
         case OpType::MarkerPop:
             return 4u;
 
@@ -320,20 +328,38 @@ static uint32_t ampr_op_size_bytes(const Op& op) {
     }
 }
 
+int ampr_op_layout_checked(const Op& op, PackedOpLayout* outLayout) {
+    if (!outLayout) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    *outLayout = {};
+
+    if (op.type == OpType::MarkerSet || op.type == OpType::MarkerPush) {
+        AmprMarkerLayout markerLayout{};
+        if (!ampr_marker_layout_fits_native(op, &markerLayout)) {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+        outLayout->bytes = static_cast<uint32_t>(markerLayout.dwords * 4ull);
+        outLayout->commandCount = static_cast<uint32_t>(markerLayout.commandCount);
+        return 0;
+    }
+
+    outLayout->bytes = ampr_fixed_op_size_bytes(op);
+    if (outLayout->bytes == 0u) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    outLayout->commandCount = 1u;
+    return 0;
+}
+
 int ampr_op_size_bytes_checked(const Op& op, uint32_t* outBytes) {
     if (!outBytes) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    if ((op.type == OpType::MarkerSet || op.type == OpType::MarkerPush) &&
-        (!op.text || op.textLength == UINT32_MAX)) {
-        *outBytes = 0;
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    *outBytes = ampr_op_size_bytes(op);
-    if (*outBytes == 0u) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    return 0;
+    PackedOpLayout layout{};
+    const int rc = ampr_op_layout_checked(op, &layout);
+    *outBytes = layout.bytes;
+    return rc;
 }
 
 static void ampr_strict_write_words(SceAmprCommandBuffer* cb, uint32_t offBytes, const uint32_t* words, uint32_t dwords) {
@@ -353,10 +379,12 @@ static void ampr_strict_write_words(SceAmprCommandBuffer* cb, uint32_t offBytes,
               dwords > 5 ? words[5] : 0u);
 }
 
-int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& op, uint32_t bytes) {
-    uint32_t expectedBytes = 0;
-    const int sizeRc = ampr_op_size_bytes_checked(op, &expectedBytes);
-    if (sizeRc != 0 || bytes == 0 || bytes != expectedBytes) {
+int ampr_write_op_with_layout(SceAmprCommandBuffer* cb,
+                              uint32_t offBytes,
+                              const Op& op,
+                              const PackedOpLayout& layout) {
+    const uint32_t bytes = layout.bytes;
+    if (bytes == 0u || layout.commandCount == 0u) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
     if (!cb || !cb->buffer) {
@@ -386,7 +414,7 @@ int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& 
             if ((ref >> 32) == 0) dwords = 3u - (ref == 0 ? 1u : 0u);
 
             w[0] = (uint32_t)((addr >> 16) & 0xFFFF0000ull)
-                 | ((((uint16_t)dwords << 8) + 3840u) & 0xEF00u)
+                 | (((static_cast<uint32_t>(dwords) << 8) + 3840u) & 0xEF00u)
                  | ((cmp & 7u) << 13)
                  | ((flush & 1u) << 12)
                  | 1u;
@@ -471,8 +499,8 @@ int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& 
             } else {
                 w[0] = ((op.u32c & 0xFu) << 12) | ((n & 0xFu) << 8) | 0x5452000Fu;
                 ampr_strict_write_words(cb, offBytes, w, 1u);
-                uint32_t bytes = n * 4u;
-                if (bytes && offBytes + 4u + bytes <= cb->bufsize) {
+                uint32_t payloadBytes = n * 4u;
+                if (payloadBytes && offBytes + 4u + payloadBytes <= cb->bufsize) {
                     uint8_t* payloadOut = static_cast<uint8_t*>(cb->buffer) + offBytes + 4u;
                     uint32_t cursor = 0u;
                     if (op.u8a) {
@@ -484,13 +512,13 @@ int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& 
                         const bool typedNop = op.u32c != 0u || op.u8a != 0u || op.u64a != 0u;
                         const uint32_t copyBytes = typedNop
                             ? static_cast<uint32_t>(op.u64a)
-                            : bytes - cursor;
-                        if (copyBytes != 0u && cursor < bytes) {
-                            const uint32_t boundedCopy = copyBytes < bytes - cursor ? copyBytes : bytes - cursor;
+                            : payloadBytes - cursor;
+                        if (copyBytes != 0u && cursor < payloadBytes) {
+                            const uint32_t boundedCopy = copyBytes < payloadBytes - cursor ? copyBytes : payloadBytes - cursor;
                             std::memcpy(payloadOut + cursor, op.cptr, boundedCopy);
                             cursor += boundedCopy;
                             const uint32_t padding = ampr_align4(cursor) - cursor;
-                            if (padding != 0u && cursor + padding <= bytes) {
+                            if (padding != 0u && cursor + padding <= payloadBytes) {
                                 std::memset(payloadOut + cursor, 0, padding);
                             }
                         }
@@ -543,7 +571,7 @@ int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& 
             const uint64_t offset = op.u64b;
             const uint32_t dwords = ((offset >> 32) != 0) ? 6u : 5u;
             w[0] = ((static_cast<uint32_t>(offset) << 12) & 0x3FFFF000u)
-                 | (((static_cast<uint16_t>(dwords) << 8) + 1792u) & 0x700u)
+                 | (((static_cast<uint32_t>(dwords) << 8) + 1792u) & 0x700u)
                  | 40u;
             w[1] = static_cast<uint32_t>(op.u64a - 1u);
             w[2] = op.u32a & 0x7FFFFFFFu;
@@ -560,7 +588,7 @@ int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& 
             const uint64_t offset = op.u64b;
             const uint32_t dwords = (offset >= 0x40000ull) ? 3u : 2u;
             w[0] = ((static_cast<uint32_t>(offset) << 12) & 0x3FFFF000u)
-                 | (((static_cast<uint16_t>(dwords) << 8) + 768u) & 0x300u)
+                 | (((static_cast<uint32_t>(dwords) << 8) + 768u) & 0x300u)
                  | 41u;
             w[1] = static_cast<uint32_t>(op.u64a - 1u);
             if (dwords == 3u) {
@@ -582,7 +610,7 @@ int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& 
             const uint64_t offset = op.u64b;
             const uint32_t dwords = ((offset >> 32) != 0) ? 5u : 4u;
             w[0] = ((static_cast<uint32_t>(offset) << 12) & 0x3FFFF000u)
-                 | (((static_cast<uint16_t>(dwords) << 8) + 1792u) & 0x700u)
+                 | (((static_cast<uint32_t>(dwords) << 8) + 1792u) & 0x700u)
                  | 43u;
             w[1] = static_cast<uint32_t>(op.u64a - 1u);
             w[2] = static_cast<uint32_t>(buffer);
@@ -636,6 +664,18 @@ int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& 
             return SCE_KERNEL_ERROR_EINVAL;
     }
     return 0;
+}
+
+int ampr_strict_write_op(SceAmprCommandBuffer* cb,
+                         uint32_t offBytes,
+                         const Op& op,
+                         uint32_t bytes) {
+    PackedOpLayout layout{};
+    const int layoutRc = ampr_op_layout_checked(op, &layout);
+    if (layoutRc != 0 || bytes == 0u || bytes != layout.bytes) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    return ampr_write_op_with_layout(cb, offBytes, op, layout);
 }
 
 static uint32_t ampr_load_packed_u32(const uint8_t* p) {
@@ -736,85 +776,6 @@ static uint32_t ampr_decode_amm_prot(uint32_t w0) {
 
 static uint32_t ampr_decode_amm_prot_without_prt_flag(uint32_t w0) {
     return ((w0 & ~0x8000u) >> 12) & 0x7FFFu;
-}
-
-static int ampr_decode_amm_packed_op_view(const void* buffer,
-                                          uint32_t bytes,
-                                          uint32_t off,
-                                          PackedOpView* outView,
-                                          uint32_t* errorOffset) {
-    const uint8_t* const base = static_cast<const uint8_t*>(buffer) + off;
-    const uint32_t w0 = ampr_load_packed_u32(base);
-    const uint32_t opcode12 = w0 & 0xFFFu;
-    uint32_t dwords = 0;
-    OpType type = OpType::Nop;
-
-    switch (opcode12) {
-        case 0x221u:
-        case 0x321u: {
-            dwords = opcode12 == 0x321u ? 4u : 3u;
-            if (!ampr_decode_need_dwords(off, bytes, dwords, errorOffset)) {
-                return SCE_KERNEL_ERROR_EINVAL;
-            }
-            const uint32_t prot = ampr_decode_amm_prot_without_prt_flag(w0);
-            const bool prt = (w0 & 0x8000u) != 0;
-            type = prt && prot == 0u && ((w0 >> 27) & 0x1Fu) == 0u
-                ? OpType::AmmMapAsPrt
-                : OpType::AmmMap;
-            break;
-        }
-        case 0x325u:
-        case 0x425u:
-            dwords = opcode12 == 0x425u ? 5u : 4u;
-            type = OpType::AmmMapDirect;
-            break;
-        case 0x222u:
-        case 0x228u:
-            dwords = 3u;
-            type = opcode12 == 0x228u ? OpType::AmmUnmapToPrt : OpType::AmmUnmap;
-            break;
-        case 0x323u:
-        case 0x423u:
-        case 0x324u:
-        case 0x424u:
-        case 0x327u:
-            dwords = opcode12 == 0x423u || opcode12 == 0x424u ? 5u : 4u;
-            type = opcode12 == 0x327u
-                ? OpType::AmmRemapIntoPrt
-                : (opcode12 == 0x324u || opcode12 == 0x424u
-                    ? OpType::AmmMultiMap
-                    : OpType::AmmRemap);
-            break;
-        case 0x326u:
-        case 0x426u: {
-            dwords = opcode12 == 0x426u ? 5u : 4u;
-            if (!ampr_decode_need_dwords(off, bytes, dwords, errorOffset)) {
-                return SCE_KERNEL_ERROR_EINVAL;
-            }
-            const uint32_t w2 = ampr_load_packed_u32(base + 8u);
-            const uint32_t w3 = ampr_load_packed_u32(base + 12u);
-            const bool mtype = (w2 & 0x40000000u) != 0 || ((w0 >> 27) & 0x1Fu) != 0;
-            type = mtype
-                ? (w3 == 1019u && opcode12 == 0x326u
-                    ? OpType::AmmAllocPaForPrt
-                    : OpType::AmmModifyMtypeProtect)
-                : OpType::AmmModifyProtect;
-            break;
-        }
-        default:
-            if (errorOffset) {
-                *errorOffset = off;
-            }
-            return SCE_KERNEL_ERROR_EINVAL;
-    }
-
-    if (!ampr_decode_need_dwords(off, bytes, dwords, errorOffset)) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    outView->type = type;
-    outView->bytes = dwords * 4u;
-    outView->waitFlush = false;
-    return 0;
 }
 
 static int ampr_decode_amm_packed_op(const void* buffer,
@@ -1171,121 +1132,6 @@ int ampr_decode_apr_packed_op(const void* buffer,
                               uint32_t* outBytes,
                               uint32_t* errorOffset) {
     return ampr_decode_packed_op(buffer, bytes, off, outOp, outBytes, errorOffset);
-}
-
-int ampr_decode_apr_packed_op_view(const void* buffer,
-                                   uint32_t bytes,
-                                   uint32_t off,
-                                   PackedOpView* outView,
-                                   uint32_t* errorOffset) {
-    if (errorOffset) {
-        *errorOffset = 0;
-    }
-    if (!buffer || !outView || (bytes & 3u) != 0 || (off & 3u) != 0 || off >= bytes) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-
-    const uint8_t* const base = static_cast<const uint8_t*>(buffer);
-    const uint32_t w0 = ampr_load_packed_u32(base + off);
-    const uint32_t opcode8 = w0 & 0xFFu;
-    const uint32_t opcode12 = w0 & 0xFFFu;
-    uint32_t dwords = 0;
-    OpType type = OpType::Nop;
-    bool waitFlush = false;
-
-    if (opcode8 == 1u) {
-        dwords = ((w0 >> 8) & 0xFu) + 1u;
-        if (!ampr_decode_need_dwords_range(off, bytes, dwords, 2u, 4u, errorOffset)) {
-            return SCE_KERNEL_ERROR_EINVAL;
-        }
-        type = OpType::WaitOnAddress;
-        waitFlush = ((w0 >> 12) & 1u) != 0;
-    } else if (opcode8 == 2u) {
-        dwords = ((w0 >> 8) & 0xFu) + 1u;
-        if (!ampr_decode_need_dwords_range(off, bytes, dwords, 1u, 5u, errorOffset) ||
-            dwords == 4u) {
-            if (errorOffset) {
-                *errorOffset = off;
-            }
-            return SCE_KERNEL_ERROR_EINVAL;
-        }
-        type = OpType::WaitOnCounter;
-        waitFlush = ((w0 >> 12) & 1u) != 0;
-    } else if (opcode8 == 5u || opcode8 == 117u) {
-        dwords = ((w0 >> 8) & 3u) + 1u;
-        if (!ampr_decode_need_dwords_range(off, bytes, dwords, 2u, 4u, errorOffset)) {
-            return SCE_KERNEL_ERROR_EINVAL;
-        }
-        switch (ampr_load_packed_u32(base + off + 4u) & 7u) {
-            case 1u: type = OpType::WriteAddressFromTimeCounter; break;
-            case 2u: type = OpType::WriteAddressFromCounter; break;
-            case 3u: type = OpType::WriteAddressFromCounterPair; break;
-            default: type = OpType::WriteAddress; break;
-        }
-    } else if (opcode8 == 6u || opcode8 == 118u) {
-        dwords = ((w0 >> 8) & 0xFu) + 1u;
-        if (!ampr_decode_need_dwords_range(off, bytes, dwords, 1u, 3u, errorOffset)) {
-            return SCE_KERNEL_ERROR_EINVAL;
-        }
-        type = OpType::WriteCounter;
-    } else if (opcode12 == 1032u || opcode12 == 1144u) {
-        dwords = 5u;
-        type = OpType::WriteEqueue;
-    } else if ((w0 & 0xFFFF000Fu) == 0x5452000Fu) {
-        dwords = ((w0 >> 8) & 0xFu) + 1u;
-        if (w0 == 0x5452300Fu) {
-            type = OpType::MarkerPop;
-            dwords = 1u;
-        } else {
-            const uint32_t markerType = (w0 >> 12) & 0xFu;
-            type = markerType == 1u || markerType == 5u
-                ? OpType::MarkerSet
-                : (markerType == 2u || markerType == 6u ? OpType::MarkerPush : OpType::Nop);
-        }
-    } else if (opcode8 == 40u) {
-        dwords = ((w0 >> 8) & 7u) + 1u;
-        if (!ampr_decode_need_dwords_range(off, bytes, dwords, 5u, 6u, errorOffset)) {
-            return SCE_KERNEL_ERROR_EINVAL;
-        }
-        type = OpType::AprReadFile;
-    } else if (opcode8 == 41u) {
-        dwords = ((w0 >> 8) & 3u) + 1u;
-        if (!ampr_decode_need_dwords_range(off, bytes, dwords, 2u, 3u, errorOffset)) {
-            return SCE_KERNEL_ERROR_EINVAL;
-        }
-        type = OpType::AprReadGather;
-    } else if (opcode12 == 0x22Au) {
-        dwords = 3u;
-        type = OpType::AprReadScatter;
-    } else if (opcode8 == 43u) {
-        dwords = ((w0 >> 8) & 7u) + 1u;
-        if (!ampr_decode_need_dwords_range(off, bytes, dwords, 4u, 5u, errorOffset)) {
-            return SCE_KERNEL_ERROR_EINVAL;
-        }
-        type = OpType::AprReadGatherScatter;
-    } else if (w0 == 47u) {
-        dwords = 1u;
-        type = OpType::AprResetGatherScatter;
-    } else if (opcode12 == 557u) {
-        dwords = 3u;
-        type = OpType::AprMapBegin;
-    } else if (opcode12 == 813u) {
-        dwords = 4u;
-        type = OpType::AprMapDirectBegin;
-    } else if (w0 == 46u) {
-        dwords = 1u;
-        type = OpType::AprMapEnd;
-    } else {
-        return ampr_decode_amm_packed_op_view(buffer, bytes, off, outView, errorOffset);
-    }
-
-    if (!ampr_decode_need_dwords(off, bytes, dwords, errorOffset)) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    outView->type = type;
-    outView->bytes = dwords * 4u;
-    outView->waitFlush = waitFlush;
-    return 0;
 }
 
 } // namespace sce::Ampr

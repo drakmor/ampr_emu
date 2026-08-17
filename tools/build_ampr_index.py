@@ -21,6 +21,7 @@ import os
 import struct
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -35,14 +36,18 @@ class HashCollisionStats:
     duplicate_hash_samples: list[tuple[int, str, str]] = field(default_factory=list)
 
 
-def key_for(path: str) -> str:
-    return path.replace("\\", "/").lower()
+def key_for(path: str) -> bytes:
+    # Match the runtime exactly: normalize slashes, UTF-8 encode, then fold only
+    # ASCII A..Z byte values. Do not use Unicode .lower(), which changes the
+    # AMPRIDX3 hash/order for non-ASCII paths.
+    raw = path.replace("\\", "/").encode("utf-8")
+    return bytes((b + 0x20) if 0x41 <= b <= 0x5A else b for b in raw)
 
 
 def fnv1a64_path_hash(path: str) -> int:
     h = 1469598103934665603
-    for ch in key_for(path):
-        h ^= ord(ch)
+    for byte in key_for(path):
+        h ^= byte
         h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     return h or 1
 
@@ -127,7 +132,7 @@ def report_progress(count: int) -> None:
 
 def validate_and_add_row(
     rows: list[tuple[int, int, str]],
-    seen: dict[str, str],
+    seen: dict[bytes, str],
     size: int,
     mtime: int,
     indexed_path: str,
@@ -210,12 +215,12 @@ def build_index_local(root: Path, output: Path, allow_case_collisions: bool) -> 
 
     output = output.resolve()
     output_tmp = output.with_suffix(output.suffix + ".tmp")
-    seen: dict[str, str] = {}
+    seen: dict[bytes, str] = {}
     rows: list[tuple[int, int, str]] = []
 
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames.sort(key=str.lower)
-        filenames.sort(key=str.lower)
+        dirnames.sort(key=key_for)
+        filenames.sort(key=key_for)
         for filename in filenames:
             path = Path(dirpath) / filename
             try:
@@ -259,11 +264,17 @@ def ftp_join(parent: str, name: str) -> str:
 
 
 def ftp_modify_to_int(value: str) -> int:
-    # MLSD modify is UTC YYYYMMDDHHMMSS. The emulator only uses mtime as
-    # cached metadata, so the compact integer is stable and timezone-free.
-    if len(value) >= 14 and value[:14].isdigit():
-        return int(value[:14])
-    return 0
+    # MLSD/MDTM modify is UTC YYYYMMDDHHMMSS. Store the same Unix-seconds
+    # representation used by the local builder and runtime SceKernelStat path.
+    stamp = value[:14]
+    if len(stamp) != 14 or not stamp.isdigit():
+        return 0
+    try:
+        dt = datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        seconds = int(dt.timestamp())
+        return seconds if seconds >= 0 else 0
+    except (ValueError, OverflowError, OSError):
+        return 0
 
 
 def ftp_is_dir(ftp: ftplib.FTP, path: str) -> bool:
@@ -341,7 +352,7 @@ def collect_ftp_rows(
     root: str,
     allow_case_collisions: bool,
 ) -> tuple[int, list[tuple[int, int, str]]]:
-    seen: dict[str, str] = {}
+    seen: dict[bytes, str] = {}
     rows: list[tuple[int, int, str]] = []
     dirs_seen = 0
     stack = [root]
@@ -353,7 +364,7 @@ def collect_ftp_rows(
         except ftplib.error_perm as exc:
             print(f"warning: skipping unreadable FTP directory {current}: {exc}", file=sys.stderr)
             continue
-        entries.sort(key=lambda item: item[0].lower())
+        entries.sort(key=lambda item: key_for(item[0]))
 
         child_dirs: list[str] = []
         for name, facts in entries:
@@ -370,7 +381,7 @@ def collect_ftp_rows(
             rel = remote_path[len(root):].lstrip("/") if root != "/" else remote_path.lstrip("/")
             indexed_path = "/app0/" + rel.replace("\\", "/")
             indexed_key = key_for(indexed_path)
-            if indexed_key in ("/app0/ampr_emu.index", "/app0/ampr_emu.index.tmp"):
+            if indexed_key in (key_for("/app0/ampr_emu.index"), key_for("/app0/ampr_emu.index.tmp"), key_for("/app0/ampr_emu.index.bak")):
                 continue
 
             size = int(facts.get("size", "0") or "0")
@@ -381,16 +392,59 @@ def collect_ftp_rows(
     return dirs_seen, rows
 
 
+def ftp_file_exists(ftp: ftplib.FTP, remote_path: str) -> bool:
+    """Best-effort file existence probe that never mutates the remote tree."""
+    try:
+        size = ftp.size(remote_path)
+        if size is not None:
+            return True
+    except ftplib.all_errors:
+        pass
+    try:
+        ftp.sendcmd(f"MLST {remote_path}")
+        return True
+    except ftplib.all_errors:
+        return False
+
+
 def upload_index_to_ftp(ftp: ftplib.FTP, root: str, output: Path) -> None:
     remote_tmp = ftp_join(root, "ampr_emu.index.tmp")
     remote_dst = ftp_join(root, "ampr_emu.index")
+    remote_backup = ftp_join(root, "ampr_emu.index.bak")
     with output.open("rb") as f:
         ftp.storbinary(f"STOR {remote_tmp}", f)
+
+    # Some FTP servers do not replace an existing destination on RNTO. Only
+    # clear/reuse the backup name when a current destination is known to exist;
+    # otherwise a stale .bak may be the only recoverable copy from an earlier
+    # interrupted update and must not be destroyed before the new file installs.
+    dst_existed = ftp_file_exists(ftp, remote_dst)
+    old_moved = False
+    if dst_existed:
+        try:
+            ftp.delete(remote_backup)
+        except ftplib.all_errors:
+            pass
+        try:
+            ftp.rename(remote_dst, remote_backup)
+            old_moved = True
+        except ftplib.all_errors:
+            pass
     try:
-        ftp.delete(remote_dst)
+        ftp.rename(remote_tmp, remote_dst)
+    except Exception:
+        if old_moved:
+            try:
+                ftp.rename(remote_backup, remote_dst)
+            except ftplib.all_errors:
+                pass
+        raise
+    # A successfully installed destination supersedes either the freshly moved
+    # old index or any stale recovery copy left by a previous interrupted run.
+    try:
+        ftp.delete(remote_backup)
     except ftplib.all_errors:
         pass
-    ftp.rename(remote_tmp, remote_dst)
     print(f"uploaded {remote_dst}")
 
 

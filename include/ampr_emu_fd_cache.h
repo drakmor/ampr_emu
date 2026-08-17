@@ -36,7 +36,8 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
                                  uint32_t id,
                                  const FileEntryView& entry,
                                  int flags,
-                                 int mode);
+                                 int mode,
+                                 bool allowOpen);
 void ampr_index_release_cached_fd_pin(uint32_t fileId);
 void ampr_index_fd_direct_note_open();
 void ampr_index_fd_direct_note_close();
@@ -54,10 +55,6 @@ void ampr_index_fd_cache_release_open_fd_headroom(size_t reserve, size_t cap);
 bool ampr_index_fd_cache_release_open_fd_budget_headroom(size_t reserve);
 size_t ampr_index_fd_cache_release_idle_percent(unsigned percent);
 bool ampr_index_fd_common_open_budget_headroom_available(size_t reserve,
-                                                         size_t* outObserved = nullptr,
-                                                         size_t* outBudget = nullptr,
-                                                         size_t* outEvictable = nullptr);
-bool ampr_index_fd_cached_open_budget_headroom_available(uint32_t fileId,
                                                          size_t* outObserved = nullptr,
                                                          size_t* outBudget = nullptr,
                                                          size_t* outEvictable = nullptr);

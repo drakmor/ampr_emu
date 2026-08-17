@@ -441,14 +441,48 @@ void publish_hook_original(size_t hookIndex) {
     }
 }
 
-void reset_hook_originals_to_sdk_fallbacks() {
-    for (size_t index = 0; index < kHookCount; ++index) {
-        g_amprOriginalLibkernelById[index] = g_amprSdkLibkernelFallbackById[index];
-    }
-}
-
 uint64_t hook_mask_bit(size_t index) {
     return uint64_t{1} << index;
+}
+
+void refresh_hook_runtime_state_from_detours() {
+    int installed = 0;
+    int mandatoryInstalled = 0;
+    uint64_t capabilityMask = 0;
+    uint64_t mandatoryMask = 0;
+    uint64_t optionalMask = 0;
+    uint64_t mandatoryCapabilityMask = 0;
+
+    for (size_t index = 0; index < kHookCount; ++index) {
+        HookSpec& hook = g_hooks[index];
+        const uint64_t bit = hook_mask_bit(index);
+        if (hook.mandatory) {
+            mandatoryMask |= bit;
+        } else {
+            optionalMask |= bit;
+        }
+
+        if (hook.detour.installed) {
+            ++installed;
+            capabilityMask |= bit;
+            if (hook.mandatory) {
+                ++mandatoryInstalled;
+                mandatoryCapabilityMask |= bit;
+            }
+            g_amprOriginalLibkernelById[index] = hook.detour.trampoline;
+        } else {
+            g_amprOriginalLibkernelById[index] = g_amprSdkLibkernelFallbackById[index];
+        }
+    }
+
+    g_hookInstalledCount = installed;
+    g_hookMandatoryInstalledCount = mandatoryInstalled;
+    g_hookCapabilityMask = capabilityMask;
+    g_hookMandatoryMask = mandatoryMask;
+    g_hookOptionalMask = optionalMask;
+    g_hookMandatoryCapabilityMask = mandatoryCapabilityMask;
+    set_hooks_installed(mandatoryMask != 0 &&
+                        mandatoryCapabilityMask == mandatoryMask);
 }
 
 void reset_deferred_hook_log() {
@@ -1072,7 +1106,10 @@ bool rip_relative_instruction_changes_stack(const hde64s& hs) {
     }
     if (hs.opcode == 0xff) {
         const uint8_t group = hs.modrm_reg & 7u;
-        return group == 4u || group == 6u;
+        // /2,/3 are calls: the callee would observe the scratch-register push
+        // on its stack. /4,/5 are jumps: our trailing pop would never execute.
+        // /6 is push itself. Only /0 (inc) and /1 (dec) are safe here.
+        return group >= 2u && group <= 6u;
     }
     return false;
 }
@@ -1926,12 +1963,7 @@ static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
               kHookCount);
 
     if (installed == 0) {
-        for (HookSpec& hook : g_hooks) {
-            (void)uninstall_inline_detour(hook.detour);
-        }
-        reset_hook_originals_to_sdk_fallbacks();
-        g_hookCapabilityMask = 0;
-        g_hookMandatoryCapabilityMask = 0;
+        refresh_hook_runtime_state_from_detours();
         hook_logf("install status=failed reason=no-symbols-installed missing=%d failed=%d",
                   missing,
                   failed);
@@ -1940,15 +1972,20 @@ static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
     }
 
     if (mandatoryMissing != 0 || mandatoryFailed != 0) {
-        for (HookSpec& hook : g_hooks) {
-            (void)uninstall_inline_detour(hook.detour);
+        bool rollbackOk = true;
+        for (size_t index = kHookCount; index > 0; --index) {
+            rollbackOk = uninstall_inline_detour(g_hooks[index - 1].detour) && rollbackOk;
         }
-        reset_hook_originals_to_sdk_fallbacks();
-        g_hookCapabilityMask = 0;
-        g_hookMandatoryCapabilityMask = 0;
-        hook_logf("install status=failed reason=mandatory-hook-unavailable mandatoryMissing=%d mandatoryFailed=%d",
+        // A failed restore must retain the corresponding trampoline/original
+        // pointer and capability bit. Never advertise a fallback for a detour
+        // that is still physically patched into libkernel.
+        refresh_hook_runtime_state_from_detours();
+        hook_logf("install status=failed reason=mandatory-hook-unavailable mandatoryMissing=%d mandatoryFailed=%d rollbackOk=%u residual=%d capability=0x%llx",
                   mandatoryMissing,
-                  mandatoryFailed);
+                  mandatoryFailed,
+                  rollbackOk ? 1u : 0u,
+                  g_hookInstalledCount,
+                  static_cast<unsigned long long>(g_hookCapabilityMask));
         g_hookInstallResult = -1;
         return -1;
     }
@@ -1980,6 +2017,8 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprUninstallLibkernelHooks(void) {
     bool ok = true;
     int removed = 0;
     int failed = 0;
+    (void)removed;
+    (void)failed;
     for (size_t index = kHookCount; index > 0; --index) {
         HookSpec& hook = g_hooks[index - 1];
         const bool wasInstalled = hook.detour.installed;
@@ -1993,9 +2032,15 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprUninstallLibkernelHooks(void) {
             hook_logf("symbol=%s status=uninstall-failed", hook.symbol);
         }
     }
-    reset_hook_originals_to_sdk_fallbacks();
-    set_hooks_installed(false);
-    hook_logf("uninstall status=summary removed=%d failed=%d", removed, failed);
+    // Recompute originals/capabilities from what is actually still installed.
+    // This keeps partial restore failures callable through their trampoline
+    // instead of publishing an SDK fallback behind a still-active detour.
+    refresh_hook_runtime_state_from_detours();
+    hook_logf("uninstall status=summary removed=%d failed=%d residual=%d capability=0x%llx",
+              removed,
+              failed,
+              g_hookInstalledCount,
+              static_cast<unsigned long long>(g_hookCapabilityMask));
     return ok ? 0 : -1;
 }
 

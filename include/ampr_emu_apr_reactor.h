@@ -57,6 +57,4 @@ struct Job {
 
 int apr_reactor_shutdown();
 int apr_reactor_wait_synthetic_submit_id(SceAprSubmitId id, bool* outHandled);
-int apr_reactor_submit(const Job& j,
-                       SceAprSubmitId* outSubmitId,
-                       uint32_t* outErrorOffset);
+int apr_reactor_submit(const Job& j, SceAprSubmitId* outSubmitId);

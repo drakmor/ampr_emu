@@ -18,6 +18,7 @@ static int cb_append_amm_kernel_record(SceAmprCommandBuffer* cb,
                                        MeasureFn measure,
                                        WriteFn write,
                                        bool requireBuffer = true) {
+    (void)typeName;
     if (!cb) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
@@ -36,22 +37,24 @@ static int cb_append_amm_kernel_record(SceAmprCommandBuffer* cb,
     if (bytes > cb->bufsize || oldOffset > cb->bufsize - bytes) {
         return SCE_KERNEL_ERROR_EBUSY;
     }
-    const uint32_t nextOffset = oldOffset + bytes;
-
-    cb->offset = nextOffset;
+    // A few compatibility writers defer the buffer check until after their
+    // measure call so an unavailable kernel helper can still report ENXIO.
     if (!cb->buffer) {
-        cb->offset = oldOffset;
         return SCE_KERNEL_ERROR_EPERM;
     }
+    if (cb->num < 0 || cb->num == INT32_MAX) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    const uint32_t nextOffset = oldOffset + bytes;
     void* dst = static_cast<uint8_t*>(cb->buffer) + oldOffset;
     const int writeRc = write(dst);
     if (writeRc != 0) {
-        cb->offset = oldOffset;
         return writeRc;
     }
 
-    volatile uint32_t* num = reinterpret_cast<volatile uint32_t*>(&cb->num);
-    *num = *num + 1u;
+    // Commit metadata only after the kernel-format writer has succeeded.
+    cb->offset = nextOffset;
+    ++cb->num;
     AMPR_TLOGF("cb.append.amm.kernel cb=%p type=%s off=0x%x size=0x%x next=0x%x bufsize=0x%x",
               cb,
               typeName ? typeName : "?",
@@ -67,6 +70,9 @@ static void amm_log_cpu_visible_prot_substitution(const char* op,
                                                   int prot,
                                                   uint64_t kernelProt,
                                                   uint64_t adjustedProt) {
+    (void)op;
+    (void)cb;
+    (void)prot;
     if (adjustedProt == kernelProt) {
         return;
     }

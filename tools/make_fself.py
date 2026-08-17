@@ -25,7 +25,7 @@ def ilog2(x):
 	return len(bin(x)) - 3
 
 def is_intervals_overlap(p1, p2):
-	return p1[0] <= p2[1] and p1[1] <= p2[0]
+	return p1[0] <= p2[1] and p2[0] <= p1[1]
 
 def check_file_magic(f, expected_magic):
 	old_offset = f.tell()
@@ -439,7 +439,7 @@ class SignedElfEntry(object):
 	def segment_index(self):
 		return (self.props >> SignedElfEntry.PROPS_SEGMENT_INDEX_SHIFT) & SignedElfEntry.PROPS_SEGMENT_INDEX_MASK
 
-	@wbits.setter
+	@segment_index.setter
 	def segment_index(self, value):
 		self.props &= ~(SignedElfEntry.PROPS_SEGMENT_INDEX_MASK << SignedElfEntry.PROPS_SEGMENT_INDEX_SHIFT)
 		self.props |= (value & SignedElfEntry.PROPS_SEGMENT_INDEX_MASK) << SignedElfEntry.PROPS_SEGMENT_INDEX_SHIFT

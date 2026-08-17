@@ -158,7 +158,7 @@ def build_stub(config: dict[str, object]) -> bytes:
     sections.append((".dynamic", SHT_DYNAMIC, dynamic, 8, 4, 0, 16))
     sections.append((".scenid", SHT_SCENID, bytes(scenid), 8, 5, 0, 8))
     sections.append((".dynstr", SHT_STRTAB, bytes(dynstr), 1, 0, 0, 0))
-    sections.append((".dynsym", SHT_DYNSYM, bytes(dynsym), 8, 4, 0, 24))
+    sections.append((".dynsym", SHT_DYNSYM, bytes(dynsym), 8, 4, 1, 24))
 
     out = bytearray(b"\0" * 64)
     layout = []

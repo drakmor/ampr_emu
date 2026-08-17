@@ -270,12 +270,13 @@ int cb_append_with_type_mask(SceAmprCommandBuffer* cb, Op&& op, uint32_t setMask
         return SCE_KERNEL_ERROR_EPERM;
     }
 
-    uint32_t sz = 0;
-    int sizeRc = ampr_op_size_bytes_checked(op, &sz);
-    if (sizeRc != 0 || sz == 0) {
-        return sizeRc ? sizeRc : SCE_KERNEL_ERROR_EINVAL;
+    PackedOpLayout layout{};
+    const int layoutRc = ampr_op_layout_checked(op, &layout);
+    if (layoutRc != 0) {
+        return layoutRc;
     }
-    const uint32_t commandCount = ampr_native_op_command_count(op);
+    const uint32_t sz = layout.bytes;
+    const uint32_t commandCount = layout.commandCount;
     const uint32_t off = cb->offset;
     op.bufOffsetBytes = off;
     // Match the SDK EBUSY path for full command buffers.
@@ -287,7 +288,7 @@ int cb_append_with_type_mask(SceAmprCommandBuffer* cb, Op&& op, uint32_t setMask
         cb->num > static_cast<int>(static_cast<uint32_t>(INT32_MAX) - commandCount)) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    const int writeRc = ampr_strict_write_op(cb, off, op, sz);
+    const int writeRc = ampr_write_op_with_layout(cb, off, op, layout);
     if (writeRc != 0) {
         return writeRc;
     }
@@ -445,6 +446,9 @@ int CommandBuffer::writeCounterOnCompletion(uint8_t counterIndex, uint32_t value
 }
 
 int CommandBuffer::writeKernelEventQueue_04_00(SceKernelEqueue eq, int32_t id, uint64_t data, bool atSop) {
+    if (!eq) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
     if (!atSop) {
         const int mapRc = ampr_reject_completion_write_in_apr_map(&m_commandBuffer);
         if (mapRc != 0) {

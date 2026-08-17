@@ -30,12 +30,28 @@ static uint64_t apr_next_submit_id() {
     return g_next_submit_id.fetch_add(1ull, std::memory_order_relaxed);
 }
 
-static int apr_submit_reject(SceAprResultBuffer* res, int rc, uint32_t errorOffset = 0) {
+static int apr_submit_reject(SceAprResultBuffer* res, int rc) {
     if (res) {
         res->result = rc;
-        res->errorOffset = errorOffset;
+        res->errorOffset = 0;
     }
     return rc;
+}
+
+static int resolve_index_path_to_sce(const char* path,
+                                     uint32_t* outId,
+                                     size_t* outSize = nullptr) {
+    uint32_t id = SCE_AMPR_APR_FILEID_INVALID;
+    size_t size = 0;
+    const int rc = ampr_index_resolve_path_to_id(path, &id, outSize ? &size : nullptr);
+    if (rc != 0) {
+        return ampr_sce_errno_from_posix(rc < 0 ? -rc : rc);
+    }
+    *outId = id;
+    if (outSize) {
+        *outSize = size;
+    }
+    return 0;
 }
 
 } // namespace
@@ -54,13 +70,12 @@ int aprResolveFilepathsToIds(const char* path[], uint32_t num, SceAprFileId ids[
     for (uint32_t i=0;i<num;i++) {
         uint32_t id=0;
         AMPR_TLOGF("apr.resolveIds item enter idx=%u path=%s", (unsigned)i, ampr_log_path_arg(path[i]));
-        int rc = ampr_index_resolve_path_to_id(path[i], &id, nullptr);
-        if (rc!=0) {
-            const int sceRc = ampr_sce_errno_from_posix(rc < 0 ? -rc : rc);
+        const int rc = resolve_index_path_to_sce(path[i], &id);
+        if (rc != 0) {
             AMPR_CRITICAL_LOGF("apr.resolveIds item fail idx=%u path=%s rc=0x%x",
-                      (unsigned)i, ampr_log_path_arg(path[i]), sceRc);
+                      (unsigned)i, ampr_log_path_arg(path[i]), rc);
             if (errorIndex) *errorIndex=i;
-            return sceRc;
+            return rc;
         }
         ids[i]=id;
         AMPR_TLOGF("apr.resolveIds item done idx=%u path=%s fileId=%u",
@@ -82,13 +97,12 @@ int aprResolveFilepathsToIdsAndFileSizes(const char* path[], uint32_t num, SceAp
         AMPR_TLOGF("[apr-rs-02] resolve ids+sizes item begin idx=%u path=%s",
                   (unsigned)i, ampr_log_path_arg(path[i]));
         uint32_t id=0; size_t sz=0;
-        int rc = ampr_index_resolve_path_to_id(path[i], &id, &sz);
-        if (rc!=0) {
-            const int sceRc = ampr_sce_errno_from_posix(rc < 0 ? -rc : rc);
+        const int rc = resolve_index_path_to_sce(path[i], &id, &sz);
+        if (rc != 0) {
             AMPR_CRITICAL_LOGF("[apr-rs-03] resolve ids+sizes item fail idx=%u path=%s rc=0x%x",
-                      (unsigned)i, ampr_log_path_arg(path[i]), sceRc);
+                      (unsigned)i, ampr_log_path_arg(path[i]), rc);
             if (errorIndex) *errorIndex=i;
-            return sceRc;
+            return rc;
         }
         ids[i]=id; fileSizes[i]=sz;
         AMPR_TLOGF("[apr-rs-04] resolve ids+sizes item done idx=%u path=%s fileId=%u size=0x%llx",
@@ -158,7 +172,7 @@ int aprResolveFilepathsWithPrefixToIds(const char* pathPrefix, const char* path[
     if (pathRc != 0) return pathRc;
     if (errorIndex) *errorIndex = 0;
     for (uint32_t i=0;i<num;i++) {
-        char full[kAprResolveFullPathMax];
+        char full[kAprResolveFullPathMax]{};
         const int joinRc = join_prefix_path(pathPrefix, path[i], full, sizeof(full));
         if (joinRc != 0) {
             if (errorIndex) *errorIndex=i;
@@ -167,13 +181,12 @@ int aprResolveFilepathsWithPrefixToIds(const char* pathPrefix, const char* path[
         uint32_t id=0;
         AMPR_TLOGF("apr.resolvePrefixIds item enter idx=%u prefix=%s path=%s full=%s",
                   (unsigned)i, ampr_log_path_arg(pathPrefix), ampr_log_path_arg(path[i]), full);
-        int rc = ampr_index_resolve_path_to_id(full, &id, nullptr);
-        if (rc!=0) {
-            const int sceRc = ampr_sce_errno_from_posix(rc < 0 ? -rc : rc);
+        const int rc = resolve_index_path_to_sce(full, &id);
+        if (rc != 0) {
             AMPR_CRITICAL_LOGF("apr.resolvePrefixIds item fail idx=%u full=%s rc=0x%x",
-                      (unsigned)i, full, sceRc);
+                      (unsigned)i, full, rc);
             if (errorIndex) *errorIndex=i;
-            return sceRc;
+            return rc;
         }
         ids[i]=id;
         AMPR_TLOGF("apr.resolvePrefixIds item done idx=%u full=%s fileId=%u",
@@ -193,7 +206,7 @@ int aprResolveFilepathsWithPrefixToIdsAndFileSizes(const char* pathPrefix, const
     if (pathRc != 0) return pathRc;
     if (errorIndex) *errorIndex = 0;
     for (uint32_t i=0;i<num;i++) {
-        char full[kAprResolveFullPathMax];
+        char full[kAprResolveFullPathMax]{};
         const int joinRc = join_prefix_path(pathPrefix, path[i], full, sizeof(full));
         if (joinRc != 0) {
             if (errorIndex) *errorIndex=i;
@@ -202,13 +215,12 @@ int aprResolveFilepathsWithPrefixToIdsAndFileSizes(const char* pathPrefix, const
         uint32_t id=0; size_t sz=0;
         AMPR_TLOGF("apr.resolvePrefixIdsSizes item enter idx=%u prefix=%s path=%s full=%s",
                   (unsigned)i, ampr_log_path_arg(pathPrefix), ampr_log_path_arg(path[i]), full);
-        int rc = ampr_index_resolve_path_to_id(full, &id, &sz);
-        if (rc!=0) {
-            const int sceRc = ampr_sce_errno_from_posix(rc < 0 ? -rc : rc);
+        const int rc = resolve_index_path_to_sce(full, &id, &sz);
+        if (rc != 0) {
             AMPR_CRITICAL_LOGF("apr.resolvePrefixIdsSizes item fail idx=%u full=%s rc=0x%x",
-                      (unsigned)i, full, sceRc);
+                      (unsigned)i, full, rc);
             if (errorIndex) *errorIndex=i;
-            return sceRc;
+            return rc;
         }
         ids[i]=id; fileSizes[i]=sz;
         AMPR_TLOGF("apr.resolvePrefixIdsSizes item done idx=%u full=%s fileId=%u size=0x%llx",
@@ -228,8 +240,8 @@ int aprResolveFilepathsToIdsForEach(const char* path[], uint32_t num, SceAprFile
     uint32_t resolved = 0;
     for (uint32_t i=0;i<num;i++) {
         uint32_t id=SCE_AMPR_APR_FILEID_INVALID;
-        int rc = ampr_index_resolve_path_to_id(path[i], &id, nullptr);
-        results[i] = (rc==0)?0:ampr_sce_errno_from_posix(rc < 0 ? -rc : rc);
+        const int rc = resolve_index_path_to_sce(path[i], &id);
+        results[i] = rc;
         if (results[i] != 0) id = SCE_AMPR_APR_FILEID_INVALID;
         ids[i]=id;
         if (results[i] == 0) ++resolved;
@@ -249,8 +261,8 @@ int aprResolveFilepathsToIdsAndFileSizesForEach(const char* path[], uint32_t num
     uint32_t resolved = 0;
     for (uint32_t i=0;i<num;i++) {
         uint32_t id=SCE_AMPR_APR_FILEID_INVALID; size_t sz=0;
-        int rc = ampr_index_resolve_path_to_id(path[i], &id, &sz);
-        results[i] = (rc==0)?0:ampr_sce_errno_from_posix(rc < 0 ? -rc : rc);
+        const int rc = resolve_index_path_to_sce(path[i], &id, &sz);
+        results[i] = rc;
         if (results[i] != 0) {
             id = SCE_AMPR_APR_FILEID_INVALID;
             sz = 0;
@@ -276,12 +288,12 @@ int aprResolveFilepathsWithPrefixToIdsForEach(const char* pathPrefix, const char
     uint32_t resolved = 0;
     for (uint32_t i=0;i<num;i++) {
         uint32_t id=SCE_AMPR_APR_FILEID_INVALID;
-        char full[kAprResolveFullPathMax];
-        int rc = join_prefix_path(pathPrefix, path[i], full, sizeof(full));
-        if (rc == 0) {
-            rc = ampr_index_resolve_path_to_id(full, &id, nullptr);
-        }
-        results[i] = (rc==0)?0:ampr_sce_errno_from_posix(rc < 0 ? -rc : rc);
+        char full[kAprResolveFullPathMax]{};
+        const int joinRc = join_prefix_path(pathPrefix, path[i], full, sizeof(full));
+        const int rc = joinRc == 0
+            ? resolve_index_path_to_sce(full, &id)
+            : ampr_sce_errno_from_posix(joinRc);
+        results[i] = rc;
         if (results[i] != 0) id = SCE_AMPR_APR_FILEID_INVALID;
         ids[i]=id;
         if (results[i] == 0) ++resolved;
@@ -304,12 +316,12 @@ int aprResolveFilepathsWithPrefixToIdsAndFileSizesForEach(const char* pathPrefix
     uint32_t resolved = 0;
     for (uint32_t i=0;i<num;i++) {
         uint32_t id=SCE_AMPR_APR_FILEID_INVALID; size_t sz=0;
-        char full[kAprResolveFullPathMax];
-        int rc = join_prefix_path(pathPrefix, path[i], full, sizeof(full));
-        if (rc == 0) {
-            rc = ampr_index_resolve_path_to_id(full, &id, &sz);
-        }
-        results[i] = (rc==0)?0:ampr_sce_errno_from_posix(rc < 0 ? -rc : rc);
+        char full[kAprResolveFullPathMax]{};
+        const int joinRc = join_prefix_path(pathPrefix, path[i], full, sizeof(full));
+        const int rc = joinRc == 0
+            ? resolve_index_path_to_sce(full, &id, &sz)
+            : ampr_sce_errno_from_posix(joinRc);
+        results[i] = rc;
         if (results[i] != 0) {
             id = SCE_AMPR_APR_FILEID_INVALID;
             sz = 0;
@@ -403,12 +415,9 @@ static int apr_submit_command_buffer(AprCommandBuffer* commandBuffer,
     j.nativePrio = rawPrio;
     j.aprRes = res;
     SceAprSubmitId submitId = 0;
-    uint32_t submitErrorOffset = 0;
-    const int submitRc = apr_reactor_submit(j,
-                                             id ? &submitId : nullptr,
-                                             &submitErrorOffset);
+    const int submitRc = apr_reactor_submit(j, id ? &submitId : nullptr);
     if (submitRc != 0) {
-        return apr_submit_reject(res, submitRc, submitErrorOffset);
+        return apr_submit_reject(res, submitRc);
     }
     if (id) *id = submitId;
     return 0;

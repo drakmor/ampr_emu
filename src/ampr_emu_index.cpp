@@ -118,6 +118,7 @@ static FileIndexState& file_index_state() { return *file_index_state_create(); }
 static constexpr const char* kAmprApp0Root = "/app0";
 static constexpr const char* kAmprApp0IndexPath = "/app0/ampr_emu.index";
 static constexpr const char* kAmprApp0IndexTempPath = "/app0/ampr_emu.index.tmp";
+static constexpr const char* kAmprApp0IndexBackupPath = "/app0/ampr_emu.index.bak";
 static constexpr char kAmprIndexMagic[8] = {'A', 'M', 'P', 'R', 'I', 'D', 'X', '3'};
 static constexpr uint32_t kAmprIndexVersion = 3;
 static constexpr uint64_t kAmprIndexLoadWaitUs = 500000ull;
@@ -156,6 +157,7 @@ static constexpr size_t kAmprIndexMaxPath = 4096;
 struct App0IndexBuildWorkspace {
     char indexKey[kAmprIndexMaxPath];
     char tempIndexKey[kAmprIndexMaxPath];
+    char backupIndexKey[kAmprIndexMaxPath];
     char dir[kAmprIndexMaxPath];
     char path[kAmprIndexMaxPath];
     char pathKey[kAmprIndexMaxPath];
@@ -983,8 +985,32 @@ public:
         }
         int renameRc = ampr_real_sceKernelRename(kAmprApp0IndexTempPath, kAmprApp0IndexPath);
         if (renameRc < 0) {
-            (void)ampr_real_sceKernelUnlink(kAmprApp0IndexPath);
+            // Fallback for filesystems that do not replace an existing target:
+            // retain the old index as a backup until the new rename succeeds.
+            // If the destination is absent, a stale backup may be the only
+            // recoverable copy and must remain untouched after a failed install.
+            SceKernelStat destinationStat{};
+            const bool destinationExists =
+                ampr_real_sceKernelStat(kAmprApp0IndexPath, &destinationStat) == 0;
+            bool oldMoved = false;
+            if (destinationExists) {
+                (void)ampr_real_sceKernelUnlink(kAmprApp0IndexBackupPath);
+                oldMoved = ampr_real_sceKernelRename(
+                    kAmprApp0IndexPath, kAmprApp0IndexBackupPath) >= 0;
+            }
             renameRc = ampr_real_sceKernelRename(kAmprApp0IndexTempPath, kAmprApp0IndexPath);
+            if (renameRc < 0 && oldMoved) {
+                const int restoreRc =
+                    ampr_real_sceKernelRename(kAmprApp0IndexBackupPath, kAmprApp0IndexPath);
+                if (restoreRc < 0) {
+                    AMPR_CRITICAL_LOGF("apr.index save restore fail backup=%s dst=%s rc=0x%x",
+                                       kAmprApp0IndexBackupPath,
+                                       kAmprApp0IndexPath,
+                                       restoreRc);
+                }
+            } else if (renameRc >= 0 && oldMoved) {
+                (void)ampr_real_sceKernelUnlink(kAmprApp0IndexBackupPath);
+            }
         }
         if (renameRc < 0) {
             (void)ampr_real_sceKernelUnlink(kAmprApp0IndexTempPath);
@@ -993,6 +1019,10 @@ public:
             release_buffers();
             return false;
         }
+        // A previous interrupted replacement may have left a backup behind.
+        // Once the new destination is installed, that stale recovery copy is no
+        // longer needed and must not accumulate across successful rebuilds.
+        (void)ampr_real_sceKernelUnlink(kAmprApp0IndexBackupPath);
 
         AMPR_LOGF("apr.index saved path=%s format=AMPRIDX3 entries=%llu pathBytes=0x%llx hashSlots=%zu hashOffset=0x%llx memory=1",
                   kAmprApp0IndexPath,
@@ -1157,16 +1187,19 @@ static bool ampr_join_dirent_path(const char* dir,
     auto& workspace = g_app0_index_build_workspace;
     auto& indexKey = workspace.indexKey;
     auto& tempIndexKey = workspace.tempIndexKey;
+    auto& backupIndexKey = workspace.backupIndexKey;
     auto& dir = workspace.dir;
     auto& path = workspace.path;
     auto& pathKey = workspace.pathKey;
     if (!normalize_app0_path_key(kAmprApp0IndexPath, indexKey, sizeof(indexKey)) ||
-        !normalize_app0_path_key(kAmprApp0IndexTempPath, tempIndexKey, sizeof(tempIndexKey))) {
+        !normalize_app0_path_key(kAmprApp0IndexTempPath, tempIndexKey, sizeof(tempIndexKey)) ||
+        !normalize_app0_path_key(kAmprApp0IndexBackupPath, backupIndexKey, sizeof(backupIndexKey))) {
         AMPR_CRITICAL_LOGF("apr.index build fail reason=internal-temp-key");
         return;
     }
 
     size_t dirCount = 0;
+    (void)dirCount;
     size_t fileCount = 0;
     size_t nextProgressFileCount = 1000;
     while (!dirs.empty()) {
@@ -1251,7 +1284,8 @@ static bool ampr_join_dirent_path(const char* dir,
                     continue;
                 }
                 if (compare_index_path_key(pathKey, indexKey) == 0 ||
-                    compare_index_path_key(pathKey, tempIndexKey) == 0) {
+                    compare_index_path_key(pathKey, tempIndexKey) == 0 ||
+                    compare_index_path_key(pathKey, backupIndexKey) == 0) {
                     continue;
                 }
 
@@ -1328,6 +1362,7 @@ static bool ampr_join_dirent_path(const char* dir,
 }
 
 static bool pread_exact_logged(int fd, void* dst, size_t size, off_t offset, const char* label) {
+    (void)label;
     char* out = static_cast<char*>(dst);
     size_t done = 0;
     while (done < size) {

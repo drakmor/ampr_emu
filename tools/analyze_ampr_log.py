@@ -1189,6 +1189,7 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
     stats.last_seq = seq
 
     kv = parse_kv(body)
+    read_chains = parse_int(kv.get("readChains"))
     if "activeLanes" in kv:
         stats.saw_active_lanes_field = True
     if "activeJobs" in kv:
@@ -2202,7 +2203,6 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
         add_stall_aio_sample(stats, line_no, seq, kv, "first", "first")
         add_stall_aio_sample(stats, line_no, seq, kv, "oldest", "oldest")
 
-    read_chains = parse_int(kv.get("readChains"))
     if read_chains is not None:
         stats.max_reactor_read_chains = max(stats.max_reactor_read_chains, read_chains)
 

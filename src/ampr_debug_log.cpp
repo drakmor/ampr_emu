@@ -81,7 +81,7 @@ struct AmprDebugLogState {
     std::atomic<SceKernelSema> writerWakeSema{SCE_KERNEL_SEMA_ID_INVALID};
     std::atomic<uint32_t> writerSignalers{0};
     int fd{-1};
-    bool openAttempted{false};
+    bool truncateOnNextOpen{true};
     std::atomic<bool> shutdownRequested{false};
     bool startupInfoQueued{false};
     std::atomic<bool> writerStarted{false};
@@ -317,19 +317,19 @@ inline int debugLogOpenOnceForWriter(AmprDebugLogState& state) {
     if (state.shutdownRequested.load(std::memory_order_acquire)) {
         return -1;
     }
-    state.openAttempted = true;
-    const int fd = debugLogKernelOpen(
-        getDebugLogPath(),
-        SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC,
-        SCE_KERNEL_S_IRWU);
+    const int flags = SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT |
+        (state.truncateOnNextOpen ? SCE_KERNEL_O_TRUNC : SCE_KERNEL_O_APPEND);
+    const int fd = debugLogKernelOpen(getDebugLogPath(), flags, SCE_KERNEL_S_IRWU);
     if (fd >= 0 && !state.shutdownRequested.load(std::memory_order_acquire)) {
         state.fd = fd;
+        // Only the first successful open truncates. A reopen after a hard
+        // write/fsync failure appends so crash-tail diagnostics are preserved.
+        state.truncateOnNextOpen = false;
         return fd;
     }
     if (fd >= 0) {
         (void)debugLogKernelClose(fd);
     }
-    state.openAttempted = false;
     return -1;
 }
 
@@ -354,6 +354,7 @@ inline bool debugLogWriteAllForWriter(AmprDebugLogState& state, const char* data
     while (done < len) {
         const ssize_t wr = debugLogKernelWrite(fd, data + done, len - done);
         if (wr <= 0) {
+            debugLogCloseForWriter(state);
             return false;
         }
         done += static_cast<size_t>(wr);
@@ -395,10 +396,13 @@ inline bool debugLogWriteEntryForWriter(AmprDebugLogState& state, const AmprDebu
 #endif
     }
 #endif
+    if (written && !durable) {
+        debugLogCloseForWriter(state);
+    }
     if (entry.critical && durable) {
         state.flushedCriticalSequence.store(entry.sequence, std::memory_order_release);
     }
-    return written;
+    return written && durable;
 }
 
 inline void* debugLogWriterMain(void* arg) {
@@ -775,62 +779,42 @@ void debugLogLine(const char* rawLine) {
     }
 }
 
-void debugLogf(const char* fmt, ...) {
+static void debugLogV(bool criticalEntry, const char* fmt, va_list args) {
     static thread_local bool inLogger = false;
-    if (!fmt || !*fmt || !getDebugLogEnabled()) {
-        return;
-    }
-    if (inLogger) {
+    if (!fmt || !*fmt || !getDebugLogEnabled() || inLogger) {
         return;
     }
     inLogger = true;
-    va_list args;
-    va_start(args, fmt);
     char line[kAmprDebugLogLineCapacity];
     const int written = vsnprintf(line, sizeof(line), fmt, args);
-    va_end(args);
     if (written <= 0) {
         inLogger = false;
         return;
     }
     line[sizeof(line) - 1u] = '\0';
-    debugLogKernelOutLine(line, false);
+    debugLogKernelOutLine(line, criticalEntry);
     uint64_t sequence = 0;
-    bool critical = false;
-    const bool queued = debugLogEnqueueBody(line, false, &sequence, &critical);
+    bool queuedCritical = false;
+    const bool queued = debugLogEnqueueBody(
+        line, criticalEntry, &sequence, &queuedCritical);
     inLogger = false;
     if (queued) {
-        debugLogWaitForCriticalFlush(sequence, critical);
+        debugLogWaitForCriticalFlush(sequence, queuedCritical);
     }
 }
 
-void debugLogCriticalf(const char* fmt, ...) {
-    static thread_local bool inLogger = false;
-    if (!fmt || !*fmt || !getDebugLogEnabled()) {
-        return;
-    }
-    if (inLogger) {
-        return;
-    }
-    inLogger = true;
+void debugLogf(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    char line[kAmprDebugLogLineCapacity];
-    const int written = vsnprintf(line, sizeof(line), fmt, args);
+    debugLogV(false, fmt, args);
     va_end(args);
-    if (written <= 0) {
-        inLogger = false;
-        return;
-    }
-    line[sizeof(line) - 1u] = '\0';
-    debugLogKernelOutLine(line, true);
-    uint64_t sequence = 0;
-    bool critical = false;
-    const bool queued = debugLogEnqueueBody(line, true, &sequence, &critical);
-    inLogger = false;
-    if (queued) {
-        debugLogWaitForCriticalFlush(sequence, critical);
-    }
+}
+
+void debugLogCriticalf(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    debugLogV(true, fmt, args);
+    va_end(args);
 }
 
 } // namespace sce::Ampr::Emu

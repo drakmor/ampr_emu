@@ -67,19 +67,22 @@ static_assert(std::is_trivially_destructible<Op>::value,
 static_assert(sizeof(Op) <= 80u,
               "runtime opcode representation unexpectedly grew");
 
-struct PackedOpView {
-    OpType type{};
-    uint32_t bytes{};
-    bool waitFlush{};
-};
-
 namespace sce::Ampr {
+
+struct PackedOpLayout {
+    uint32_t bytes{};
+    uint32_t commandCount{};
+};
 
 const char* ampr_op_name(OpType type);
 bool ampr_valid_wait_flush(WaitFlush f);
 bool ampr_set_marker_text(Op& op, const char* text);
+int ampr_op_layout_checked(const Op& op, PackedOpLayout* outLayout);
 int ampr_op_size_bytes_checked(const Op& op, uint32_t* outBytes);
-uint32_t ampr_native_op_command_count(const Op& op);
+int ampr_write_op_with_layout(SceAmprCommandBuffer* cb,
+                              uint32_t offBytes,
+                              const Op& op,
+                              const PackedOpLayout& layout);
 int ampr_strict_write_op(SceAmprCommandBuffer* cb, uint32_t offBytes, const Op& op, uint32_t bytes);
 int ampr_decode_packed_op(const void* buffer,
                           uint32_t bytes,
@@ -93,10 +96,5 @@ int ampr_decode_apr_packed_op(const void* buffer,
                               Op* outOp,
                               uint32_t* outBytes,
                               uint32_t* errorOffset);
-int ampr_decode_apr_packed_op_view(const void* buffer,
-                                   uint32_t bytes,
-                                   uint32_t off,
-                                   PackedOpView* outView,
-                                   uint32_t* errorOffset);
 
 } // namespace sce::Ampr

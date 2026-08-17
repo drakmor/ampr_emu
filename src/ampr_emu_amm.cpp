@@ -17,6 +17,7 @@
 #include "ampr_emu_prot.h"
 
 #include <atomic>
+#include <cstdlib>
 
 namespace {
 
@@ -76,7 +77,7 @@ static int ampr_kernel_write_map_command(void* dst,
                                                        size,
                                                        type,
                                                        prot,
-                                                       0,
+                                                       uint64_t{0},
                                                        outSize);
 }
 
@@ -96,23 +97,19 @@ static int ampr_kernel_call_indirect_buffer3_compat(unsigned int priority,
     return SCE_KERNEL_ERROR_ENXIO;
 }
 
-static int amm_call_indirect_buffer_retry(unsigned int priority,
-                                          uint64_t bufferBase,
-                                          uint64_t currentOffset,
-                                          uint32_t* retries) {
+template <typename SubmitFn, typename FirstRetryLogFn>
+static int amm_submit_with_retry(SubmitFn submit,
+                                 FirstRetryLogFn logFirstRetry,
+                                 uint32_t* retries) {
     uint32_t retryCount = 0;
     int rc = 0;
     for (;;) {
-        rc = kRealCallIndirectBuffer(priority, bufferBase, currentOffset);
+        rc = submit();
         if (rc != kAmmSubmitRetryRc) {
             break;
         }
         if (retryCount == 0) {
-            AMPR_CRITICAL_LOGF("amm.leaf.submit.retry.first buffer=%p currentOffset=0x%llx prio=%u rc=0x%x",
-                               (void*)(uintptr_t)bufferBase,
-                               (unsigned long long)currentOffset,
-                               priority,
-                               rc);
+            logFirstRetry(rc);
         }
         ++retryCount;
         sceKernelUsleep(kAmmSubmitRetrySleepUsec);
@@ -121,6 +118,25 @@ static int amm_call_indirect_buffer_retry(unsigned int priority,
         *retries = retryCount;
     }
     return rc;
+}
+
+static int amm_call_indirect_buffer_retry(unsigned int priority,
+                                          uint64_t bufferBase,
+                                          uint64_t currentOffset,
+                                          uint32_t* retries) {
+    return amm_submit_with_retry(
+        [&]() {
+            return kRealCallIndirectBuffer(priority, bufferBase, currentOffset);
+        },
+        [&](int rc) {
+            (void)rc;
+            AMPR_CRITICAL_LOGF("amm.leaf.submit.retry.first buffer=%p currentOffset=0x%llx prio=%u rc=0x%x",
+                               (void*)(uintptr_t)bufferBase,
+                               (unsigned long long)currentOffset,
+                               priority,
+                               rc);
+        },
+        retries);
 }
 
 static int amm_call_indirect_buffer2_retry(unsigned int priority,
@@ -129,14 +145,16 @@ static int amm_call_indirect_buffer2_retry(unsigned int priority,
                                            SceAmmResultBuffer* result,
                                            SceAmmSubmitId* submitId,
                                            uint32_t* retries) {
-    uint32_t retryCount = 0;
-    int rc = 0;
-    for (;;) {
-        rc = kRealCallIndirectBuffer2(priority, bufferBase, currentOffset, result, submitId);
-        if (rc != kAmmSubmitRetryRc) {
-            break;
-        }
-        if (retryCount == 0) {
+    return amm_submit_with_retry(
+        [&]() {
+            return kRealCallIndirectBuffer2(priority,
+                                            bufferBase,
+                                            currentOffset,
+                                            result,
+                                            submitId);
+        },
+        [&](int rc) {
+            (void)rc;
             AMPR_CRITICAL_LOGF("amm.leaf.submit.result.retry.first buffer=%p currentOffset=0x%llx prio=%u rc=0x%x res=%p id=%p sid=0x%x",
                                (void*)(uintptr_t)bufferBase,
                                (unsigned long long)currentOffset,
@@ -145,14 +163,8 @@ static int amm_call_indirect_buffer2_retry(unsigned int priority,
                                result,
                                submitId,
                                submitId ? *submitId : 0u);
-        }
-        ++retryCount;
-        sceKernelUsleep(kAmmSubmitRetrySleepUsec);
-    }
-    if (retries) {
-        *retries = retryCount;
-    }
-    return rc;
+        },
+        retries);
 }
 
 static int amm_call_indirect_buffer3_retry(unsigned int priority,
@@ -160,14 +172,15 @@ static int amm_call_indirect_buffer3_retry(unsigned int priority,
                                            uint64_t currentOffset,
                                            SceAmmSubmitId* submitId,
                                            uint32_t* retries) {
-    uint32_t retryCount = 0;
-    int rc = 0;
-    for (;;) {
-        rc = ampr_kernel_call_indirect_buffer3_compat(priority, bufferBase, currentOffset, submitId);
-        if (rc != kAmmSubmitRetryRc) {
-            break;
-        }
-        if (retryCount == 0) {
+    return amm_submit_with_retry(
+        [&]() {
+            return ampr_kernel_call_indirect_buffer3_compat(priority,
+                                                            bufferBase,
+                                                            currentOffset,
+                                                            submitId);
+        },
+        [&](int rc) {
+            (void)rc;
             AMPR_CRITICAL_LOGF("amm.leaf.submit.id.retry.first buffer=%p currentOffset=0x%llx prio=%u rc=0x%x id=%p sid=0x%x",
                                (void*)(uintptr_t)bufferBase,
                                (unsigned long long)currentOffset,
@@ -175,14 +188,8 @@ static int amm_call_indirect_buffer3_retry(unsigned int priority,
                                rc,
                                submitId,
                                submitId ? *submitId : 0u);
-        }
-        ++retryCount;
-        sceKernelUsleep(kAmmSubmitRetrySleepUsec);
-    }
-    if (retries) {
-        *retries = retryCount;
-    }
-    return rc;
+        },
+        retries);
 }
 
 static int amm_validate_submit_args(uint64_t bufferBase, uint32_t priority) {
@@ -247,6 +254,10 @@ static uint64_t ampr_adjust_kernel_writer_prot_for_ampr_write(const char* op,
                                                               uint64_t size,
                                                               uint64_t arg,
                                                               uint64_t prot) {
+    (void)op;
+    (void)va;
+    (void)size;
+    (void)arg;
     const uint64_t adjustedProt = sce::Ampr::Emu::protWithCpuRwForAmprWrite(prot);
     if (adjustedProt != prot) {
         AMPR_CRITICAL_LOGF("amm.kernel.prot.substitute op=%s va=0x%llx size=0x%llx arg=0x%llx prot=0x%llx adjustedProt=0x%llx",
@@ -267,6 +278,10 @@ static uint64_t ampr_adjust_kernel_writer_mask_for_adjusted_prot(const char* op,
                                                                  uint64_t prot,
                                                                  uint64_t adjustedProt,
                                                                  uint64_t protMask) {
+    (void)op;
+    (void)va;
+    (void)size;
+    (void)arg;
     const uint64_t adjustedMask =
         sce::Ampr::Emu::protMaskWithCpuRwForAdjustedProt(prot, adjustedProt, protMask);
     if (adjustedMask != protMask) {

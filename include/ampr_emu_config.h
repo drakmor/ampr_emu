@@ -117,7 +117,7 @@
 #ifndef AMPR_EMU_APR_READ_CHUNK_QUANTUM
 // Maximum number of new host AIO requests one APR priority lane may admit in
 // one scheduler pass. The byte budget below is applied at the same time, so
-// four request slots are shared across consecutive jobs in the same priority
+// eight request slots are shared across consecutive jobs in the same priority
 // lane. The byte budget still prevents a large sequential burst.
 #define AMPR_EMU_APR_READ_CHUNK_QUANTUM 8u
 #endif
@@ -137,16 +137,17 @@
 #endif
 
 #ifndef AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
-// Maximum simultaneously live AIO IDs owned by one logical readFile ReadChain.
-// The byte window below is enforced at the same time.
-#define AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS 8u
+// A logical ReadChain is sliced at up to 512 KiB and its charged-byte window is
+// also 512 KiB, so only one slice can be live at a time. Small-file batching
+// happens across read commands/jobs through the shared priority-lane budget.
+#define AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS 1u
 #endif
 
 #ifndef AMPR_EMU_APR_PER_READ_ACTIVE_BYTES
 // Maximum charged in-flight bytes for one logical readFile. Each request is
 // rounded up to AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES for admission only.
-// Thus a full 512 KiB chunk behaves like 1 x 512 KiB, while up to eight <=64 KiB
-// requests can coexist in the same 512 KiB window.
+// Thus a full 512 KiB chunk consumes the complete per-read window. The separate
+// priority-lane pass budget may still batch up to eight <=64 KiB read commands.
 #define AMPR_EMU_APR_PER_READ_ACTIVE_BYTES 0x80000u
 #endif
 
@@ -240,10 +241,16 @@
 #define AMPR_EMU_APR_AIO_THROTTLE_RECOVER_SEVERE_MS 250u
 #endif
 
-#ifndef AMPR_EMU_APR_AIO_SDK_SCHED_HEADROOM
-// Extra SDK AIO scheduler/delayed slots above the reactor's maximum dynamic
-// active-read window. The reactor clamps the final values to SDK caps.
-#define AMPR_EMU_APR_AIO_SDK_SCHED_HEADROOM 48
+#ifndef AMPR_EMU_APR_AIO_SDK_SCHEDULING_WINDOW_SIZE
+// Number of requests from the front of each SDK AIO priority queue considered
+// for scheduling optimization. This does not reserve AIO ids.
+#define AMPR_EMU_APR_AIO_SDK_SCHEDULING_WINDOW_SIZE 128
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_SDK_DELAYED_COUNT_LIMIT
+// Maximum number of times SDK scheduling optimization may skip an older AIO
+// request. This is independent of the optimization-window size.
+#define AMPR_EMU_APR_AIO_SDK_DELAYED_COUNT_LIMIT 128
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_POLL_IDLE_SLEEP_NS
@@ -308,11 +315,13 @@
 
 #ifndef AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
 // 1 -> allow the reactor to issue same-priority APR reads located after one or
-// more *OnCompletion records, including across adjacent submitted buffers. Each
-// completion retains the read-sequence fence that preceded it and still
-// dispatches in source order. A valid WaitOnAddress whose condition is already
-// true is transparent; any other non-read/non-EOP record stops read-ahead.
-// Disabled by default to preserve the strict parser path.
+// more *OnCompletion records within one submitted command buffer. Each completion
+// retains the read-sequence fence that preceded it and still dispatches in source
+// order. Priority-lane scheduling may continue into following FIFO jobs while the
+// shared per-pass read budget remains available. A valid WaitOnAddress whose
+// condition is already true is transparent; any other non-read/non-EOP record
+// stops speculative read-ahead inside the current job.
+// Enabled in the active cursor-direct configuration.
 #define AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD 1
 #endif
 
@@ -353,11 +362,6 @@
 #define AMPR_EMU_APR_AIO_DISPATCH_QUANTUM_BYTES 0x80000u
 #endif
 
-#ifndef AMPR_EMU_APR_AIO_DIRECT_SMALL_FULL_FILE_BYTES
-// Direct APR reads at or below this size are classified as small in logs.
-#define AMPR_EMU_APR_AIO_DIRECT_SMALL_FULL_FILE_BYTES 0x200000ull
-#endif
-
 #ifndef AMPR_EMU_APR_FD_CACHE_MIN_FILE_BYTES
 // Files at or below this size bypass the APR fd-cache and use short-lived direct
 // fds. The cache is reserved for larger files that are more likely to be read
@@ -365,19 +369,9 @@
 #define AMPR_EMU_APR_FD_CACHE_MIN_FILE_BYTES 0x200000ull
 #endif
 
-#ifndef AMPR_EMU_APR_AIO_BULK_FULL_FILE_BYTES
-// Direct APR reads at or above this size are classified as bulk in logs.
-#define AMPR_EMU_APR_AIO_BULK_FULL_FILE_BYTES 0x400000ull
-#endif
-
 #ifndef AMPR_EMU_APR_FD_PRESSURE_COOLDOWN_MS
 // How long FD pressure keeps the reduced AIO/FD limits active.
 #define AMPR_EMU_APR_FD_PRESSURE_COOLDOWN_MS 2000
-#endif
-
-#ifndef AMPR_EMU_APR_FD_PRESSURE_SCORE_MAX
-// Repeated FD pressure events within the cooldown shrink limits further.
-#define AMPR_EMU_APR_FD_PRESSURE_SCORE_MAX 4
 #endif
 
 #ifndef AMPR_EMU_APR_REACTOR_THREAD_PRIORITY
@@ -420,23 +414,6 @@
 // Low-rate reactor state sample while APR work is present, even if progress is
 // still being made. This catches visual hangs that do not trip stall detection.
 #define AMPR_EMU_APR_REACTOR_HEARTBEAT_MS 1000
-#endif
-
-#ifndef AMPR_EMU_APR_REACTOR_BACKLOG_WARN_THRESHOLD
-// Emit sparse normal-log reactor heartbeats once queued APR reads grow this
-// high. Detailed per-job/per-read progress remains behind VERBOSE/TRACE.
-#define AMPR_EMU_APR_REACTOR_BACKLOG_WARN_THRESHOLD 64
-#endif
-
-#ifndef AMPR_EMU_APR_REACTOR_BACKLOG_WARN_INTERVAL_NS
-// Minimum interval between unchanged backlog heartbeats.
-#define AMPR_EMU_APR_REACTOR_BACKLOG_WARN_INTERVAL_NS 1000000000ull
-#endif
-
-#ifndef AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES
-// Number of top file ids sampled when the reactor emits a backlog heartbeat.
-// 0 disables the per-file snapshot and keeps only the aggregate heartbeat.*
-#define AMPR_EMU_APR_REACTOR_BACKLOG_FILE_SAMPLES 4
 #endif
 
 #ifndef AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP
@@ -506,7 +483,7 @@
 
 // Version
 #ifndef AMPR_EMU_VERSION
-#define AMPR_EMU_VERSION "0.3.3 (public beta) (c) Drakmor"
+#define AMPR_EMU_VERSION "0.3.4 (public beta) (c) Drakmor"
 #endif
 
 #ifndef AMPR_EMU_DEBUG_LOG
