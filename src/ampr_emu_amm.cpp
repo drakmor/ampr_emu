@@ -11,6 +11,7 @@
 #include "ampr_emu_log.h"
 #include "ampr_emu_runtime_memory.h"
 #include "ampr_emu_sync.h"
+#include "ampr_emu_command_log.h"
 #if AMPR_EMU_DEBUG_LOG && (AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP & 1)
 #include "ampr_emu_command_buffer_dump.h"
 #endif
@@ -962,6 +963,21 @@ static void amm_dump_submit_command_buffers(uint64_t bufferBase,
 }
 #endif
 
+static void amm_log_submit_command_buffer(uint64_t bufferBase,
+                                          uint32_t currentOffset,
+                                          uint32_t prio,
+                                          AmprCommandLogSubmitMode mode) {
+    AmprCommandLogSubmitInfo info{};
+    info.domain = AmprCommandLogDomain::Amm;
+    info.mode = mode;
+    info.priority = prio;
+    info.sourceCapacity = currentOffset;
+    info.submitCookie = 0;
+    info.buffer = reinterpret_cast<const void*>(static_cast<uintptr_t>(bufferBase));
+    info.bytes = currentOffset;
+    commandLogSubmit(info);
+}
+
 int ammSubmitCommandBufferAndGetResultLeaf(uint64_t bufferBase,
                                            uint32_t currentOffset,
                                            uint32_t prio,
@@ -988,6 +1004,11 @@ int ammSubmitCommandBufferAndGetResultLeaf(uint64_t bufferBase,
     if (validateRc != 0) {
         return validateRc;
     }
+
+    amm_log_submit_command_buffer(bufferBase,
+                                  currentOffset,
+                                  prio,
+                                  AmprCommandLogSubmitMode::SubmitAndGetResult);
 
 #if AMPR_EMU_DEBUG_LOG && (AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP & 1)
     if (::ampr_debug_log_runtime_enabled()) {
@@ -1058,6 +1079,12 @@ int ammSubmitCommandBufferLeaf(uint64_t bufferBase,
     if (validateRc != 0) {
         return validateRc;
     }
+
+    amm_log_submit_command_buffer(bufferBase,
+                                  currentOffset,
+                                  prio,
+                                  id ? AmprCommandLogSubmitMode::SubmitAndGetId
+                                     : AmprCommandLogSubmitMode::Submit);
 
 #if AMPR_EMU_DEBUG_LOG && (AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP & 1)
     if (::ampr_debug_log_runtime_enabled()) {

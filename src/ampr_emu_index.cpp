@@ -158,6 +158,8 @@ struct App0IndexBuildWorkspace {
     char indexKey[kAmprIndexMaxPath];
     char tempIndexKey[kAmprIndexMaxPath];
     char backupIndexKey[kAmprIndexMaxPath];
+    char commandLogKey[kAmprIndexMaxPath];
+    char debugLogKey[kAmprIndexMaxPath];
     char dir[kAmprIndexMaxPath];
     char path[kAmprIndexMaxPath];
     char pathKey[kAmprIndexMaxPath];
@@ -1188,12 +1190,16 @@ static bool ampr_join_dirent_path(const char* dir,
     auto& indexKey = workspace.indexKey;
     auto& tempIndexKey = workspace.tempIndexKey;
     auto& backupIndexKey = workspace.backupIndexKey;
+    auto& commandLogKey = workspace.commandLogKey;
+    auto& debugLogKey = workspace.debugLogKey;
     auto& dir = workspace.dir;
     auto& path = workspace.path;
     auto& pathKey = workspace.pathKey;
     if (!normalize_app0_path_key(kAmprApp0IndexPath, indexKey, sizeof(indexKey)) ||
         !normalize_app0_path_key(kAmprApp0IndexTempPath, tempIndexKey, sizeof(tempIndexKey)) ||
-        !normalize_app0_path_key(kAmprApp0IndexBackupPath, backupIndexKey, sizeof(backupIndexKey))) {
+        !normalize_app0_path_key(kAmprApp0IndexBackupPath, backupIndexKey, sizeof(backupIndexKey)) ||
+        !normalize_app0_path_key(AMPR_EMU_COMMAND_LOG_PATH, commandLogKey, sizeof(commandLogKey)) ||
+        !normalize_app0_path_key(AMPR_EMU_DEBUG_LOG_PATH, debugLogKey, sizeof(debugLogKey))) {
         AMPR_CRITICAL_LOGF("apr.index build fail reason=internal-temp-key");
         return;
     }
@@ -1285,7 +1291,9 @@ static bool ampr_join_dirent_path(const char* dir,
                 }
                 if (compare_index_path_key(pathKey, indexKey) == 0 ||
                     compare_index_path_key(pathKey, tempIndexKey) == 0 ||
-                    compare_index_path_key(pathKey, backupIndexKey) == 0) {
+                    compare_index_path_key(pathKey, backupIndexKey) == 0 ||
+                    compare_index_path_key(pathKey, commandLogKey) == 0 ||
+                    compare_index_path_key(pathKey, debugLogKey) == 0) {
                     continue;
                 }
 

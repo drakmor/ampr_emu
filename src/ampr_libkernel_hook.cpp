@@ -6,6 +6,7 @@
 
 #include "ampr.h"
 #include "ampr_debug_log.h"
+#include "ampr_emu_apr_equeue.h"
 #include "ampr_emu_kernel_amm.h"
 #include "ampr_emu_kernel_lookup.h"
 #include "ampr_emu_prot.h"
@@ -14,6 +15,7 @@
 #include "hde64.h"
 
 #include <_kernel.h>
+#include <kernel/equeue.h>
 #include <sys/dmem.h>
 #include <sys/types.h>
 
@@ -171,9 +173,9 @@ struct HookLogRecord {
 
 HookSpec g_hooks[] = {
     /*
-     * Supported ReleaseHooks detours. Kernel equeues intentionally do not
-     * appear here: event delivery stays native and command-buffer equeue writes
-     * remain ordinary native APR/AMM records.
+     * Supported ReleaseHooks detours. The optional equeue entries at the end
+     * mirror only native AMPR registrations and merge APR-local packets at wait;
+     * AMM command buffers and native AMM event delivery remain untouched.
      */
     {"sceKernelOpen", reinterpret_cast<void*>(&sceKernelOpen_emul), kHookMandatory, {}},
     {"sceKernelStat", reinterpret_cast<void*>(&sceKernelStat_emul), kHookMandatory, {}},
@@ -227,6 +229,12 @@ HookSpec g_hooks[] = {
     {"sceKernelWriteModifyMtypeProtectCommand", reinterpret_cast<void*>(&sceKernelWriteModifyMtypeProtectCommand_emul), kHookMandatory, {}},
     {"sceKernelWriteModifyMtypeProtectWithGpuMaskIdCommand", reinterpret_cast<void*>(&sceKernelWriteModifyMtypeProtectWithGpuMaskIdCommand_emul), kHookMandatory, {}},
     {"sceKernelWriteRemapIntoPrtCommand", reinterpret_cast<void*>(&sceKernelWriteRemapIntoPrtCommand_emul), kHookOptional, {}},
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+    {"sceKernelWaitEqueue", reinterpret_cast<void*>(&sceKernelWaitEqueue_emul), kHookOptional, {}},
+    {"sceKernelDeleteEqueue", reinterpret_cast<void*>(&sceKernelDeleteEqueue_emul), kHookOptional, {}},
+    {"sceKernelAddAmprEvent", reinterpret_cast<void*>(&sceKernelAddAmprEvent_emul), kHookOptional, {}},
+    {"sceKernelDeleteAmprEvent", reinterpret_cast<void*>(&sceKernelDeleteAmprEvent_emul), kHookOptional, {}},
+#endif
 };
 
 constexpr size_t kHookCount = sizeof(g_hooks) / sizeof(g_hooks[0]);
@@ -234,6 +242,17 @@ static_assert(kHookCount == kAmprLibkernelHook_Count, "AmprLibkernelHookId must 
 static_assert(kHookCount <= 64, "hook capability mask is uint64_t-indexed by HookSpec order");
 constexpr size_t kMaxTrampolinePages =
     (kHookCount + kTrampolineSlotsPerPage - 1u) / kTrampolineSlotsPerPage;
+
+static bool local_equeue_hooks_installed() {
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+    return g_hooks[kAmprLibkernelHook_sceKernelWaitEqueue].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelDeleteEqueue].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelAddAmprEvent].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelDeleteAmprEvent].detour.installed;
+#else
+    return false;
+#endif
+}
 
 std::atomic<int> g_hookLock{0};
 std::atomic<int> g_installed{0};
@@ -311,7 +330,18 @@ HookLogRecord g_hookLogRecords[kHookCount]{};
     reinterpret_cast<void*>(&::sceKernelWriteModifyProtectWithGpuMaskIdCommand), \
     reinterpret_cast<void*>(&::sceKernelWriteModifyMtypeProtectCommand), \
     reinterpret_cast<void*>(&::sceKernelWriteModifyMtypeProtectWithGpuMaskIdCommand), \
-    nullptr
+    nullptr \
+    AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS
+
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+#define AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS \
+    , reinterpret_cast<void*>(&::sceKernelWaitEqueue) \
+    , reinterpret_cast<void*>(&::sceKernelDeleteEqueue) \
+    , reinterpret_cast<void*>(&::sceKernelAddAmprEvent) \
+    , reinterpret_cast<void*>(&::sceKernelDeleteAmprEvent)
+#else
+#define AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS
+#endif
 
 void* const g_amprSdkLibkernelFallbackById[kAmprLibkernelHook_Count]{
     AMPR_LIBKERNEL_SDK_FALLBACKS,
@@ -325,6 +355,7 @@ AMPR_LIBKERNEL_HOOK_EXPORT void* g_amprOriginalLibkernelById[kAmprLibkernelHook_
 };
 }
 #undef AMPR_LIBKERNEL_SDK_FALLBACKS
+#undef AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS
 alignas(SCE_KERNEL_PAGE_SIZE) uint8_t g_trampolineStorage[kMaxTrampolinePages][kTrampolinePageSize]{};
 uint32_t g_trampolinePageUsed[kMaxTrampolinePages]{};
 int g_trampolinePageProt[kMaxTrampolinePages]{};
@@ -483,6 +514,7 @@ void refresh_hook_runtime_state_from_detours() {
     g_hookMandatoryCapabilityMask = mandatoryCapabilityMask;
     set_hooks_installed(mandatoryMask != 0 &&
                         mandatoryCapabilityMask == mandatoryMask);
+    apr_equeue_overlay_set_hooks_available(local_equeue_hooks_installed());
 }
 
 void reset_deferred_hook_log() {
@@ -1991,6 +2023,7 @@ static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
     }
 
     set_hooks_installed(true);
+    apr_equeue_overlay_set_hooks_available(local_equeue_hooks_installed());
     g_hookInstallResult = 0;
     return 0;
 }
@@ -2014,6 +2047,7 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprUninstallLibkernelHooks(void) {
 #if AMPR_EMU_DEBUG_LOG && (AMPR_EMU_DEBUG_LOG_VERBOSE || AMPR_EMU_DEBUG_LOG_TRACE)
     g_hookRuntimeLogEnabled.store(0, std::memory_order_release);
 #endif
+    apr_equeue_overlay_shutdown();
     bool ok = true;
     int removed = 0;
     int failed = 0;

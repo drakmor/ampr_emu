@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <cstring>
 
-#if AMPR_EMU_DEBUG_LOG && (AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP || AMPR_EMU_APR_REACTOR_STALL_WARN_ITERATIONS != 0)
+#if AMPR_EMU_DEBUG_LOG && AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP
 static inline void ampr_dump_decoded_op(const char* domain,
                                         const char* label,
                                         uint64_t submitId,

@@ -65,6 +65,12 @@ typedef enum AmprLibkernelHookId {
     kAmprLibkernelHook_sceKernelWriteModifyMtypeProtectCommand,
     kAmprLibkernelHook_sceKernelWriteModifyMtypeProtectWithGpuMaskIdCommand,
     kAmprLibkernelHook_sceKernelWriteRemapIntoPrtCommand,
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+    kAmprLibkernelHook_sceKernelWaitEqueue,
+    kAmprLibkernelHook_sceKernelDeleteEqueue,
+    kAmprLibkernelHook_sceKernelAddAmprEvent,
+    kAmprLibkernelHook_sceKernelDeleteAmprEvent,
+#endif
     kAmprLibkernelHook_Count
 } AmprLibkernelHookId;
 

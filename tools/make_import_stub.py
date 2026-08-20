@@ -54,6 +54,7 @@ STUBS = {
             ("_Znwm", STT_FUNC),
             ("abort", STT_FUNC),
             ("snprintf", STT_FUNC),
+            ("vsnprintf", STT_FUNC),
             ("strlcpy", STT_FUNC),
             ("strcasecmp", STT_FUNC),
             ("strtoll", STT_FUNC),

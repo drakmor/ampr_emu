@@ -231,6 +231,8 @@ def build_index_local(root: Path, output: Path, allow_case_collisions: bool) -> 
             if resolved == output or resolved == output_tmp:
                 continue
             indexed_path = app0_path(root, path)
+            if indexed_path.lower() in {"/app0/ampr_commands.bin", "/app0/apr_emu.log"}:
+                continue
             try:
                 st = path.stat()
             except OSError as exc:
@@ -381,7 +383,13 @@ def collect_ftp_rows(
             rel = remote_path[len(root):].lstrip("/") if root != "/" else remote_path.lstrip("/")
             indexed_path = "/app0/" + rel.replace("\\", "/")
             indexed_key = key_for(indexed_path)
-            if indexed_key in (key_for("/app0/ampr_emu.index"), key_for("/app0/ampr_emu.index.tmp"), key_for("/app0/ampr_emu.index.bak")):
+            if indexed_key in (
+                key_for("/app0/ampr_emu.index"),
+                key_for("/app0/ampr_emu.index.tmp"),
+                key_for("/app0/ampr_emu.index.bak"),
+                key_for("/app0/ampr_commands.bin"),
+                key_for("/app0/apr_emu.log"),
+            ):
                 continue
 
             size = int(facts.get("size", "0") or "0")

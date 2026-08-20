@@ -56,5 +56,6 @@ struct Job {
 };
 
 int apr_reactor_shutdown();
+void apr_reactor_notify_external_progress();
 int apr_reactor_wait_synthetic_submit_id(SceAprSubmitId id, bool* outHandled);
 int apr_reactor_submit(const Job& j, SceAprSubmitId* outSubmitId);

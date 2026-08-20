@@ -5,11 +5,15 @@
  */
 
 #include "ampr_emu_apr_services.h"
+#include "ampr_emu_command_log.h"
 #include "ampr_emu_apr_reactor.h"
 #include "ampr_emu_apr_reactor_common.h"
 #include "ampr_emu_command_buffer_apr.h"
 #include "ampr_emu_command_buffer_common.h"
 #include "ampr_emu_command_buffer_types.h"
+#if AMPR_EMU_DEBUG_LOG && (AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP & 2)
+#include "ampr_emu_command_buffer_dump.h"
+#endif
 #include "ampr_emu_errno.h"
 #include "ampr_emu_index.h"
 #include "ampr_emu_log.h"
@@ -405,6 +409,31 @@ static int apr_submit_command_buffer(AprCommandBuffer* commandBuffer,
     const uint32_t logicalCommands = static_cast<uint32_t>(rawCommandCount);
 
     const uint64_t sid = apr_next_submit_id();
+    AmprCommandLogSubmitInfo commandLog{};
+    commandLog.domain = AmprCommandLogDomain::Apr;
+    commandLog.mode = static_cast<AmprCommandLogSubmitMode>(mode);
+    commandLog.priority = rawPrio;
+    commandLog.submitType = static_cast<uint32_t>(nativeSubmitType);
+    commandLog.commandCount = logicalCommands;
+    commandLog.sourceCapacity = sourceCapacity;
+    commandLog.flags = useSourceOverride ? kAmprCommandLogFlagSourceOverride : 0u;
+    commandLog.submitCookie = sid;
+    commandLog.buffer = sourceBuffer;
+    commandLog.bytes = logicalBytes;
+    commandLogSubmit(commandLog);
+
+#if AMPR_EMU_DEBUG_LOG && (AMPR_EMU_SUBMIT_COMMAND_BUFFER_DUMP & 2)
+    ampr_dump_decoded_command_buffer("apr",
+                                     "source",
+                                     sid,
+                                     sourceBuffer,
+                                     logicalBytes,
+                                     sourceCapacity,
+                                     logicalCommands,
+                                     rawPrio,
+                                     static_cast<uint32_t>(nativeSubmitType));
+#endif
+
     Job j;
     j.id = sid;
     j.sourceBuffer = sourceBuffer;

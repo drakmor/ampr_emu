@@ -548,8 +548,6 @@ class LogStats:
     max_done_retained: int = 0
     max_done_pending: int = 0
     max_done_pending_waits: int = 0
-    direct_full_file_caps: int = 0
-    direct_full_file_cap_reasons: Counter = field(default_factory=Counter)
     direct_open_enters: int = 0
     direct_open_leaves: int = 0
     direct_open_headroom_defers: int = 0
@@ -1985,13 +1983,7 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
             ),
         )
 
-    elif prefix == "apr.reactor.directFullFile.cap":
-        stats.direct_full_file_caps += 1
-        reason = kv.get("reason")
-        if reason:
-            stats.direct_full_file_cap_reasons[reason] += 1
-
-    elif prefix == "apr.reactor.acquire.full-file-direct.enter":
+    elif prefix == "apr.reactor.acquire.direct.enter":
         stats.direct_open_enters += 1
         file_id = parse_int(kv.get("fileId")) or 0
         if job_id is not None:
@@ -2003,13 +1995,13 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
                 parse_int(kv.get("off")) or 0,
             )
 
-    elif prefix == "apr.reactor.acquire.full-file-direct.leave":
+    elif prefix == "apr.reactor.acquire.direct.leave":
         stats.direct_open_leaves += 1
         file_id = parse_int(kv.get("fileId")) or 0
         if job_id is not None:
             stats.active_direct_opens.pop((job_id, file_id), None)
 
-    elif prefix == "apr.reactor.acquire.full-file-direct.no-headroom":
+    elif prefix == "apr.reactor.acquire.direct.no-headroom":
         stats.direct_open_headroom_defers += 1
 
     elif prefix == "apr.reactor.acquire.defer":
@@ -2906,16 +2898,6 @@ def build_findings(stats: LogStats) -> List[str]:
             f"APR wait boost observed: {stats.wait_boosts} boost line(s), "
             f"reserve hits={stats.wait_boost_reserves}, direct reserve hits={stats.wait_boost_direct_reserves}."
         )
-    if stats.direct_full_file_caps:
-        if stats.direct_full_file_cap_reasons:
-            reasons = ", ".join(
-                f"{reason}:{count}" for reason, count in stats.direct_full_file_cap_reasons.most_common(5)
-            )
-            findings.append(
-                f"APR direct full-file cap was hit {stats.direct_full_file_caps} time(s); top reasons: {reasons}."
-            )
-        else:
-            findings.append(f"APR direct full-file cap was hit {stats.direct_full_file_caps} time(s).")
     if stats.acquire_defers:
         reasons = ", ".join(
             f"{reason}:{count}" for reason, count in stats.acquire_defer_reasons.most_common(5)
@@ -3346,10 +3328,6 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
                 f"0x{sample.submit_id:x}{'*' if sample.waiting else ''}" for sample in samples
             )
             print(f"  latest done ids:     {ids}")
-    print(f"  direct full cap hits:{stats.direct_full_file_caps}")
-    if stats.direct_full_file_cap_reasons:
-        reasons = ", ".join(f"{name}: {count}" for name, count in stats.direct_full_file_cap_reasons.most_common(5))
-        print(f"  direct cap reasons:  {reasons}")
     print(f"  direct open enter/leave:{stats.direct_open_enters}/{stats.direct_open_leaves}")
     if stats.direct_open_headroom_defers or stats.acquire_defers:
         reasons = ", ".join(f"{name}: {count}" for name, count in stats.acquire_defer_reasons.most_common(5))
@@ -4224,8 +4202,6 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
             }
             for item in stats.reactor_state_samples[-top:]
         ],
-        "direct_full_file_caps": stats.direct_full_file_caps,
-        "direct_full_file_cap_reasons": dict(stats.direct_full_file_cap_reasons),
         "direct_open_enters": stats.direct_open_enters,
         "direct_open_leaves": stats.direct_open_leaves,
         "direct_open_headroom_defers": stats.direct_open_headroom_defers,

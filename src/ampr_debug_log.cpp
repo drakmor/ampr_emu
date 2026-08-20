@@ -6,6 +6,7 @@
 
 #include "ampr_debug_log.h"
 #include "ampr_emu_kernel_lookup.h"
+#include "ampr_emu_command_log.h"
 #include "ampr_libkernel_hook.h"
 
 #include <cstdarg>
@@ -496,7 +497,14 @@ void startDebugLogWriter() {
         return;
     }
     debugLogStartWriterLocked(state);
+    const bool writerStarted = state.writerStarted.load(std::memory_order_acquire);
     debugLogUnlockLifecycle(state);
+
+    // Auxiliary binary command journaling follows the main logger lifecycle.
+    // Never create its writer from module_start() or from an APR/AMM submit path.
+    if (writerStarted) {
+        startCommandLog();
+    }
 }
 
 inline bool debugLogPushLocked(AmprDebugLogState& state,
@@ -735,6 +743,10 @@ inline bool debugLogEnqueueBody(const char* body,
 }
 
 void shutdownDebugLog() {
+    // Stop/drain the auxiliary command journal while the main text logger is
+    // still alive so its writer summary and diagnostics can be queued safely.
+    shutdownCommandLog();
+
     auto& state = debugLogState();
     while (!debugLogTryLockLifecycle(state)) {
         (void)debugLogKernelUsleep(200ll);

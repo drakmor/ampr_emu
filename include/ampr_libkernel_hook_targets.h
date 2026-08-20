@@ -7,6 +7,7 @@
 #pragma once
 
 #include "ampr.h"
+#include "ampr_emu_apr_equeue.h"
 
 #include <_kernel.h>
 #include <kernel.h>
