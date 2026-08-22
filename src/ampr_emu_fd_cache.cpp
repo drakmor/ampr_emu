@@ -9,6 +9,7 @@
 #include "ampr_emu_kernel_file.h"
 #include "ampr_emu_log.h"
 #include "ampr_emu_sync.h"
+#include "ampr_emu_errno.h"
 
 #include <atomic>
 #include <new>
@@ -415,7 +416,6 @@ static void fd_runtime_note_unpin_locked(FileState& fs, FileState::RuntimeFile& 
 struct FdPressureCaps {
     size_t fdBudget{};
     size_t cacheCap{};
-    size_t directCap{};
 };
 
 static constexpr size_t kFdOpenBudgetBaseCap =
@@ -499,8 +499,7 @@ static FdPressureCaps fd_pressure_caps_for_budget(size_t fdBudget) {
         cacheCap = fdBudget - 1;
     }
 
-    const size_t directCap = fdBudget;
-    return FdPressureCaps{fdBudget, cacheCap, directCap};
+    return FdPressureCaps{fdBudget, cacheCap};
 }
 
 static FdPressureCaps fd_pressure_current_caps() {
@@ -1119,16 +1118,22 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
               pathToOpen,
               flags);
     int opened = ampr_real_sceKernelOpen(pathToOpen, flags, static_cast<SceKernelMode>(mode));
-    const int openErrno = opened < 0 ? errno : 0;
-    AMPR_TLOGF("apr.fdcache.open.leave job=0x%llx fileId=%u path=%s fd=%d errno=%d",
+    // ampr_real_sceKernelOpen() is the raw libkernel slot: preserve the SCE
+    // return code and derive POSIX errno only for local pressure/error classes.
+    const int openErrno = opened < 0 ? ampr_posix_errno_from_sce(opened) : 0;
+    const bool openPressure =
+        opened < 0 && ampr_posix_errno_is_fd_open_pressure(openErrno);
+    AMPR_TLOGF("apr.fdcache.open.leave job=0x%llx fileId=%u path=%s fd=%d rawRc=0x%x errno=%d pressure=%u",
               (unsigned long long)jobId,
               id,
               pathToOpen,
               opened,
-              openErrno);
-    if (opened < 0 && openErrno == EMFILE) {
+              opened,
+              openErrno,
+              openPressure ? 1u : 0u);
+    if (openPressure) {
 #if AMPR_EMU_DEBUG_LOG
-        if (ampr_debug_log_runtime_enabled()) {
+        if (openErrno == EMFILE && ampr_debug_log_runtime_enabled()) {
             g_fd_cache_diag_emfile.fetch_add(1, std::memory_order_relaxed);
         }
 #endif
@@ -1136,21 +1141,22 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
         const size_t observedOpen = fd_observed_open_count(beforeStats);
         const FdPressureCaps pressureCaps = fd_cache_mark_open_pressure(observedOpen);
         const size_t closedStale = fd_cache_release_stale_for_pressure();
-        const size_t closedIdle =
-            ampr_index_fd_cache_release_idle_percent(AMPR_EMU_FD_CACHE_EMFILE_IDLE_CLOSE_PERCENT);
+        const size_t closedIdle = ampr_index_fd_cache_release_idle_percent(
+            AMPR_EMU_FD_CACHE_OPEN_PRESSURE_IDLE_CLOSE_PERCENT);
         const FdCacheStats afterStats = fd_cache_stats();
         (void)pressureCaps;
         (void)closedStale;
         (void)closedIdle;
         (void)afterStats;
-        AMPR_LOGF("apr.fdcache.acquire.open defer-emfile job=0x%llx fileId=%u path=%s observedOpen=%zu fdBudget=%zu cacheCap=%zu directCap=%zu closedStale=%zu closedIdle=%zu cacheBefore=%zu/%zu directBefore=%zu pinned=%zu pins=%zu evictable=%zu cacheAfter=%zu/%zu directAfter=%zu pinnedAfter=%zu pinsAfter=%zu evictableAfter=%zu",
+        AMPR_LOGF("apr.fdcache.acquire.open defer-pressure job=0x%llx fileId=%u path=%s rawRc=0x%x errno=%d observedOpen=%zu fdBudget=%zu cacheCap=%zu closedStale=%zu closedIdle=%zu cacheBefore=%zu/%zu directBefore=%zu pinned=%zu pins=%zu evictable=%zu cacheAfter=%zu/%zu directAfter=%zu pinnedAfter=%zu pinsAfter=%zu evictableAfter=%zu",
                   (unsigned long long)jobId,
                   id,
                   pathToOpen,
+                  opened,
+                  openErrno,
                   observedOpen,
                   pressureCaps.fdBudget,
                   pressureCaps.cacheCap,
-                  pressureCaps.directCap,
                   closedStale,
                   closedIdle,
                   beforeStats.open,
@@ -1167,18 +1173,21 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
                   afterStats.evictable);
     }
     if (opened < 0) {
-        if (openErrno != EMFILE) {
-            AMPR_CRITICAL_LOGF("apr.fdcache.acquire.open status=failed job=0x%llx fileId=%u path=%s rc=0x%x",
+        if (!openPressure) {
+            AMPR_CRITICAL_LOGF("apr.fdcache.acquire.open status=failed job=0x%llx fileId=%u path=%s rawRc=0x%x errno=%d rc=0x%x",
                       (unsigned long long)jobId,
                       id,
                       pathToOpen,
+                      opened,
+                      openErrno,
                       -openErrno);
         }
-        AMPR_FILE_STATUS_LOGF("apr.file.open status=%s reason=fd-cache-open job=0x%llx fileId=%u path=%s errno=%d rc=0x%x",
-                              openErrno == EMFILE ? "deferred" : "failed",
+        AMPR_FILE_STATUS_LOGF("apr.file.open status=%s reason=fd-cache-open job=0x%llx fileId=%u path=%s rawRc=0x%x errno=%d rc=0x%x",
+                              openPressure ? "deferred" : "failed",
                               (unsigned long long)jobId,
                               id,
                               pathToOpen,
+                              opened,
                               openErrno,
                               -openErrno);
         return -openErrno;
@@ -1298,12 +1307,12 @@ void ampr_index_release_cached_fd_pin(uint32_t fileId) {
 
 AmprIndexFdPressureCaps ampr_index_fd_pressure_current_caps() {
     const FdPressureCaps caps = fd_pressure_current_caps();
-    return AmprIndexFdPressureCaps{caps.fdBudget, caps.cacheCap, caps.directCap};
+    return AmprIndexFdPressureCaps{caps.fdBudget, caps.cacheCap};
 }
 
 AmprIndexFdPressureCaps ampr_index_fd_cache_mark_open_pressure(size_t observedOpen) {
     const FdPressureCaps caps = fd_cache_mark_open_pressure(observedOpen);
-    return AmprIndexFdPressureCaps{caps.fdBudget, caps.cacheCap, caps.directCap};
+    return AmprIndexFdPressureCaps{caps.fdBudget, caps.cacheCap};
 }
 
 uint64_t ampr_index_fd_cache_open_pressure_generation() {

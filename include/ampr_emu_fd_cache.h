@@ -14,7 +14,6 @@ struct FileEntryView;
 struct AmprIndexFdPressureCaps {
     size_t fdBudget{};
     size_t cacheCap{};
-    size_t directCap{};
 };
 
 struct AmprIndexFdCacheStats {

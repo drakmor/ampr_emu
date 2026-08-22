@@ -62,8 +62,8 @@
 #endif
 
 #ifndef AMPR_EMU_FD_CACHE_EMFILE_IDLE_CLOSE_PERCENT
-// On EMFILE/open pressure, close only this percentage of idle cached FDs before
-// retrying the open. Active pinned FDs are never closed by this path.
+// Percentage used by the ordinary high/critical watermark reclaim policy.
+// Active pinned FDs are never closed by this path.
 #define AMPR_EMU_FD_CACHE_EMFILE_IDLE_CLOSE_PERCENT 10
 #endif
 
@@ -115,6 +115,31 @@
 #define AMPR_EMU_APR_AIO_INFLIGHT 32
 #endif
 
+#ifndef AMPR_EMU_FD_DIRECT_CAP_RESERVE
+// Effective APR-budget slots kept outside the direct full-file population for
+// cached descriptors and process-wide safety headroom.
+#define AMPR_EMU_FD_DIRECT_CAP_RESERVE 12u
+#endif
+
+#ifndef AMPR_EMU_FD_DIRECT_CAP_PRESSURE_PERCENT
+// Temporary tighter share while the reactor is inside an FD-pressure cooldown.
+#define AMPR_EMU_FD_DIRECT_CAP_PRESSURE_PERCENT 60u
+#endif
+
+#ifndef AMPR_EMU_FD_DIRECT_OPEN_SAFETY_RESERVE
+// Keep this many APR-budget slots unused while admitting a new direct FD. This
+// absorbs small process-wide FD races and gives title-side opens breathing
+// room without reducing the idle cache cap.
+#define AMPR_EMU_FD_DIRECT_OPEN_SAFETY_RESERVE 6u
+#endif
+
+#ifndef AMPR_EMU_FD_CACHE_OPEN_PRESSURE_IDLE_CLOSE_PERCENT
+// A real open() resource-pressure failure is stronger evidence than the normal
+// high-watermark heuristic. Drop this share of currently idle cache entries
+// before retrying. Pinned descriptors are never closed.
+#define AMPR_EMU_FD_CACHE_OPEN_PRESSURE_IDLE_CLOSE_PERCENT 100u
+#endif
+
 #ifndef AMPR_EMU_APR_READ_CHUNK_QUANTUM
 // Maximum number of new host AIO requests one APR priority lane may admit in
 // one scheduler pass. The byte budget below is applied at the same time, so
@@ -141,7 +166,7 @@
 // A logical ReadChain is sliced at up to 512 KiB and its charged-byte window is
 // also 512 KiB, so only one slice can be live at a time. Small-file batching
 // happens across read commands/jobs through the shared priority-lane budget.
-#define AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS 1u
+#define AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS 4u //1u
 #endif
 
 #ifndef AMPR_EMU_APR_PER_READ_ACTIVE_BYTES
@@ -149,7 +174,7 @@
 // rounded up to AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES for admission only.
 // Thus a full 512 KiB chunk consumes the complete per-read window. The separate
 // priority-lane pass budget may still batch up to eight <=64 KiB read commands.
-#define AMPR_EMU_APR_PER_READ_ACTIVE_BYTES 0x80000u
+#define AMPR_EMU_APR_PER_READ_ACTIVE_BYTES  0x200000u // 0x80000u
 #endif
 
 #ifndef AMPR_EMU_APR_GROUP_SOFT_TARGETS
@@ -260,27 +285,6 @@
 #define AMPR_EMU_APR_AIO_POLL_INITIAL_STEP_NS 50000
 #endif
 
-#ifndef AMPR_EMU_APR_AIO_POLL_BATCH_LIMIT
-// Maximum SDK AIO poll syscalls issued by one reactor worker iteration.
-// The deadline heap retains every due request not reached in this iteration.
-#define AMPR_EMU_APR_AIO_POLL_BATCH_LIMIT 24
-#endif
-
-#ifndef AMPR_EMU_APR_AIO_POLL_BUDGET_COOLDOWN_NS
-// If one observation phase consumes the complete poll budget without finding
-// a completion while more requests are already due, defer the next AIO
-// observation by this amount. This is a global observation cooldown, not a
-// per-request backoff, and prevents overdue staged-EOP bursts from turning the
-// reactor into a tight sceKernelAioPollRequest loop.
-#define AMPR_EMU_APR_AIO_POLL_BUDGET_COOLDOWN_NS 250000
-#endif
-
-#ifndef AMPR_EMU_APR_AIO_POLL_REGULAR_RESERVE
-// Poll calls retained for deadline-ready heap selection after servicing the
-// completion-gating hot queue. Clamped so a non-empty batch keeps one hot slot.
-#define AMPR_EMU_APR_AIO_POLL_REGULAR_RESERVE 6
-#endif
-
 #ifndef AMPR_EMU_APR_AIO_POLL_BACKGROUND_INITIAL_MIN_NS
 // Delay the first observation of newly submitted background reads. A newly
 // issued read is often only a provisional tail and may be superseded by more
@@ -311,9 +315,9 @@
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_CAPACITY_POLL_BATCH_LIMIT
-// Maximum non-due submitted AIO requests sampled by one admission-pressure
-// probe.  Stop as soon as one completion is found; a newly freed slot is then
-// consumed by the normal queue traversal in the same reactor pass.
+// Maximum unique non-due submitted AIO IDs sampled by one array
+// admission-pressure probe. Every selected ID is observed by the same SDK
+// call; any newly freed slots are consumed by the following queue traversal.
 #define AMPR_EMU_APR_AIO_CAPACITY_POLL_BATCH_LIMIT 4
 #endif
 
@@ -439,11 +443,33 @@
 #endif
 
 #ifndef AMPR_EMU_APR_LOCAL_EQUEUE
-// 1 -> publish APR WriteKernelEventQueue packets through the fixed-storage
-// equeue overlay when all optional equeue hooks and the private EVFILT_USER
-// wake registration are available. AMM remains native. Set to 0 to restore
-// the all-native APR equeue ownership used before the overlay was introduced.
+// Diagnostic/A-B fallback only. The production APR completion path keeps
+// WriteKernelEventQueue native and pre-submits fixed gated sidecars to A53.
+// Set to 1 only when explicitly testing the older userspace equeue overlay.
 #define AMPR_EMU_APR_LOCAL_EQUEUE 1
+#endif
+
+#ifndef AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+// Pre-scan APR submissions and immediately submit native APR packets on
+// priorities 1..6 to A53 behind fixed private gates. Priority 0 shares native
+// High with AMM and therefore uses a just-in-time APR micro-submit to avoid a
+// closed eager gate blocking an older AMM map. The old persistent APR batch is
+// not mixed into a lane while this path is enabled.
+#define AMPR_EMU_APR_EAGER_NATIVE_EQUEUE 0
+#endif
+
+#ifndef AMPR_EMU_APR_EAGER_NATIVE_EQUEUE_MAX_EVENTS
+// Maximum native APR records in one eager sidecar. Only the exact encoded
+// command span is reserved from the shared circular arena; no per-record mirror
+// or maximum-sized per-job command buffer is retained.
+#define AMPR_EMU_APR_EAGER_NATIVE_EQUEUE_MAX_EVENTS 2048u
+#endif
+
+#ifndef AMPR_EMU_APR_EAGER_NATIVE_EQUEUE_ARENA_BYTES
+// One native-visible circular arena. Each eager job reserves only its encoded
+// gate/packet/checkpoint bytes plus one progress word. Wrap and overlap are
+// checked; real exhaustion backpressures submit until older slices retire.
+#define AMPR_EMU_APR_EAGER_NATIVE_EQUEUE_ARENA_BYTES 0x04000000u
 #endif
 
 #ifndef AMPR_EMU_APR_LOCAL_EQUEUE_QUEUE_CAPACITY
@@ -461,6 +487,22 @@
 // Shared FIFO-node pool for published APR events. Exhaustion is reactor
 // backpressure; it must never select native fallback for the blocked packet.
 #define AMPR_EMU_APR_LOCAL_EQUEUE_PENDING_CAPACITY AMPR_EMU_APR_COMMAND_BUFFER_LIVE_MAX
+#endif
+
+#ifndef AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_US
+// After a synthetic APR event was delivered, briefly keep the next blocking
+// wait in userspace so a nearby APR completion can be consumed without a
+// private EVFILT_USER trigger. This is the initial adaptive window, or the
+// fixed window when adaptive mode is disabled. Polling waits never use it.
+// Set to 0 to disable the wait optimization completely.
+#define AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_US 10u // 10u
+#endif
+
+#ifndef AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_ADAPTIVE
+// Adapt the grace independently for each tracked equeue. The controller uses
+// four bounded levels derived from WAIT_GRACE_US (1/4, 1/2, 1x, and 2x), grows
+// after two hits, shrinks after every miss, and cools down after repeated misses.
+#define AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_ADAPTIVE 1
 #endif
 
 #ifndef AMPR_EMU_APR_REACTOR_STALL_WARN_NS
@@ -496,7 +538,7 @@
 //   bit 0 (1) -> APR submits
 //   bit 1 (2) -> AMM submits
 // Enable 3 for a complete AMPR command trace. 
-#define AMPR_EMU_COMMAND_LOG 0
+#define AMPR_EMU_COMMAND_LOG 3
 #endif
 
 #ifndef AMPR_EMU_COMMAND_LOG_PATH
@@ -592,7 +634,7 @@
 
 // Version
 #ifndef AMPR_EMU_VERSION
-#define AMPR_EMU_VERSION "0.3.6 (public beta) (c) Drakmor"
+#define AMPR_EMU_VERSION "0.3.6.4 (public beta) (c) Drakmor"
 #endif
 
 #ifndef AMPR_EMU_DEBUG_LOG
@@ -600,7 +642,7 @@
 // The first log write in each process truncates the file; later writes in the
 // same run continue on the open fd.
 // 0 -> compile out log callsites and the logger backend.
-#define AMPR_EMU_DEBUG_LOG 0
+#define AMPR_EMU_DEBUG_LOG 1
 #endif
 
 #if AMPR_EMU_COMMAND_LOG && !AMPR_EMU_DEBUG_LOG
@@ -611,7 +653,7 @@
 // 1 -> enable moderate success-path diagnostics. This level is intended to be
 // usable during real startup/hang investigation without export/AMM hot-call
 // traces.
-#define AMPR_EMU_DEBUG_LOG_VERBOSE 1
+#define AMPR_EMU_DEBUG_LOG_VERBOSE 0
 #endif
 
 #ifndef AMPR_EMU_DEBUG_LOG_TRACE

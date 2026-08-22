@@ -72,6 +72,11 @@ static inline int ampr_posix_errno_from_sce(int rc) {
     }
 }
 
+
+static inline bool ampr_posix_errno_is_fd_open_pressure(int err) {
+    return err == EAGAIN || err == EMFILE || err == ENFILE;
+}
+
 static inline int ampr_libkernel_return_from_sce(int rc) {
     if (rc == 0) {
         return 0;

@@ -32,6 +32,8 @@ static constexpr uint64_t kAprNativeMicroCompletionDone = 0x4150524d444f4e45ull;
 static constexpr uint32_t kAprNativeMicroCommandCapacity = 64u;
 static constexpr uint32_t kAprNativeMicroCompletionBytes = 16u;
 static constexpr uint32_t kAprNativeMicroSlotAlignment = 64u;
+static constexpr uint32_t kAprNativeMicroAmmPriority = 0u;
+static constexpr int kAprNativeMicroResultPending = INT32_MIN;
 
 static constexpr bool apr_read_completion_window_exhausted(
     uint64_t latestSubmitted,
@@ -45,6 +47,7 @@ struct alignas(kAprNativeMicroSlotAlignment) AprNativeMicroSlot {
     uint8_t commands[kAprNativeMicroCommandCapacity]{};
     uint8_t completionTemplate[kAprNativeMicroCompletionBytes]{};
     alignas(8) volatile uint64_t completion{};
+    SceAprResultBuffer result{};
 };
 static constexpr size_t kAprNativeMicroRawBytes =
     sizeof(AprNativeMicroSlot) * kAprCommandBufferLiveMax;
@@ -53,6 +56,119 @@ static constexpr size_t kAprNativeMicroPoolBytes =
      SCE_KERNEL_PAGE_SIZE) * SCE_KERNEL_PAGE_SIZE;
 alignas(SCE_KERNEL_PAGE_SIZE) static uint8_t
     g_apr_native_micro_pool[kAprNativeMicroPoolBytes];
+
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+// Eager native APR sidecars are fully populated before submission. Each live
+// eager job reserves only its encoded bytes from one native-visible circular
+// arena. Every APR priority owns one release word; monotonic tokens let one release store
+// open a FIFO prefix spanning several public submits. Per-packet checkpoints
+// preserve ordering against following software/AMM work and make completion
+// observable without scanning command storage.
+static constexpr uint32_t kAprNativeEventGateBytes = 16u;
+static constexpr uint32_t kAprNativeEventPacketMaxBytes = 20u;
+static constexpr uint32_t kAprNativeEventCheckpointBytes = 16u;
+static constexpr uint64_t kAprNativeEventTokenBase = 0x4150524500000000ull;
+static constexpr int kAprNativeEventResultPending = INT32_MIN;
+static constexpr uint32_t kAprNativeEventMaxPerJob =
+    static_cast<uint32_t>(AMPR_EMU_APR_EAGER_NATIVE_EQUEUE_MAX_EVENTS);
+static constexpr uint32_t kAprNativeEventArenaBytes =
+    static_cast<uint32_t>(AMPR_EMU_APR_EAGER_NATIVE_EQUEUE_ARENA_BYTES);
+static constexpr uint32_t kAprNativeEventArenaAlignment = 64u;
+static constexpr uint32_t kAprNativeEventArenaAllocationCount =
+    static_cast<uint32_t>(kAprCommandBufferLiveMax);
+static_assert(kAprNativeEventMaxPerJob != 0,
+              "eager native APR sidecar must hold at least one record");
+static_assert(kAprNativeEventArenaBytes >= SCE_KERNEL_PAGE_SIZE &&
+                  kAprNativeEventArenaBytes % SCE_KERNEL_PAGE_SIZE == 0,
+              "eager native APR arena must be page aligned and non-empty");
+static_assert((kAprNativeEventArenaAlignment &
+               (kAprNativeEventArenaAlignment - 1u)) == 0,
+              "eager native APR arena alignment must be a power of two");
+static_assert(kAprNativeEventArenaAllocationCount != 0,
+              "eager native APR arena needs allocation descriptors");
+
+struct AprNativeEventArenaPlacement {
+    uint32_t offset{UINT32_MAX};
+    uint32_t reservedBytes{};
+};
+
+static constexpr AprNativeEventArenaPlacement
+apr_native_event_arena_placement(uint32_t capacity,
+                                 uint32_t readOffset,
+                                 uint32_t writeOffset,
+                                 uint32_t usedBytes,
+                                 uint32_t requestBytes) {
+    AprNativeEventArenaPlacement placement{};
+    if (capacity == 0 || readOffset >= capacity || writeOffset >= capacity ||
+        usedBytes > capacity || requestBytes == 0 ||
+        requestBytes > capacity - usedBytes) {
+        return placement;
+    }
+    if (writeOffset >= readOffset) {
+        const uint32_t tailBytes = capacity - writeOffset;
+        if (requestBytes <= tailBytes) {
+            placement.offset = writeOffset;
+            placement.reservedBytes = requestBytes;
+        } else if (requestBytes <= readOffset &&
+                   tailBytes <= capacity - usedBytes - requestBytes) {
+            placement.offset = 0;
+            placement.reservedBytes = tailBytes + requestBytes;
+        }
+    } else if (requestBytes <= readOffset - writeOffset) {
+        placement.offset = writeOffset;
+        placement.reservedBytes = requestBytes;
+    }
+    return placement;
+}
+
+static_assert(apr_native_event_arena_placement(1024, 0, 0, 0, 64).offset == 0);
+static_assert(apr_native_event_arena_placement(1024, 320, 896, 576, 256).offset == 0);
+static_assert(apr_native_event_arena_placement(1024, 320, 896, 576, 256).reservedBytes == 384);
+static_assert(apr_native_event_arena_placement(1024, 768, 128, 384, 256).offset == 128);
+static_assert(apr_native_event_arena_placement(1024, 128, 896, 768, 192).offset == UINT32_MAX);
+
+struct alignas(8) AprNativeEventResultSlot {
+    SceAprResultBuffer result{};
+};
+
+alignas(SCE_KERNEL_PAGE_SIZE) static uint8_t
+    g_apr_native_event_arena[kAprNativeEventArenaBytes];
+static constexpr size_t kAprNativeEventResultRawBytes =
+    sizeof(AprNativeEventResultSlot) * kAprCommandBufferLiveMax;
+static constexpr size_t kAprNativeEventResultPoolBytes =
+    ((kAprNativeEventResultRawBytes + SCE_KERNEL_PAGE_SIZE - 1u) /
+     SCE_KERNEL_PAGE_SIZE) * SCE_KERNEL_PAGE_SIZE;
+alignas(SCE_KERNEL_PAGE_SIZE) static uint8_t
+    g_apr_native_event_result_pool[kAprNativeEventResultPoolBytes];
+
+static constexpr size_t kAprNativeEventLaneReleaseStride =
+    kAprNativeMicroSlotAlignment;
+static constexpr size_t kAprNativeEventControlRawBytes =
+    kAprPriorityArrayCount * kAprNativeEventLaneReleaseStride;
+static constexpr size_t kAprNativeEventControlPoolBytes =
+    ((kAprNativeEventControlRawBytes + SCE_KERNEL_PAGE_SIZE - 1u) /
+     SCE_KERNEL_PAGE_SIZE) * SCE_KERNEL_PAGE_SIZE;
+alignas(SCE_KERNEL_PAGE_SIZE) static uint8_t
+    g_apr_native_event_control_pool[kAprNativeEventControlPoolBytes];
+
+static volatile uint64_t* apr_native_event_lane_release_ptr(size_t lane) {
+    if (lane >= kAprPriorityArrayCount) {
+        return nullptr;
+    }
+    return reinterpret_cast<volatile uint64_t*>(
+        g_apr_native_event_control_pool +
+        lane * kAprNativeEventLaneReleaseStride);
+}
+
+static SceAprResultBuffer* apr_native_event_result(size_t slot) {
+    if (slot >= kAprCommandBufferLiveMax) {
+        return nullptr;
+    }
+    return &(
+        reinterpret_cast<AprNativeEventResultSlot*>(
+            g_apr_native_event_result_pool) + slot)->result;
+}
+#endif
 
 // A submitted APR batch never changes its byte length or command count. Each
 // group has one flush-enabled gate, eight fixed payload slots, and one
@@ -244,6 +360,12 @@ static bool apr_aio_submit_sce_rc_is_deferred(int rc) {
     return rc == SCE_KERNEL_ERROR_EAGAIN;
 }
 
+static bool apr_fd_acquire_sce_rc_is_deferred(int rc) {
+    return rc == SCE_KERNEL_ERROR_EAGAIN ||
+           rc == SCE_KERNEL_ERROR_EMFILE ||
+           rc == SCE_KERNEL_ERROR_ENFILE;
+}
+
 static bool apr_aio_completion_sce_rc_is_retryable(int rc) {
     return rc == SCE_KERNEL_ERROR_EAGAIN ||
            rc == SCE_KERNEL_ERROR_EBUSY ||
@@ -283,6 +405,17 @@ static int apr_backend_read_error_to_apr(int rc) {
         return SCE_AMPR_ERROR_APR_MEMORYFAULTWRITEBUFFERADDRESS;
     }
     return SCE_AMPR_ERROR_APR_UNAVAILABLEFILEID;
+}
+
+static bool apr_backend_read_error_is_missing_path(int rc) {
+    return rc == SCE_KERNEL_ERROR_ENOENT ||
+           rc == SCE_KERNEL_ERROR_ENOTDIR;
+}
+
+static const char* apr_backend_read_error_reason(const char* fallback, int rc) {
+    return apr_backend_read_error_is_missing_path(rc)
+               ? "indexed-path-missing"
+               : fallback;
 }
 
 static bool apr_prepare_aio_read_desc([[maybe_unused]] uint64_t jobId,
@@ -379,6 +512,38 @@ static_assert(!apr_read_is_single_quantum_full_file(
                   AMPR_EMU_APR_AIO_DISPATCH_QUANTUM_BYTES),
               "a partial file read must use the FD cache");
 
+static size_t apr_adaptive_direct_fd_cap(const AmprIndexFdPressureCaps& caps,
+                                          uint32_t aioLimit,
+                                          bool fdPressure) {
+    const size_t budget = caps.fdBudget;
+    if (budget == 0 || aioLimit == 0) {
+        return 0;
+    }
+
+    const size_t reserve = static_cast<size_t>(AMPR_EMU_FD_DIRECT_CAP_RESERVE);
+    size_t cap = 1;
+    if (budget > reserve) {
+        cap = budget - reserve;
+    }
+
+    if (cap > static_cast<size_t>(aioLimit)) {
+        cap = static_cast<size_t>(aioLimit);
+    }
+
+    if (fdPressure) {
+        size_t pressureShare =
+            (budget * static_cast<size_t>(AMPR_EMU_FD_DIRECT_CAP_PRESSURE_PERCENT)) / 100u;
+        if (pressureShare == 0) {
+            pressureShare = 1;
+        }
+        if (cap > pressureShare) {
+            cap = pressureShare;
+        }
+    }
+
+    return cap;
+}
+
 static void apr_update_read_desc_fd_policy(AprAioReadDesc& rd) {
     if (!rd.fileMetadataValid) {
         return;
@@ -404,6 +569,7 @@ static bool apr_read_desc_entry(const AprAioReadDesc& rd, FileEntryView* out) {
 static bool apr_acquire_aio_read_desc(uint64_t jobId,
                                       AprAioReadDesc& rd,
                                       bool allowNewFd,
+                                      size_t directOpenCap,
                                       int* outRc,
                                       uint32_t* outErrorOffset) {
     if (outRc) *outRc = 0;
@@ -422,7 +588,8 @@ static bool apr_acquire_aio_read_desc(uint64_t jobId,
                       rd.fileId);
             return false;
         }
-        constexpr const char* directMode = "single-quantum-full-file-direct";
+        [[maybe_unused]] constexpr const char* directMode =
+            "single-quantum-full-file-direct";
         if (!haveDirectEntry) {
             if (outRc) *outRc = apr_file_id_lookup_error(rd.fileId);
             AMPR_CRITICAL_LOGF("apr.reactor.acquire.fail status=failed job=0x%llx reason=no-entry fileId=%u mode=%s rc=0x%x",
@@ -437,15 +604,45 @@ static bool apr_acquire_aio_read_desc(uint64_t jobId,
                                   outRc ? *outRc : apr_file_id_lookup_error(rd.fileId));
             return false;
         }
-        fd_cache_release_watermark_headroom(1, directMode);
-        if (!ampr_index_fd_cache_release_open_fd_budget_headroom(1)) {
+        const AmprIndexFdPressureCaps fdCaps = ampr_index_fd_pressure_current_caps();
+        const size_t directOpen = ampr_index_fd_direct_open_count();
+        if (directOpenCap != 0 && directOpen + 1u > directOpenCap) {
             if (outRc) *outRc = SCE_KERNEL_ERROR_EAGAIN;
-            AMPR_LOGF("apr.reactor.acquire.direct.no-headroom job=0x%llx fileId=%u path=%s mode=%s rc=0x%x",
+            AMPR_TLOGF("apr.reactor.acquire.direct.defer job=0x%llx fileId=%u reason=direct-cap directOpen=%zu directCap=%zu fdBudget=%zu",
                       (unsigned long long)jobId,
                       rd.fileId,
-                      ampr_log_path_arg(directEntry.path),
-                      directMode,
-                      SCE_KERNEL_ERROR_EAGAIN);
+                      directOpen,
+                      directOpenCap,
+                      fdCaps.fdBudget);
+            return false;
+        }
+        const size_t requestedReserve =
+            1u + static_cast<size_t>(AMPR_EMU_FD_DIRECT_OPEN_SAFETY_RESERVE);
+        const size_t openReserve =
+            requestedReserve < fdCaps.fdBudget ? requestedReserve : fdCaps.fdBudget;
+
+        // Fast path: do not proactively evict cached descriptors merely because
+        // the combined FD population crossed a watermark. Most direct opens are
+        // admitted while real budget headroom still exists, so one snapshot is
+        // enough and no sceKernelClose() is issued. Only reclaim cache entries
+        // when the requested reserve would actually exceed the effective budget.
+        const AmprIndexFdCacheStats preOpenStats = ampr_index_fd_cache_stats();
+        const size_t observedOpen = preOpenStats.open + directOpen;
+        const bool hasBudgetHeadroom =
+            observedOpen <= fdCaps.fdBudget &&
+            openReserve <= fdCaps.fdBudget - observedOpen;
+        if (!hasBudgetHeadroom &&
+            !ampr_index_fd_cache_release_open_fd_budget_headroom(openReserve)) {
+            if (outRc) *outRc = SCE_KERNEL_ERROR_EAGAIN;
+            AMPR_TLOGF("apr.reactor.acquire.direct.defer job=0x%llx fileId=%u reason=fd-budget-headroom directOpen=%zu directCap=%zu observedOpen=%zu reserve=%zu fdBudget=%zu evictable=%zu",
+                      (unsigned long long)jobId,
+                      rd.fileId,
+                      directOpen,
+                      directOpenCap,
+                      observedOpen,
+                      openReserve,
+                      fdCaps.fdBudget,
+                      preOpenStats.evictable);
             return false;
         }
         AMPR_TLOGF("apr.reactor.acquire.direct.enter job=0x%llx fileId=%u path=%s mode=%s len=0x%llx off=0x%llx",
@@ -458,34 +655,45 @@ static bool apr_acquire_aio_read_desc(uint64_t jobId,
         int fd = ampr_real_sceKernelOpen(directEntry.path,
                                          kAprAioOpenFlags,
                                          static_cast<SceKernelMode>(0));
-        int openErrno = fd < 0 ? errno : 0;
-        AMPR_TLOGF("apr.reactor.acquire.direct.leave job=0x%llx fileId=%u mode=%s fd=%d errno=%d",
+        // ampr_real_sceKernelOpen() calls the real libkernel slot directly, so
+        // failures remain in the SCE_KERNEL_ERROR_* domain. Keep rawRc intact for
+        // diagnostics and derive POSIX errno only for local classification.
+        const int openErrno = fd < 0 ? ampr_posix_errno_from_sce(fd) : 0;
+        const bool openPressure =
+            fd < 0 && ampr_posix_errno_is_fd_open_pressure(openErrno);
+        AMPR_TLOGF("apr.reactor.acquire.direct.leave job=0x%llx fileId=%u mode=%s fd=%d rawRc=0x%x errno=%d pressure=%u",
                   (unsigned long long)jobId,
                   rd.fileId,
                   directMode,
                   fd,
-                  openErrno);
-        if (fd < 0 && openErrno == EMFILE) {
+                  fd,
+                  openErrno,
+                  openPressure ? 1u : 0u);
+        if (openPressure) {
 #if AMPR_EMU_DEBUG_LOG
-            g_apr_direct_emfile_events.fetch_add(1, std::memory_order_relaxed);
+            if (openErrno == EMFILE) {
+                g_apr_direct_emfile_events.fetch_add(1, std::memory_order_relaxed);
+            }
 #endif
             const AmprIndexFdCacheStats beforeStats = ampr_index_fd_cache_stats();
             const size_t observedOpen = beforeStats.open + ampr_index_fd_direct_open_count();
             const AmprIndexFdPressureCaps pressureCaps = ampr_index_fd_cache_mark_open_pressure(observedOpen);
-            const size_t closedIdle = ampr_index_fd_cache_release_idle_percent(AMPR_EMU_FD_CACHE_EMFILE_IDLE_CLOSE_PERCENT);
+            const size_t closedIdle = ampr_index_fd_cache_release_idle_percent(
+                AMPR_EMU_FD_CACHE_OPEN_PRESSURE_IDLE_CLOSE_PERCENT);
             const AmprIndexFdCacheStats afterStats = ampr_index_fd_cache_stats();
             (void)pressureCaps;
             (void)closedIdle;
             (void)afterStats;
-            AMPR_LOGF("apr.reactor.acquire.direct.defer-emfile job=0x%llx fileId=%u path=%s mode=%s observedOpen=%zu fdBudget=%zu cacheCap=%zu directCap=%zu closedIdle=%zu cacheBefore=%zu/%zu directBefore=%zu pinned=%zu pins=%zu evictable=%zu cacheAfter=%zu/%zu directAfter=%zu pinnedAfter=%zu pinsAfter=%zu evictableAfter=%zu",
+            AMPR_LOGF("apr.reactor.acquire.direct.defer-pressure job=0x%llx fileId=%u path=%s mode=%s rawRc=0x%x errno=%d observedOpen=%zu fdBudget=%zu cacheCap=%zu closedIdle=%zu cacheBefore=%zu/%zu directBefore=%zu pinned=%zu pins=%zu evictable=%zu cacheAfter=%zu/%zu directAfter=%zu pinnedAfter=%zu pinsAfter=%zu evictableAfter=%zu",
                       (unsigned long long)jobId,
                       rd.fileId,
                       ampr_log_path_arg(directEntry.path),
                       directMode,
+                      fd,
+                      openErrno,
                       observedOpen,
                       pressureCaps.fdBudget,
                       pressureCaps.cacheCap,
-                      pressureCaps.directCap,
                       closedIdle,
                       beforeStats.open,
                       beforeStats.entries,
@@ -501,22 +709,26 @@ static bool apr_acquire_aio_read_desc(uint64_t jobId,
                       afterStats.evictable);
         }
         if (fd < 0) {
-            if (outRc) *outRc = ampr_sce_errno_from_posix(openErrno);
-            if (openErrno != EMFILE) {
-                AMPR_CRITICAL_LOGF("apr.reactor.acquire.fail status=failed job=0x%llx reason=open-direct fileId=%u path=%s mode=%s errno=%d rc=0x%x",
+            if (outRc) {
+                *outRc = ampr_sce_errno_from_posix(openErrno);
+            }
+            if (!openPressure) {
+                AMPR_CRITICAL_LOGF("apr.reactor.acquire.fail status=failed job=0x%llx reason=open-direct fileId=%u path=%s mode=%s rawRc=0x%x errno=%d rc=0x%x",
                           (unsigned long long)jobId,
                           rd.fileId,
                           ampr_log_path_arg(directEntry.path),
                           directMode,
+                          fd,
                           openErrno,
                           outRc ? *outRc : 0);
             }
-            AMPR_FILE_STATUS_LOGF("apr.file.open status=%s reason=direct job=0x%llx fileId=%u path=%s mode=%s errno=%d rc=0x%x",
-                                  openErrno == EMFILE ? "deferred" : "failed",
+            AMPR_FILE_STATUS_LOGF("apr.file.open status=%s reason=direct job=0x%llx fileId=%u path=%s mode=%s rawRc=0x%x errno=%d rc=0x%x",
+                                  openPressure ? "deferred" : "failed",
                                   (unsigned long long)jobId,
                                   rd.fileId,
                                   ampr_log_path_arg(directEntry.path),
                                   directMode,
+                                  fd,
                                   openErrno,
                                   outRc ? *outRc : 0);
             return false;
@@ -556,7 +768,8 @@ static bool apr_acquire_aio_read_desc(uint64_t jobId,
               (unsigned long long)cachedEntry.size);
     if (fd < 0) {
         if (outRc) *outRc = ampr_sce_errno_from_posix(-fd);
-        const bool deferred = fd == -EAGAIN || fd == -EMFILE;
+        const bool deferred =
+            fd == -EAGAIN || fd == -EMFILE || fd == -ENFILE;
         if (!deferred) {
             AMPR_CRITICAL_LOGF("apr.reactor.acquire.fail status=failed job=0x%llx reason=fd fileId=%u path=%s pathKnown=%u fdErr=%d rc=0x%x",
                       (unsigned long long)jobId,
@@ -661,12 +874,34 @@ public:
         job->sourceBuffer = static_cast<const uint8_t*>(j.sourceBuffer);
         job->sourceBytes = j.sourceBytes;
         job->nativeSubmitType = j.nativeSubmitType;
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        const int eagerPlanRc = analyze_eager_native_event_plan(*job);
+        if (eagerPlanRc != 0) {
+            AMPR_VLOGF("apr.reactor.native.fifo.plan.reject job=0x%llx lane=%u commands=%u rc=0x%x maxRecords=%u",
+                       (unsigned long long)job->id,
+                       (unsigned)job->prioIndex,
+                       (unsigned)job->commandCount,
+                       eagerPlanRc,
+                       (unsigned)kAprNativeEventMaxPerJob);
+            release_job_state(job);
+            return eagerPlanRc;
+        }
+#endif
         if (!start_worker()) {
             release_job_state(job);
             return SCE_KERNEL_ERROR_ENOMEM;
         }
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        if (!allocate_eager_native_event_arena(*job)) {
+            release_job_state(job);
+            return SCE_KERNEL_ERROR_ECANCELED;
+        }
+#endif
         [[maybe_unused]] const uint32_t jobSlot = job->poolSlot;
         [[maybe_unused]] const uint8_t laneIndex = job->prioIndex;
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        AmprLockGuard eagerSubmitGuard(eagerNativeSubmitMutex[laneIndex]);
+#endif
         {
             AmprUniqueLock lk(m);
             if (stop || shutdownRequested.load(std::memory_order_acquire)) {
@@ -732,7 +967,17 @@ public:
                         (unsigned)job->syntheticLowerGeneration);
                 }
             }
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+            if (job->eagerNativeEventPlan) {
+                job->eagerNativeEventPreparePending.store(
+                    true, std::memory_order_release);
+            }
+#endif
             if (!add_active_job_locked(job)) {
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+                job->eagerNativeEventPreparePending.store(
+                    false, std::memory_order_relaxed);
+#endif
                 release_unpublished_synthetic_wait_slot_locked(*job);
                 lk.unlock();
                 release_job_state(job);
@@ -745,8 +990,39 @@ public:
                 job->syntheticWaitPublished = true;
                 *outSubmitId = job->syntheticSubmitId;
             }
+        }
+
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        if (job->eagerNativeEventPlan) {
+            const bool eagerSubmitted = submit_eager_native_event_sidecar(*job);
+            {
+                AmprLockGuard lk(m);
+                if (eagerSubmitted) {
+                    link_eager_native_event_job_locked(*job);
+                } else {
+                    // Never mix this lane with the persistent native batch. A
+                    // failed native FIFO submit is a job error; source bytes stay
+                    // untouched and no packet is replayed through another engine.
+                    job->eagerNativeEventPlan = false;
+                    set_fail(*job,
+                             "native-fifo-submit",
+                             SCE_KERNEL_ERROR_EIO,
+                             job->sourceOffset);
+                }
+                job->eagerNativeEventPreparePending.store(
+                    false, std::memory_order_release);
+                reactorWakeEpoch.fetch_add(1u, std::memory_order_release);
+            }
+        } else {
+            AmprLockGuard lk(m);
             reactorWakeEpoch.fetch_add(1u, std::memory_order_release);
         }
+#else
+        {
+            AmprLockGuard lk(m);
+            reactorWakeEpoch.fetch_add(1u, std::memory_order_release);
+        }
+#endif
         reactorCv.notify_one();
         AMPR_VLOGF("apr.reactor.submit job=0x%llx prio=%u lane=%u commands=%u bytes=0x%x mode=cursor-direct jobSlot=%u",
                   (unsigned long long)j.id,
@@ -871,6 +1147,8 @@ private:
         kConfiguredActiveReads < SCE_KERNEL_AIO_ID_NUM_MAX
             ? kConfiguredActiveReads
             : SCE_KERNEL_AIO_ID_NUM_MAX;
+    static_assert(kMaxActiveReads <= SCE_KERNEL_AIO_REQUEST_NUM_MAX,
+                  "APR AIO active window exceeds an SDK request array");
     static constexpr unsigned kBaseActiveReads =
         kConfiguredBaseActiveReads < kMaxActiveReads
             ? kConfiguredBaseActiveReads
@@ -915,36 +1193,30 @@ private:
     static constexpr uint32_t kReadChainPoolCapacity =
         static_cast<uint32_t>(kMaxActiveReads) +
         static_cast<uint32_t>(kPriorityCount) * 2u + 1u;
-    static constexpr size_t kAioPollBatchLimit =
-        AMPR_EMU_APR_AIO_POLL_BATCH_LIMIT != 0
-            ? static_cast<size_t>(AMPR_EMU_APR_AIO_POLL_BATCH_LIMIT)
-            : static_cast<size_t>(kMaxActiveReads);
-    static constexpr size_t kAioRegularPollReserveMax =
-        kAioPollBatchLimit > 1u ? kAioPollBatchLimit - 1u : 0u;
-    static_assert(AMPR_EMU_APR_AIO_POLL_REGULAR_RESERVE >= 0,
-                  "APR AIO regular poll reserve must not be negative");
-    static constexpr size_t kConfiguredAioRegularPollReserve =
-        static_cast<size_t>(AMPR_EMU_APR_AIO_POLL_REGULAR_RESERVE);
-    static constexpr size_t kAioRegularPollReserve =
-        kConfiguredAioRegularPollReserve < kAioRegularPollReserveMax
-            ? kConfiguredAioRegularPollReserve
-            : kAioRegularPollReserveMax;
-    static constexpr size_t kAioHotPollLimit =
-        kAioPollBatchLimit - kAioRegularPollReserve;
+    // One normal SDK array poll can observe every due unique id owned by the
+    // reactor. Deadline filtering still excludes newly submitted/background
+    // requests that are not due; this limit only removes artificial splitting
+    // of the due set across worker passes.
+    static constexpr size_t kAioPollBatchLimit = kMaxActiveReads;
+    static_assert(kAioPollBatchLimit >= 1u,
+                  "APR AIO poll batch must contain at least one SDK id");
     static constexpr uint32_t kAioPollPressureThreshold =
         (static_cast<uint32_t>(kBaseActiveReads) * 3u + 3u) / 4u;
     static_assert(kAioPollPressureThreshold >= 1u &&
                       kAioPollPressureThreshold <= kBaseActiveReads,
                   "APR AIO poll pressure threshold must fit the base window");
-    static constexpr size_t kAioCapacityPollBatchLimit =
+    static constexpr size_t kConfiguredAioCapacityPollBatchLimit =
         AMPR_EMU_APR_AIO_CAPACITY_POLL_BATCH_LIMIT != 0
             ? static_cast<size_t>(AMPR_EMU_APR_AIO_CAPACITY_POLL_BATCH_LIMIT)
             : 1u;
+    static constexpr size_t kAioCapacityPollBatchLimit =
+        kConfiguredAioCapacityPollBatchLimit < kAioPollBatchLimit
+            ? kConfiguredAioCapacityPollBatchLimit
+            : kAioPollBatchLimit;
     static_assert(AMPR_EMU_APR_AIO_CAPACITY_POLL_INTERVAL_NS > 0,
                   "APR AIO capacity poll interval must be non-zero");
-    static_assert(kAioCapacityPollBatchLimit >= 1u &&
-                      kAioCapacityPollBatchLimit <= kMaxActiveReads,
-                  "APR AIO capacity poll batch must fit the active window");
+    static_assert(kAioCapacityPollBatchLimit >= 1u,
+                  "APR AIO capacity poll batch must contain at least one SDK id");
     static constexpr uint32_t kHotPollQueueCapacity =
         static_cast<uint32_t>(kMaxActiveReads * 2u);
     // Sequence completion is a reorder bitmap, not a pending-read queue. Keep
@@ -1118,6 +1390,7 @@ private:
     enum class NativeMicroEngine : uint8_t {
         None,
         AprBatch,
+        Apr,
         Amm,
     };
 
@@ -1153,6 +1426,14 @@ private:
         uint32_t deferredReleaseBufferIndex{};
         uint32_t deferredReleaseGroupIndex{};
         NativeBatchState buffers[kAprNativeBatchBufferCountPerLane]{};
+    };
+
+    struct EagerNativeArenaAllocation {
+        uint32_t offset{};
+        uint32_t reservedBytes{};
+        uint32_t next{UINT32_MAX};
+        bool active{};
+        bool released{};
     };
 
     struct GatherScatterState {
@@ -1205,6 +1486,7 @@ private:
         uint32_t crossEopFenceCount{};
         uint32_t crossEopDeferredErrorOffset{UINT32_MAX};
         int crossEopDeferredErrorRc{};
+        int crossEopDeferredBackendRc{};
         const char* crossEopDeferredErrorReason{};
         bool crossEopScanActive{};
         uint64_t crossEopFenceReadSequences[
@@ -1218,9 +1500,31 @@ private:
         volatile uint64_t* nativeCompletionAddress{};
         uint64_t nativeSubmitTimeNs{};
         NativeMicroEngine nativeMicroEngine{NativeMicroEngine::None};
+        SceAprSubmitId nativeMicroSubmitId{};
         uint64_t nativeBatchSequence{};
         uint64_t nativeBatchReleaseReadSequence{};
         bool nativeBatchReleasePending{};
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        uint32_t eagerNativeArenaAllocation{UINT32_MAX};
+        uint32_t eagerNativeArenaOffset{};
+        uint32_t eagerNativeArenaBytes{};
+        uint32_t eagerNativeEventProgressOffset{};
+        uint32_t eagerNativeEventFirstSourceOffset{};
+        uint32_t eagerNativeEventCount{};
+        uint32_t eagerNativeEventCursor{};
+        uint32_t eagerNativeEventReleaseCursor{};
+        uint32_t eagerNativeEventCommandBytes{};
+        SceAprSubmitId eagerNativeEventSubmitId{};
+        uint64_t eagerNativeEventFirstToken{};
+        uint64_t eagerNativeCounterWaitTarget{};
+        uint64_t eagerNativeEventLastReleaseNs{};
+        uint64_t eagerNativeEventLastWatchdogNs{};
+        bool eagerNativeEventPlan{};
+        std::atomic<bool> eagerNativeEventPreparePending{false};
+        bool eagerNativeEventQueueLinked{};
+        bool eagerNativeEventAllReleased{};
+        JobState* eagerNativeEventQueueNext{};
+#endif
         uint32_t nativeSourceOffset{};
         OpType nativeSourceType{OpType::Nop};
         SceAprSubmitId syntheticSubmitId{};
@@ -1332,6 +1636,23 @@ private:
 #else
             false;
 #endif
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        if (job->eagerNativeEventPreparePending.load(std::memory_order_acquire) ||
+            job->eagerNativeEventQueueLinked ||
+            job->eagerNativeEventSubmitId != 0 ||
+            job->nativeMicroSubmitId != 0) {
+            AMPR_CRITICAL_LOGF("apr.reactor.job.pool.releaseWithEagerNative job=0x%llx prepare=%u linked=%u submitId=0x%x microSubmitId=0x%x nativeSubmitted=%u engine=%u",
+                               (unsigned long long)job->id,
+                               job->eagerNativeEventPreparePending.load(std::memory_order_relaxed) ? 1u : 0u,
+                               job->eagerNativeEventQueueLinked ? 1u : 0u,
+                               job->eagerNativeEventSubmitId,
+                               job->nativeMicroSubmitId,
+                               job->nativeSubmitted.load(std::memory_order_relaxed) ? 1u : 0u,
+                               (unsigned)job->nativeMicroEngine);
+            ampr_debug_int3_trap();
+        }
+        release_eager_native_event_arena(*job);
+#endif
         if (job->activeReadCount != 0 || job->cursorReadChain != nullptr ||
             hasSpeculativeRead) {
             AMPR_CRITICAL_LOGF("apr.reactor.job.pool.releaseWithReads job=0x%llx active=%u cursor=%u speculative=%u",
@@ -1385,6 +1706,196 @@ private:
         return nullptr;
     }
 
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+    uint8_t* eager_native_event_commands(const JobState& job) const {
+        if (job.eagerNativeArenaAllocation >=
+                kAprNativeEventArenaAllocationCount ||
+            job.eagerNativeArenaBytes == 0 ||
+            job.eagerNativeArenaOffset > kAprNativeEventArenaBytes ||
+            job.eagerNativeArenaBytes >
+                kAprNativeEventArenaBytes - job.eagerNativeArenaOffset) {
+            return nullptr;
+        }
+        return g_apr_native_event_arena + job.eagerNativeArenaOffset;
+    }
+
+    volatile uint64_t* eager_native_event_progress(const JobState& job) const {
+        uint8_t* const commands = eager_native_event_commands(job);
+        if (!commands || job.eagerNativeEventProgressOffset >
+                             job.eagerNativeArenaBytes - sizeof(uint64_t)) {
+            return nullptr;
+        }
+        return reinterpret_cast<volatile uint64_t*>(
+            commands + job.eagerNativeEventProgressOffset);
+    }
+
+    bool allocate_eager_native_event_arena(JobState& job) {
+        if (!job.eagerNativeEventPlan) {
+            return true;
+        }
+        if (job.eagerNativeArenaAllocation != UINT32_MAX ||
+            job.eagerNativeArenaBytes == 0 ||
+            job.eagerNativeArenaBytes > kAprNativeEventArenaBytes) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.arena.allocate-invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        bool loggedWait = false;
+        for (;;) {
+            {
+                AmprSpinLock lock(&eagerNativeArenaLock);
+                if (eagerNativeArenaUsedBytes > kAprNativeEventArenaBytes ||
+                    eagerNativeArenaReadOffset >= kAprNativeEventArenaBytes ||
+                    eagerNativeArenaWriteOffset >= kAprNativeEventArenaBytes ||
+                    (eagerNativeArenaFreeHead != UINT32_MAX &&
+                     eagerNativeArenaFreeHead >=
+                         kAprNativeEventArenaAllocationCount) ||
+                    (eagerNativeArenaQueueHead != UINT32_MAX &&
+                     eagerNativeArenaQueueHead >=
+                         kAprNativeEventArenaAllocationCount) ||
+                    (eagerNativeArenaQueueTail != UINT32_MAX &&
+                     eagerNativeArenaQueueTail >=
+                         kAprNativeEventArenaAllocationCount) ||
+                    ((eagerNativeArenaQueueHead == UINT32_MAX) !=
+                     (eagerNativeArenaQueueTail == UINT32_MAX))) {
+                    AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.arena.state-corrupt file=%s line=%d", __FILE__, __LINE__);
+                    std::abort();
+                }
+                const uint32_t allocationIndex = eagerNativeArenaFreeHead;
+                const uint32_t requestBytes = job.eagerNativeArenaBytes;
+                const uint32_t freeBytes = kAprNativeEventArenaBytes -
+                    eagerNativeArenaUsedBytes;
+                const AprNativeEventArenaPlacement placement =
+                    allocationIndex < kAprNativeEventArenaAllocationCount
+                        ? apr_native_event_arena_placement(
+                              kAprNativeEventArenaBytes,
+                              eagerNativeArenaReadOffset,
+                              eagerNativeArenaWriteOffset,
+                              eagerNativeArenaUsedBytes,
+                              requestBytes)
+                        : AprNativeEventArenaPlacement{};
+                if (placement.offset != UINT32_MAX) {
+                    EagerNativeArenaAllocation& allocation =
+                        eagerNativeArenaAllocations[allocationIndex];
+                    if (allocation.active) {
+                        AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.arena.active-free file=%s line=%d", __FILE__, __LINE__);
+                        std::abort();
+                    }
+                    if (allocation.next != UINT32_MAX &&
+                        allocation.next >=
+                            kAprNativeEventArenaAllocationCount) {
+                        AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.arena.free-corrupt file=%s line=%d", __FILE__, __LINE__);
+                        std::abort();
+                    }
+                    eagerNativeArenaFreeHead = allocation.next;
+                    allocation.offset = placement.offset;
+                    allocation.reservedBytes = placement.reservedBytes;
+                    allocation.next = UINT32_MAX;
+                    allocation.active = true;
+                    allocation.released = false;
+                    if (eagerNativeArenaQueueTail <
+                        kAprNativeEventArenaAllocationCount) {
+                        eagerNativeArenaAllocations[
+                            eagerNativeArenaQueueTail].next = allocationIndex;
+                    } else {
+                        eagerNativeArenaQueueHead = allocationIndex;
+                    }
+                    eagerNativeArenaQueueTail = allocationIndex;
+                    eagerNativeArenaWriteOffset =
+                        (placement.offset + requestBytes) %
+                        kAprNativeEventArenaBytes;
+                    if (placement.reservedBytes > freeBytes) {
+                        AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.arena.reserve-overflow file=%s line=%d", __FILE__, __LINE__);
+                        std::abort();
+                    }
+                    eagerNativeArenaUsedBytes += placement.reservedBytes;
+                    job.eagerNativeArenaAllocation = allocationIndex;
+                    job.eagerNativeArenaOffset = placement.offset;
+                    if (loggedWait) {
+                        AMPR_VLOGF("apr.reactor.native.fifo.arena.resumed allocation=%u offset=0x%x bytes=0x%x used=0x%x capacity=0x%x",
+                                   allocationIndex,
+                                   placement.offset,
+                                   requestBytes,
+                                   eagerNativeArenaUsedBytes,
+                                   kAprNativeEventArenaBytes);
+                    }
+                    return true;
+                }
+            }
+            {
+                AmprLockGuard lk(m);
+                if (stop || shutdownRequested.load(std::memory_order_acquire)) {
+                    return false;
+                }
+            }
+            if (!loggedWait) {
+                AMPR_VLOGF("apr.reactor.native.fifo.arena.wait bytes=0x%x capacity=0x%x descriptors=%u",
+                           job.eagerNativeArenaBytes,
+                           kAprNativeEventArenaBytes,
+                           kAprNativeEventArenaAllocationCount);
+                loggedWait = true;
+            }
+            timespec ts{0, 100000};
+            (void)::sceKernelNanosleep(&ts, nullptr);
+        }
+    }
+
+    void release_eager_native_event_arena(JobState& job) noexcept {
+        const uint32_t allocationIndex = job.eagerNativeArenaAllocation;
+        if (allocationIndex == UINT32_MAX) {
+            return;
+        }
+        if (allocationIndex >= kAprNativeEventArenaAllocationCount) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.arena.release-invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        const uint32_t allocationOffset = job.eagerNativeArenaOffset;
+        AmprSpinLock lock(&eagerNativeArenaLock);
+        EagerNativeArenaAllocation& released =
+            eagerNativeArenaAllocations[allocationIndex];
+        if (!released.active || released.released ||
+            released.offset != allocationOffset) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.arena.double-free file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        released.released = true;
+        while (eagerNativeArenaQueueHead <
+               kAprNativeEventArenaAllocationCount) {
+            const uint32_t headIndex = eagerNativeArenaQueueHead;
+            EagerNativeArenaAllocation& head =
+                eagerNativeArenaAllocations[headIndex];
+            if (!head.active || head.reservedBytes == 0 ||
+                head.reservedBytes > eagerNativeArenaUsedBytes) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.arena.queue-corrupt file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            if (!head.released) {
+                break;
+            }
+            eagerNativeArenaReadOffset =
+                (eagerNativeArenaReadOffset + head.reservedBytes) %
+                kAprNativeEventArenaBytes;
+            eagerNativeArenaUsedBytes -= head.reservedBytes;
+            eagerNativeArenaQueueHead = head.next;
+            if (eagerNativeArenaQueueHead == UINT32_MAX) {
+                eagerNativeArenaQueueTail = UINT32_MAX;
+                eagerNativeArenaReadOffset = eagerNativeArenaWriteOffset;
+            }
+            head = {};
+            head.next = eagerNativeArenaFreeHead;
+            eagerNativeArenaFreeHead = headIndex;
+        }
+        if (eagerNativeArenaQueueHead == UINT32_MAX &&
+            eagerNativeArenaUsedBytes != 0) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.arena.reclaim-corrupt file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        job.eagerNativeArenaAllocation = UINT32_MAX;
+        job.eagerNativeArenaOffset = 0;
+        job.eagerNativeArenaBytes = 0;
+        job.eagerNativeEventProgressOffset = 0;
+    }
+#endif
+
     struct ActiveRead {
         JobPtr job;
         AprAioReadDesc desc;
@@ -1415,12 +1926,25 @@ private:
         uint32_t jobPrevSlot{UINT32_MAX};
         uint32_t jobNextSlot{UINT32_MAX};
         bool hotPollQueued{false};
+        bool awaitingBatchSubmit{false};
         bool awaitingResubmit{false};
     };
 
-    struct HotPollEntry {
+    struct ActiveReadRef {
         uint32_t slot{UINT32_MAX};
         uint32_t generation{};
+    };
+
+    struct AioSubmitBatch {
+        SceKernelAioRWRequest requests[kMaxActiveReads]{};
+        SceKernelAioSubmitId ids[kMaxActiveReads]{};
+        ActiveReadRef items[kMaxActiveReads]{};
+        size_t count{};
+        int aioPriority{SCE_KERNEL_AIO_PRIORITY_MID};
+    };
+
+    struct AioSubmitRound {
+        AioSubmitBatch batches[3]{};
     };
 
     class ActiveReadList {
@@ -1763,24 +2287,25 @@ private:
     }
 
     static bool active_read_is_submitted(const ActiveRead& active) {
-        return !active.awaitingResubmit && active.aioId >= 0;
+        return !active.awaitingBatchSubmit &&
+               !active.awaitingResubmit &&
+               active.aioId >= 0;
     }
 
     void mark_active_read_submitted(ActiveRead& active,
                                     SceKernelAioSubmitId aioId) {
-        if (aioId < 0 || active_read_is_submitted(active)) {
+        if (aioId < 0 || active_read_is_submitted(active) ||
+            !active.awaitingBatchSubmit || active.aioId >= 0) {
             AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.submit.invalid file=%s line=%d", __FILE__, __LINE__);
             std::abort();
         }
+        active.awaitingBatchSubmit = false;
         if (active.awaitingResubmit) {
             if (deferredActiveReadCount == 0) {
                 AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.deferred.underflow file=%s line=%d", __FILE__, __LINE__);
                 std::abort();
             }
             --deferredActiveReadCount;
-        } else if (active.aioId >= 0) {
-            AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.untracked.invalid file=%s line=%d", __FILE__, __LINE__);
-            std::abort();
         }
         if (submittedActiveReadCount >= kMaxActiveReads) {
             AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.submitted.overflow file=%s line=%d", __FILE__, __LINE__);
@@ -1814,11 +2339,17 @@ private:
             }
             --submittedActiveReadCount;
         } else if (it->awaitingResubmit) {
-            if (it->aioId >= 0 || deferredActiveReadCount == 0) {
+            if (it->aioId >= 0 || it->awaitingBatchSubmit ||
+                deferredActiveReadCount == 0) {
                 AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.deferred.erase.invalid file=%s line=%d", __FILE__, __LINE__);
                 std::abort();
             }
             --deferredActiveReadCount;
+        } else if (it->awaitingBatchSubmit) {
+            if (it->aioId >= 0) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.batch-submit.erase.invalid file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
         } else if (it->aioId >= 0) {
             AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.erase.state.invalid file=%s line=%d", __FILE__, __LINE__);
             std::abort();
@@ -2036,9 +2567,11 @@ private:
         return initRc;
     }
 
-    void note_aio_submit_result(int sceRc) {
+    void note_aio_submit_result(int sceRc, size_t requestCount) {
         if (sceRc == SCE_KERNEL_ERROR_EAGAIN) {
-            aioSubmitEagainCount.fetch_add(1u, std::memory_order_relaxed);
+            aioSubmitEagainCount.fetch_add(
+                static_cast<uint64_t>(requestCount),
+                std::memory_order_relaxed);
         }
     }
 
@@ -2820,6 +3353,58 @@ private:
             return false;
         }
 
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        const int eventProtectRc = ampr_real_sceKernelMprotect(
+            g_apr_native_event_arena,
+            kAprNativeEventArenaBytes,
+            kNativeMicroProt);
+        if (eventProtectRc != 0) {
+            AMPR_CRITICAL_LOGF("apr.reactor.native.event.protect.fail rc=0x%x ptr=%p size=0x%llx prot=0x%x",
+                               eventProtectRc,
+                               g_apr_native_event_arena,
+                               (unsigned long long)kAprNativeEventArenaBytes,
+                               kNativeMicroProt);
+            AmprSpinLock lock(&nativeExecutionPoolLock);
+            nativeExecutionPoolInitAttempted = false;
+            return false;
+        }
+
+        const int eventResultProtectRc = ampr_real_sceKernelMprotect(
+            g_apr_native_event_result_pool,
+            kAprNativeEventResultPoolBytes,
+            kNativeMicroProt);
+        if (eventResultProtectRc != 0) {
+            AMPR_CRITICAL_LOGF("apr.reactor.native.event.result.protect.fail rc=0x%x ptr=%p size=0x%llx prot=0x%x",
+                               eventResultProtectRc,
+                               g_apr_native_event_result_pool,
+                               (unsigned long long)kAprNativeEventResultPoolBytes,
+                               kNativeMicroProt);
+            AmprSpinLock lock(&nativeExecutionPoolLock);
+            nativeExecutionPoolInitAttempted = false;
+            return false;
+        }
+
+        const int eventControlProtectRc = ampr_real_sceKernelMprotect(
+            g_apr_native_event_control_pool,
+            kAprNativeEventControlPoolBytes,
+            kNativeMicroProt);
+        if (eventControlProtectRc != 0) {
+            AMPR_CRITICAL_LOGF("apr.reactor.native.event.control.protect.fail rc=0x%x ptr=%p size=0x%llx prot=0x%x",
+                               eventControlProtectRc,
+                               g_apr_native_event_control_pool,
+                               (unsigned long long)kAprNativeEventControlPoolBytes,
+                               kNativeMicroProt);
+            AmprSpinLock lock(&nativeExecutionPoolLock);
+            nativeExecutionPoolInitAttempted = false;
+            return false;
+        }
+        for (uint32_t lane = 0; lane < kPriorityCount; ++lane) {
+            volatile uint64_t* const release =
+                apr_native_event_lane_release_ptr(lane);
+            __atomic_store_n(release, 0ull, __ATOMIC_RELAXED);
+        }
+#endif
+
         const int batchProtectRc = ampr_real_sceKernelMprotect(
             g_apr_native_batch_pool,
             kAprNativeBatchPoolBytes,
@@ -2844,6 +3429,22 @@ private:
                 reinterpret_cast<uintptr_t>(apr_native_batch_release_ptr(*firstBatchSlot));
             const uintptr_t progressAddress =
                 reinterpret_cast<uintptr_t>(apr_native_batch_progress_ptr(*firstBatchSlot));
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+            AMPR_KLOGF("apr.reactor.native.pool.mapped micro=%p microBytes=0x%llx eventArena=%p eventArenaBytes=0x%llx eventResult=%p eventResultBytes=0x%llx eventControl=%p eventControlBytes=0x%llx batch=%p batchBytes=0x%llx firstReleaseOff=0x%llx firstProgressOff=0x%llx prot=0x%x",
+                       g_apr_native_micro_pool,
+                       (unsigned long long)kAprNativeMicroPoolBytes,
+                       g_apr_native_event_arena,
+                       (unsigned long long)kAprNativeEventArenaBytes,
+                       g_apr_native_event_result_pool,
+                       (unsigned long long)kAprNativeEventResultPoolBytes,
+                       g_apr_native_event_control_pool,
+                       (unsigned long long)kAprNativeEventControlPoolBytes,
+                       g_apr_native_batch_pool,
+                       (unsigned long long)kAprNativeBatchPoolBytes,
+                       (unsigned long long)(releaseAddress - batchBase),
+                       (unsigned long long)(progressAddress - batchBase),
+                       kNativeMicroProt);
+#else
             AMPR_KLOGF("apr.reactor.native.pool.mapped micro=%p microBytes=0x%llx batch=%p batchBytes=0x%llx firstReleaseOff=0x%llx firstProgressOff=0x%llx prot=0x%x",
                        g_apr_native_micro_pool,
                        (unsigned long long)kAprNativeMicroPoolBytes,
@@ -2852,12 +3453,31 @@ private:
                        (unsigned long long)(releaseAddress - batchBase),
                        (unsigned long long)(progressAddress - batchBase),
                        kNativeMicroProt);
+#endif
         }
 
         {
             AmprSpinLock lock(&nativeExecutionPoolLock);
             nativeExecutionPoolReady = true;
         }
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        AMPR_VLOGF("apr.reactor.native.pool.ready microBase=%p microBytes=0x%llx microSlots=%u eventArena=%p eventArenaBytes=0x%llx eventResult=%p eventResultBytes=0x%llx eventAllocations=%u eventControl=%p eventControlBytes=0x%llx batchBase=%p batchBytes=0x%llx batchSlots=%u batchBlocks=%u prot=0x%x microTemplates=lazy",
+                   g_apr_native_micro_pool,
+                   (unsigned long long)kAprNativeMicroPoolBytes,
+                   (unsigned)kJobStatePoolCapacity,
+                   g_apr_native_event_arena,
+                   (unsigned long long)kAprNativeEventArenaBytes,
+                   g_apr_native_event_result_pool,
+                   (unsigned long long)kAprNativeEventResultPoolBytes,
+                   (unsigned)kAprNativeEventArenaAllocationCount,
+                   g_apr_native_event_control_pool,
+                   (unsigned long long)kAprNativeEventControlPoolBytes,
+                   g_apr_native_batch_pool,
+                   (unsigned long long)kAprNativeBatchPoolBytes,
+                   (unsigned)kAprNativeBatchSlotCount,
+                   (unsigned)kAprNativeBatchGroupCount,
+                   kNativeMicroProt);
+#else
         AMPR_VLOGF("apr.reactor.native.pool.ready microBase=%p microBytes=0x%llx microSlots=%u batchBase=%p batchBytes=0x%llx batchSlots=%u batchBlocks=%u prot=0x%x microTemplates=lazy",
                    g_apr_native_micro_pool,
                    (unsigned long long)kAprNativeMicroPoolBytes,
@@ -2867,6 +3487,7 @@ private:
                    (unsigned)kAprNativeBatchSlotCount,
                    (unsigned)kAprNativeBatchGroupCount,
                    kNativeMicroProt);
+#endif
         return true;
     }
 
@@ -3241,10 +3862,6 @@ private:
         }
     }
 
-    void note_aio_poll_budget_yield() {
-        note_log_counter(runtimeAioPollBudgetYields);
-    }
-
     void note_aio_driven_wait(uint64_t waitNs) {
         if (collect_log_stats()) {
             runtimeAioDrivenWaitNs += waitNs;
@@ -3387,7 +4004,7 @@ private:
     void log_aio_efault_detail(const ActiveRead& active,
                                int rc,
                                int state,
-                               int deleteRc,
+                               int deleteSceRc,
                                uint32_t errorOff,
                                uint64_t finishTimeNs) const {
         log_aio_buffer_memory_detail("apr.reactor.aio.bufVa",
@@ -3413,7 +4030,7 @@ private:
                   rc,
                   state,
                   (unsigned long long)active.result.returnValue,
-                  apr_aio_api_rc_to_sce(deleteRc),
+                  deleteSceRc,
                   active.desc.fileId,
                   pathArg,
                   active.desc.fd,
@@ -3483,6 +4100,8 @@ private:
         AioAdmissionSnapshot snapshot{};
         uint64_t laneNowNs{};
         uint32_t effectiveLimit{};
+        size_t directFdCap{};
+        bool fdPressure{};
         bool initialized{};
         bool laneNowValid{};
         bool current{};
@@ -3768,6 +4387,11 @@ private:
         update_aio_age_throttle(now, context.snapshot);
         context.effectiveLimit =
             aio_effective_read_limit(now, context.snapshot);
+        context.fdPressure = fd_pressure_active(now);
+        context.directFdCap = apr_adaptive_direct_fd_cap(
+            ampr_index_fd_pressure_current_caps(),
+            context.effectiveLimit,
+            context.fdPressure);
         context.current = true;
     }
 
@@ -3810,7 +4434,8 @@ private:
         return false;
     }
 
-    bool fd_budget_available_for_read(const AprAioReadDesc& rd) const {
+    bool fd_budget_available_for_read(const AprAioReadDesc& rd,
+                                      size_t directFdCap) const {
         if (rd.fd >= 0) {
             return true;
         }
@@ -3819,7 +4444,16 @@ private:
             // ampr_index_acquire_cached_fd under the fd-cache lock.
             return true;
         }
-        return ampr_index_fd_common_open_budget_headroom_available(1);
+        const AmprIndexFdPressureCaps caps = ampr_index_fd_pressure_current_caps();
+        const size_t directOpen = ampr_index_fd_direct_open_count();
+        if (directFdCap != 0 && directOpen + 1u > directFdCap) {
+            return false;
+        }
+        const size_t requestedReserve =
+            1u + static_cast<size_t>(AMPR_EMU_FD_DIRECT_OPEN_SAFETY_RESERVE);
+        const size_t reserve =
+            requestedReserve < caps.fdBudget ? requestedReserve : caps.fdBudget;
+        return ampr_index_fd_common_open_budget_headroom_available(reserve);
     }
 
     static uint64_t active_read_age_ns(const ActiveRead& active, uint64_t now) {
@@ -3845,7 +4479,7 @@ private:
         if (hotPollQueueCount >= kHotPollQueueCapacity) {
             return;
         }
-        hotPollQueue[hotPollQueueTail] = HotPollEntry{active.listSlot, active.listGeneration};
+        hotPollQueue[hotPollQueueTail] = ActiveReadRef{active.listSlot, active.listGeneration};
         hotPollQueueTail = (hotPollQueueTail + 1u) % kHotPollQueueCapacity;
         ++hotPollQueueCount;
         active.hotPollQueued = true;
@@ -3858,7 +4492,7 @@ private:
 
     ActiveReadIt pop_hot_active_read_poll() {
         while (hotPollQueueCount != 0) {
-            const HotPollEntry entry = hotPollQueue[hotPollQueueHead];
+            const ActiveReadRef entry = hotPollQueue[hotPollQueueHead];
             hotPollQueueHead = (hotPollQueueHead + 1u) % kHotPollQueueCapacity;
             --hotPollQueueCount;
             ActiveRead* active = activeReads.active_at_slot(entry.slot, entry.generation);
@@ -4117,27 +4751,8 @@ private:
         if (activeReads.empty()) {
             return 0;
         }
-        if (aioPollBudgetCooldownUntilNs != 0 &&
-            now < aioPollBudgetCooldownUntilNs) {
-            return aioPollBudgetCooldownUntilNs - now;
-        }
         const uint64_t deadlineNs = active_poll_deadline_ns();
         return deadlineNs != 0 && deadlineNs > now ? deadlineNs - now : 0;
-    }
-
-    bool aio_poll_budget_cooldown_active(uint64_t now) const {
-        return aioPollBudgetCooldownUntilNs != 0 &&
-               now < aioPollBudgetCooldownUntilNs;
-    }
-
-    void arm_aio_poll_budget_cooldown(uint64_t now) {
-        aioPollBudgetCooldownUntilNs =
-            now + static_cast<uint64_t>(
-                      AMPR_EMU_APR_AIO_POLL_BUDGET_COOLDOWN_NS);
-    }
-
-    void clear_aio_poll_budget_cooldown() {
-        aioPollBudgetCooldownUntilNs = 0;
     }
 
 
@@ -4255,7 +4870,7 @@ private:
     }
 #endif
 
-    void set_fail(JobState& job, [[maybe_unused]] const char* reason, int rc, uint32_t errorOffset) {
+    void set_fail(JobState& job, [[maybe_unused]] const char* reason, int rc, uint32_t errorOffset, int backendRc = 0) {
         if (job.failed.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
@@ -4264,25 +4879,27 @@ private:
         clear_cursor_read_wait_hint(job.prioIndex);
         finish_job_processing(job);
         abandon_job_cursor_read_chains(job);
-        AMPR_CRITICAL_LOGF("apr.reactor.fail job=0x%llx reason=%s rc=0x%x errorOffset=0x%x cursorRead=%u active=%u",
+        AMPR_CRITICAL_LOGF("apr.reactor.fail job=0x%llx reason=%s rc=0x%x backendRc=0x%x errorOffset=0x%x cursorRead=%u active=%u",
                   (unsigned long long)job.id,
                   reason ? reason : "unknown",
                   job.result.rc,
+                  backendRc,
                   job.result.errorOffset,
                   job.cursorReadChain != nullptr ? 1u : 0u,
                   job.activeReadCount);
     }
 
-    void set_command_error(JobState& job, const char* reason, int rc, uint32_t errorOffset) {
+    void set_command_error(JobState& job, const char* reason, int rc, uint32_t errorOffset, int backendRc = 0) {
         if (job_failed(job) || job.hasCommandError) {
             return;
         }
         job.hasCommandError = true;
-        set_fail(job, reason, rc, errorOffset);
-        AMPR_CRITICAL_LOGF("apr.reactor.command.error job=0x%llx reason=%s rc=0x%x errorOffset=0x%x active=%u action=stop-cursor",
+        set_fail(job, reason, rc, errorOffset, backendRc);
+        AMPR_CRITICAL_LOGF("apr.reactor.command.error job=0x%llx reason=%s rc=0x%x backendRc=0x%x errorOffset=0x%x active=%u action=stop-cursor",
                   (unsigned long long)job.id,
                   reason ? reason : "unknown",
                   job.result.rc,
+                  backendRc,
                   job.result.errorOffset,
                   job.activeReadCount);
     }
@@ -4291,7 +4908,8 @@ private:
     bool set_or_defer_read_command_error(JobState& job,
                                          const char* reason,
                                          int rc,
-                                         uint32_t errorOffset) {
+                                         uint32_t errorOffset,
+                                         int backendRc = 0) {
 #if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
         if (!job_failed(job) && job.crossEopScanActive &&
             errorOffset > job.sourceOffset &&
@@ -4300,19 +4918,21 @@ private:
                 errorOffset < job.crossEopDeferredErrorOffset) {
                 job.crossEopDeferredErrorOffset = errorOffset;
                 job.crossEopDeferredErrorRc = rc;
+                job.crossEopDeferredBackendRc = backendRc;
                 job.crossEopDeferredErrorReason = reason;
                 drop_unsubmitted_cross_eop_suffix(job, errorOffset);
-                AMPR_CRITICAL_LOGF("apr.reactor.crossEop.error.defer job=0x%llx sourceOffset=0x%x errorOffset=0x%x rc=0x%x reason=%s",
+                AMPR_CRITICAL_LOGF("apr.reactor.crossEop.error.defer job=0x%llx sourceOffset=0x%x errorOffset=0x%x rc=0x%x backendRc=0x%x reason=%s",
                                    (unsigned long long)job.id,
                                    job.sourceOffset,
                                    errorOffset,
                                    rc,
+                                   backendRc,
                                    reason ? reason : "unknown");
             }
             return true;
         }
 #endif
-        set_command_error(job, reason, rc, errorOffset);
+        set_command_error(job, reason, rc, errorOffset, backendRc);
         return false;
     }
 
@@ -4324,14 +4944,17 @@ private:
         }
         const uint32_t errorOffset = job.crossEopDeferredErrorOffset;
         const int rc = job.crossEopDeferredErrorRc;
+        const int backendRc = job.crossEopDeferredBackendRc;
         const char* const reason = job.crossEopDeferredErrorReason;
         job.crossEopDeferredErrorOffset = UINT32_MAX;
         job.crossEopDeferredErrorRc = 0;
+        job.crossEopDeferredBackendRc = 0;
         job.crossEopDeferredErrorReason = nullptr;
         set_command_error(job,
                           reason ? reason : "cross-eop-read",
                           rc,
-                          errorOffset);
+                          errorOffset,
+                          backendRc);
         return true;
 #else
         (void)job;
@@ -4726,9 +5349,9 @@ private:
 #endif
     }
 
-    void note_aio_admission_accepted(AioAdmissionContext& context,
-                                     const ActiveRead& active,
-                                     uint64_t submitTimeNs) {
+    void reserve_staged_aio_admission(AioAdmissionContext& context,
+                                      const ActiveRead& active,
+                                      uint64_t stageTimeNs) {
         if (!context.initialized || !context.current) {
             AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.admission.context.uninitialized file=%s line=%d", __FILE__, __LINE__);
             std::abort();
@@ -4742,22 +5365,21 @@ private:
                 read_group_for_priority(active.job->prioIndex);
             ++context.snapshot.groupActive[read_group_index(group)];
         }
-        if (submitTimeNs != 0 &&
+        if (stageTimeNs != 0 &&
             (context.snapshot.oldestSubmittedTimeNs == 0 ||
-             submitTimeNs < context.snapshot.oldestSubmittedTimeNs)) {
-            context.snapshot.oldestSubmittedTimeNs = submitTimeNs;
+             stageTimeNs < context.snapshot.oldestSubmittedTimeNs)) {
+            context.snapshot.oldestSubmittedTimeNs = stageTimeNs;
         }
-        context.laneNowNs = submitTimeNs;
+        context.laneNowNs = stageTimeNs;
         context.laneNowValid = true;
-        refresh_aio_snapshot_age(context.snapshot, submitTimeNs);
-        update_aio_age_throttle(submitTimeNs, context.snapshot);
+        refresh_aio_snapshot_age(context.snapshot, stageTimeNs);
+        update_aio_age_throttle(stageTimeNs, context.snapshot);
         context.effectiveLimit =
-            aio_effective_read_limit(submitTimeNs, context.snapshot);
+            aio_effective_read_limit(stageTimeNs, context.snapshot);
     }
 
     enum class DirectReadSubmitResult : uint8_t {
-        Deferred,
-        Submitted,
+        Pending,
         Failed,
     };
 
@@ -4766,6 +5388,7 @@ private:
         const char* errorReason{};
         int errorRc{};
         uint32_t errorOffset{};
+        int backendRc{};
 
         bool has_error() const {
             return errorReason != nullptr;
@@ -4778,9 +5401,6 @@ private:
                                          uint64_t nowNs,
                                          AioAdmissionContext& context) {
         prepare_aio_admission_context(context, nowNs);
-        // This call also synchronizes process-wide open-pressure generation and
-        // restores normal FD/cache caps when the cooldown expires.
-        (void)fd_pressure_active(nowNs);
         const uint32_t limit = context.effectiveLimit;
         const size_t activeCount = context.snapshot.activeCount;
         if (activeCount >= limit) {
@@ -4802,15 +5422,309 @@ private:
             !aio_desc_is_small_for_boost(sliceDesc)) {
             return false;
         }
-        return fd_budget_available_for_read(ownerDesc);
+        return fd_budget_available_for_read(ownerDesc, context.directFdCap);
+    }
+
+    static size_t aio_submit_batch_index(int aioPriority) {
+        if (aioPriority == SCE_KERNEL_AIO_PRIORITY_HIGH) {
+            return 0u;
+        }
+        if (aioPriority == SCE_KERNEL_AIO_PRIORITY_MID) {
+            return 1u;
+        }
+        if (aioPriority == SCE_KERNEL_AIO_PRIORITY_LOW) {
+            return 2u;
+        }
+        AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.batch-priority.invalid file=%s line=%d", __FILE__, __LINE__);
+        std::abort();
+    }
+
+    void begin_aio_submit_round() {
+        for (const AioSubmitBatch& batch : aioSubmitRound.batches) {
+            if (batch.count != 0) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.round.not-empty file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+        }
+        aioSubmitRound.batches[0].aioPriority = SCE_KERNEL_AIO_PRIORITY_HIGH;
+        aioSubmitRound.batches[1].aioPriority = SCE_KERNEL_AIO_PRIORITY_MID;
+        aioSubmitRound.batches[2].aioPriority = SCE_KERNEL_AIO_PRIORITY_LOW;
+    }
+
+    void stage_aio_submit(ActiveRead& active, bool resubmit) {
+        const size_t batchIndex = aio_submit_batch_index(active.aioPrio);
+        AioSubmitBatch& batch = aioSubmitRound.batches[batchIndex];
+        if (batch.count >= kMaxActiveReads || active.aioId >= 0 ||
+            active.awaitingBatchSubmit ||
+            (resubmit != active.awaitingResubmit)) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.stage.invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        const size_t item = batch.count++;
+        batch.requests[item] = active.request;
+        batch.ids[item] = static_cast<SceKernelAioSubmitId>(-1);
+        batch.items[item] = ActiveReadRef{
+            active.listSlot,
+            active.listGeneration,
+        };
+        active.awaitingBatchSubmit = true;
+    }
+
+    void rollback_staged_aio_admission(AioAdmissionContext& admission,
+                                       const ActiveRead& active) {
+        if (!admission.initialized || admission.snapshot.activeCount == 0) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.admission.batch-rollback.invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        --admission.snapshot.activeCount;
+        if (aio_desc_is_small_for_boost(active.desc)) {
+            if (admission.snapshot.smallCount == 0) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.admission.batch-small.underflow file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            --admission.snapshot.smallCount;
+        }
+        if (active.job && active.job->prioIndex < kPriorityCount) {
+            const size_t groupIndex = read_group_index(
+                read_group_for_priority(active.job->prioIndex));
+            if (admission.snapshot.groupActive[groupIndex] == 0) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.admission.batch-group.underflow file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            --admission.snapshot.groupActive[groupIndex];
+        }
+    }
+
+    bool aio_submit_id_is_unique(SceKernelAioSubmitId id,
+                                 const AioSubmitBatch& batch,
+                                 size_t item) const {
+        if (id < 0) {
+            return false;
+        }
+        for (const ActiveRead& active : activeReads) {
+            if (active_read_is_submitted(active) && active.aioId == id) {
+                return false;
+            }
+        }
+        for (size_t prior = 0; prior < item; ++prior) {
+            if (batch.ids[prior] == id) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void detach_staged_read_chain(JobPtr job, ReadChain* chain) {
+        if (!job || !chain) {
+            return;
+        }
+        if (job->cursorReadChain == chain) {
+            job->cursorReadChain = nullptr;
+            return;
+        }
+#if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
+        if (job->crossEopReadChain == chain) {
+            job->crossEopReadChain = nullptr;
+        }
+#endif
+    }
+
+    void accept_aio_submit_item(const ActiveReadRef& item,
+                                SceKernelAioSubmitId aioId,
+                                uint64_t submitTimeNs) {
+        ActiveRead* const active = activeReads.active_at_slot(
+            item.slot, item.generation);
+        if (!active || !active->job || !active->chain ||
+            active->aioPrio < SCE_KERNEL_AIO_PRIORITY_LOW ||
+            active->aioPrio > SCE_KERNEL_AIO_PRIORITY_HIGH) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.accept.stale file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        JobPtr job = active->job;
+        ReadChain* const chain = active->chain;
+        const bool resubmit = active->awaitingResubmit;
+        mark_active_read_submitted(*active, aioId);
+        active->submitTimeNs = submitTimeNs;
+        active->retryNotBeforeNs = 0;
+        active->aioDeleteRetries = 0;
+        active->aioDeleteFirstFailureNs = 0;
+#if AMPR_EMU_DEBUG_LOG
+        active->pollAttempts = 0;
+#endif
+
+        if (!resubmit) {
+            if (chain->seq == 0) {
+                chain->seq = active->seq;
+                ++job->nextReadSeq;
+                job->latestSubmittedReadSeq = active->seq;
+            }
+            active->seq = chain->seq;
+            const uint64_t issuedLength = active->desc.length;
+            if (issuedLength == 0 || issuedLength > chain->remaining) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.accept.range file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            chain->remaining -= issuedLength;
+            chain->nextBuffer = reinterpret_cast<void*>(
+                reinterpret_cast<uintptr_t>(chain->nextBuffer) +
+                static_cast<uintptr_t>(issuedLength));
+            chain->nextOffset += issuedLength;
+#if AMPR_EMU_DEBUG_LOG
+            if (chain->remaining != 0) {
+                chain->sliceReadyTimeNs = submitTimeNs;
+            }
+            note_native_trigger_to_aio_submit(active->nativeTriggerTimeNs,
+                                              submitTimeNs);
+            note_read_ready_to_aio_submit(active->sliceReadyTimeNs,
+                                          submitTimeNs,
+                                          job->prioIndex);
+            note_job_queue_to_first_aio_submit(*job, submitTimeNs);
+#endif
+        }
+#if AMPR_EMU_DEBUG_LOG
+        note_accepted_aio_request(active->desc.length, job->prioIndex);
+#endif
+        arm_active_read_poll_after_submit(*active, submitTimeNs);
+    }
+
+    void reject_aio_submit_item(const ActiveReadRef& item,
+                                int submitSceRc,
+                                uint64_t submitTimeNs,
+                                AioAdmissionContext* admission) {
+        ActiveRead* const active = activeReads.active_at_slot(
+            item.slot, item.generation);
+        if (!active || !active->job || !active->chain) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.reject.stale file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        JobPtr job = active->job;
+        ReadChain* const chain = active->chain;
+        const uint32_t errorOff = active->desc.errorOff;
+
+        if (active->awaitingResubmit) {
+            if (!active->awaitingBatchSubmit) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.resubmit.reject.state file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            active->awaitingBatchSubmit = false;
+            if (apr_aio_submit_sce_rc_is_deferred(submitSceRc)) {
+                active->retryNotBeforeNs =
+                    submitTimeNs + AMPR_EMU_APR_AIO_SUBMIT_RETRY_DELAY_NS;
+                return;
+            }
+            detach_staged_read_chain(job, chain);
+            chain->allIssued = true;
+            set_or_defer_read_command_error(
+                *job,
+                "aio-resubmit",
+                apr_backend_read_error_to_apr(submitSceRc),
+                errorOff);
+            apr_release_aio_read_desc(active->desc);
+            decrement_active_read_count(job);
+            decrement_read_chain_active(chain, active->readCreditBytes);
+            (void)erase_active_read(
+                activeReads.iterator_from_slot(item.slot));
+            maybe_finish_read_chain(chain);
+            maybe_release_reactor_job(job);
+            return;
+        }
+
+        if (!active->awaitingBatchSubmit || active->awaitingResubmit || !admission) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.reject.state file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        rollback_staged_aio_admission(*admission, *active);
+        active->awaitingBatchSubmit = false;
+        apr_release_aio_read_desc(active->desc);
+        decrement_active_read_count(job);
+        decrement_read_chain_active(chain, active->readCreditBytes);
+        (void)erase_active_read(activeReads.iterator_from_slot(item.slot));
+        if (apr_aio_submit_sce_rc_is_deferred(submitSceRc)) {
+            chain->retryNotBeforeNs =
+                submitTimeNs + AMPR_EMU_APR_AIO_SUBMIT_RETRY_DELAY_NS;
+            return;
+        }
+
+        detach_staged_read_chain(job, chain);
+        chain->allIssued = true;
+        maybe_finish_read_chain(chain);
+        if (!job_failed(*job)) {
+            set_or_defer_read_command_error(
+                *job,
+                "aio-submit",
+                apr_backend_read_error_to_apr(submitSceRc),
+                errorOff);
+        }
+        maybe_release_reactor_job(job);
+    }
+
+    bool flush_aio_submit_round(AioAdmissionContext* admission) {
+        bool progressedAny = false;
+        bool hasItems = false;
+        for (const AioSubmitBatch& batch : aioSubmitRound.batches) {
+            hasItems |= batch.count != 0;
+        }
+        if (!hasItems) {
+            return false;
+        }
+
+        ensure_aio_initialized();
+        for (AioSubmitBatch& batch : aioSubmitRound.batches) {
+            if (batch.count == 0) {
+                continue;
+            }
+            const int submitRc = sceKernelAioSubmitReadCommandsMultiple(
+                batch.requests,
+                static_cast<int>(batch.count),
+                batch.aioPriority,
+                batch.ids);
+            const uint64_t submitTimeNs = time_counter_now();
+            const int submitSceRc = apr_aio_api_rc_to_sce(submitRc);
+            note_aio_submit_result(submitSceRc, batch.count);
+
+            bool inconsistent = false;
+            for (size_t item = 0; item < batch.count; ++item) {
+                if ((submitRc == 0 && batch.ids[item] < 0) ||
+                    (submitRc != 0 && batch.ids[item] >= 0) ||
+                    (submitRc == 0 &&
+                     !aio_submit_id_is_unique(batch.ids[item], batch, item))) {
+                    inconsistent = true;
+                }
+            }
+            if (inconsistent) {
+                AMPR_CRITICAL_LOGF("apr.reactor.aio.submit.multiple.inconsistent rc=0x%x count=%zu prio=%d action=abort",
+                                   submitSceRc,
+                                   batch.count,
+                                   batch.aioPriority);
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.multiple.inconsistent file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+
+            const size_t itemCount = batch.count;
+            batch.count = 0;
+            for (size_t item = 0; item < itemCount; ++item) {
+                if (submitRc == 0) {
+                    accept_aio_submit_item(batch.items[item],
+                                           batch.ids[item],
+                                           submitTimeNs);
+                    progressedAny = true;
+                } else {
+                    reject_aio_submit_item(batch.items[item],
+                                           submitSceRc,
+                                           submitTimeNs,
+                                           admission);
+                    progressedAny |=
+                        !apr_aio_submit_sce_rc_is_deferred(submitSceRc);
+                }
+            }
+        }
+        return progressedAny;
     }
 
     DirectReadSubmitOutcome submit_read_chain_slice(JobPtr& job,
                                                      ReadChain& chain,
                                                      ReadIssueBudget& issueBudget,
                                                      AioAdmissionContext& admission) {
-        constexpr SceKernelAioSubmitId kUnsetAioId =
-            static_cast<SceKernelAioSubmitId>(-1);
         if (!job || job_failed(*job) || chain.job != job || chain.remaining == 0) {
             return {DirectReadSubmitResult::Failed, nullptr, 0, 0};
         }
@@ -4835,15 +5749,15 @@ private:
             chain.activeBytes >
                 static_cast<uint64_t>(AMPR_EMU_APR_PER_READ_ACTIVE_BYTES) -
                     sliceCreditBytes) {
-            return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
+            return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
         }
         if (!issueBudget.can_admit(sliceCreditBytes)) {
-            return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
+            return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
         }
         const uint64_t nowNs = aio_admission_lane_now(admission);
         if (chain.retryNotBeforeNs != 0) {
             if (nowNs < chain.retryNotBeforeNs) {
-                return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
+                return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
             }
             chain.retryNotBeforeNs = 0;
         }
@@ -4852,39 +5766,52 @@ private:
                                              sliceDesc,
                                              nowNs,
                                              admission)) {
-            return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
+            return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
         }
 
         if (chain.ownerDesc.fd < 0) {
             int acquireRc = 0;
             uint32_t acquireErrorOff = chain.ownerDesc.errorOff;
-            const bool allowNewFd = !fd_pressure_active(nowNs);
+            const bool allowNewFd = !admission.fdPressure;
             const bool acquired = apr_acquire_aio_read_desc(job->id,
                                                             chain.ownerDesc,
                                                             allowNewFd,
+                                                            admission.directFdCap,
                                                             &acquireRc,
                                                             &acquireErrorOff);
             if (!acquired) {
-                if (acquireRc == SCE_KERNEL_ERROR_EAGAIN ||
-                    acquireRc == SCE_KERNEL_ERROR_EMFILE) {
+                if (apr_fd_acquire_sce_rc_is_deferred(acquireRc)) {
                     const uint64_t failureNowNs = time_counter_now();
                     if (acquireRc == SCE_KERNEL_ERROR_EMFILE) {
                         note_emfile_event();
-                        // The fd layer already published process-wide pressure
-                        // and released reclaimable descriptors. Synchronize it
-                        // now so later APR priorities can reuse existing fds but
-                        // cannot issue another open during the cooldown.
-                        (void)fd_pressure_active(failureNowNs);
+                    }
+                    // A real open EAGAIN/EMFILE/ENFILE publishes pressure in
+                    // the fd layer. A local admission EAGAIN does not. Sample
+                    // the generation for every deferred result so the two cases
+                    // stay distinct without another result/status channel.
+                    if (fd_pressure_active(failureNowNs)) {
+                        admission.current = false;
                     }
                     chain.retryNotBeforeNs =
                         failureNowNs + AMPR_EMU_APR_AIO_SUBMIT_RETRY_DELAY_NS;
-                    return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
+                    return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
                 }
                 chain.allIssued = true;
+                const int aprRc = apr_backend_read_error_to_apr(acquireRc);
+                const char* const errorReason =
+                    apr_backend_read_error_reason("aio-acquire-fd", acquireRc);
+                AMPR_CRITICAL_LOGF("apr.reactor.acquire.error-map job=0x%llx fileId=%u reason=%s backendRc=0x%x aprRc=0x%x errorOffset=0x%x",
+                                   (unsigned long long)job->id,
+                                   chain.ownerDesc.fileId,
+                                   errorReason,
+                                   acquireRc,
+                                   aprRc,
+                                   acquireErrorOff);
                 return {DirectReadSubmitResult::Failed,
-                        "aio-acquire-fd",
-                        apr_backend_read_error_to_apr(acquireRc),
-                        acquireErrorOff};
+                        errorReason,
+                        aprRc,
+                        acquireErrorOff,
+                        acquireRc};
             }
             // Rebuild after acquiring the chain-owned fd; the active slice
             // borrows this descriptor and never owns/duplicates the pin.
@@ -4927,100 +5854,20 @@ private:
                                      0);
 #endif
 
-        ensure_aio_initialized();
         const int aioPriority = apr_aio_priority_from_apr(job->prioIndex);
-        SceKernelAioSubmitId aioId = kUnsetAioId;
-        const int submitRc = sceKernelAioSubmitReadCommands(
-            &active.request,
-            1,
-            aioPriority,
-            &aioId);
-        const uint64_t submitTimeNs = time_counter_now();
-        const int submitSceRc = apr_aio_api_rc_to_sce(submitRc);
-        note_aio_submit_result(submitSceRc);
-
-        if ((submitRc == 0 && aioId == kUnsetAioId) ||
-            (submitRc != 0 && aioId != kUnsetAioId)) {
-            AMPR_CRITICAL_LOGF("apr.reactor.aio.submit.single.inconsistent rc=0x%x aioId=%d prio=%d action=abort",
-                               submitSceRc,
-                               aioId,
-                               aioPriority);
-            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.single.inconsistent file=%s line=%d", __FILE__, __LINE__);
-            std::abort();
-        }
-
-        if (submitRc != 0) {
-            const uint32_t errorOff = active.desc.errorOff;
-            apr_release_aio_read_desc(active.desc);
-            decrement_active_read_count(job);
-            decrement_read_chain_active(&chain, active.readCreditBytes);
-            erase_active_read(activeIt);
-            if (apr_aio_submit_sce_rc_is_deferred(submitSceRc)) {
-                chain.retryNotBeforeNs =
-                    submitTimeNs + AMPR_EMU_APR_AIO_SUBMIT_RETRY_DELAY_NS;
-                return {DirectReadSubmitResult::Deferred, nullptr, 0, 0};
-            }
-            chain.allIssued = true;
-            return {DirectReadSubmitResult::Failed,
-                    "aio-submit",
-                    apr_backend_read_error_to_apr(submitSceRc),
-                    errorOff};
-        }
-
-        issueBudget.consume(active.readCreditBytes);
-
-        if (chain.seq == 0) {
-            chain.seq = seqCandidate;
-            ++job->nextReadSeq;
-            job->latestSubmittedReadSeq = seqCandidate;
-        }
-        active.seq = chain.seq;
-        mark_active_read_submitted(active, aioId);
         active.aioPrio = aioPriority;
-        active.submitTimeNs = submitTimeNs;
-        active.retryNotBeforeNs = 0;
-#if AMPR_EMU_DEBUG_LOG
-        active.pollAttempts = 0;
-#endif
-        note_aio_admission_accepted(admission, active, submitTimeNs);
+        issueBudget.consume(active.readCreditBytes);
+        stage_aio_submit(active, false);
+        // Reserve this candidate in the pass-local admission snapshot before
+        // later lanes are examined. Use the real lane timestamp so provisional
+        // batching cannot reset age throttling to time zero; a rejected array
+        // submit rolls the count/group credits back at flush time.
+        reserve_staged_aio_admission(admission, active, nowNs);
 
-        DirectReadSubmitOutcome outcome{DirectReadSubmitResult::Submitted,
-                                        nullptr,
-                                        0,
-                                        0};
-        const uint64_t issuedLength = active.desc.length;
-        if (issuedLength == 0 || issuedLength > chain.remaining) {
-            chain.allIssued = true;
-            outcome.errorReason = "aio-read-chain-range";
-            outcome.errorRc = SCE_KERNEL_ERROR_EINVAL;
-            outcome.errorOffset = active.desc.errorOff;
-        } else {
-            chain.remaining -= issuedLength;
-            chain.nextBuffer = reinterpret_cast<void*>(
-                reinterpret_cast<uintptr_t>(chain.nextBuffer) +
-                static_cast<uintptr_t>(issuedLength));
-            chain.nextOffset += issuedLength;
-            if (chain.remaining == 0) {
-                chain.allIssued = true;
-            }
-#if AMPR_EMU_DEBUG_LOG
-            else {
-                chain.sliceReadyTimeNs = submitTimeNs;
-            }
-#endif
-        }
-
-#if AMPR_EMU_DEBUG_LOG
-        note_native_trigger_to_aio_submit(active.nativeTriggerTimeNs,
-                                          submitTimeNs);
-        note_read_ready_to_aio_submit(active.sliceReadyTimeNs,
-                                              submitTimeNs,
-                                              job->prioIndex);
-        note_job_queue_to_first_aio_submit(*job, submitTimeNs);
-        note_accepted_aio_request(active.desc.length, job->prioIndex);
-#endif
-        arm_active_read_poll_after_submit(active, submitTimeNs);
-        return outcome;
+        // Source ownership remains parked until the array submit succeeds.
+        // flush_aio_submit_round() updates the chain, and the next reactor pass
+        // commits the already accepted range to the packed source cursor.
+        return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
     }
 
     struct SoftwareRead {
@@ -5102,6 +5949,581 @@ private:
                 software_op_uses_native_apr_batch(op.type)) &&
                !software_op_is_sop(op);
     }
+
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+    static bool eager_native_record_type(OpType type) {
+        return software_op_uses_native_apr_batch(type);
+    }
+
+    int analyze_eager_native_event_plan(JobState& job) {
+        job.eagerNativeArenaAllocation = UINT32_MAX;
+        job.eagerNativeArenaOffset = 0;
+        job.eagerNativeArenaBytes = 0;
+        job.eagerNativeEventProgressOffset = 0;
+        job.eagerNativeEventFirstSourceOffset = 0;
+        job.eagerNativeEventCount = 0;
+        job.eagerNativeEventCursor = 0;
+        job.eagerNativeEventReleaseCursor = 0;
+        job.eagerNativeEventCommandBytes = 0;
+        job.eagerNativeEventSubmitId = 0;
+        job.eagerNativeEventFirstToken = 0;
+        job.eagerNativeCounterWaitTarget = 0;
+        job.eagerNativeEventLastReleaseNs = 0;
+        job.eagerNativeEventLastWatchdogNs = 0;
+        job.eagerNativeEventPlan = false;
+        job.eagerNativeEventQueueLinked = false;
+        job.eagerNativeEventAllReleased = false;
+        job.eagerNativeEventQueueNext = nullptr;
+
+        const auto finalizePlan = [&job]() -> int {
+            job.eagerNativeEventPlan = job.eagerNativeEventCount != 0;
+            if (!job.eagerNativeEventPlan) {
+                return 0;
+            }
+            const uint64_t progressOffset =
+                (static_cast<uint64_t>(job.eagerNativeEventCommandBytes) + 7u) &
+                ~7ull;
+            const uint64_t requiredBytes = progressOffset + sizeof(uint64_t);
+            const uint64_t arenaBytes =
+                (requiredBytes + kAprNativeEventArenaAlignment - 1u) &
+                ~(static_cast<uint64_t>(kAprNativeEventArenaAlignment) - 1u);
+            if (arenaBytes > kAprNativeEventArenaBytes ||
+                progressOffset > UINT32_MAX) {
+                job.eagerNativeEventPlan = false;
+                job.eagerNativeEventCount = 0;
+                return SCE_KERNEL_ERROR_E2BIG;
+            }
+            job.eagerNativeEventProgressOffset =
+                static_cast<uint32_t>(progressOffset);
+            job.eagerNativeArenaBytes = static_cast<uint32_t>(arenaBytes);
+            return 0;
+        };
+
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+        // The overlay's runtime native fallback must remain wholly owned by the
+        // proven persistent batch. Do not combine that A/B configuration with
+        // an eagerly submitted native FIFO on the same APR priority.
+        return 0;
+#endif
+
+        // AMM micro-submits always use native High/0. A closed eager gate on
+        // the same A53 priority could otherwise sit ahead of an older AMM map
+        // from this or an earlier job. Priority 0 therefore uses the bounded
+        // just-in-time APR micro path below instead of a pre-submitted sidecar.
+        if (job.prioIndex == kAprNativeMicroAmmPriority) {
+            return 0;
+        }
+
+        uint32_t offset = 0;
+        uint32_t commandIndex = 0;
+        while (offset < job.sourceBytes) {
+            Op op{};
+            uint32_t opBytes = 0;
+            uint32_t errorOffset = offset;
+            const int rc = sce::Ampr::ampr_decode_apr_packed_op(
+                job.sourceBuffer,
+                job.sourceBytes,
+                offset,
+                &op,
+                &opBytes,
+                &errorOffset);
+            if (rc != 0 || opBytes == 0 || opBytes > job.sourceBytes - offset) {
+                // Preserve asynchronous decode/error behavior.  A malformed
+                // suffix remains cursor-owned. Native records in the valid
+                // prefix still use this FIFO and are never replayed through the
+                // persistent batch.
+                return finalizePlan();
+            }
+            op.bufOffsetBytes = offset;
+            if (eager_native_record_type(op.type)) {
+                if (opBytes > kAprNativeEventPacketMaxBytes ||
+                    job.eagerNativeEventCount >= kAprNativeEventMaxPerJob) {
+                    job.eagerNativeEventCount = 0;
+                    return SCE_KERNEL_ERROR_E2BIG;
+                }
+                if (job.eagerNativeEventCount == 0) {
+                    job.eagerNativeEventFirstSourceOffset = offset;
+                }
+                const uint64_t commandBytes =
+                    static_cast<uint64_t>(job.eagerNativeEventCommandBytes) +
+                    kAprNativeEventGateBytes + opBytes +
+                    kAprNativeEventCheckpointBytes;
+                if (commandBytes > UINT32_MAX) {
+                    job.eagerNativeEventCount = 0;
+                    return SCE_KERNEL_ERROR_E2BIG;
+                }
+                job.eagerNativeEventCommandBytes =
+                    static_cast<uint32_t>(commandBytes);
+                ++job.eagerNativeEventCount;
+            }
+            offset += opBytes;
+            ++commandIndex;
+        }
+        if (offset != job.sourceBytes || commandIndex != job.commandCount) {
+            return finalizePlan();
+        }
+        return finalizePlan();
+    }
+
+    bool submit_eager_native_event_sidecar(JobState& job) {
+        if (!job.eagerNativeEventPlan || job.eagerNativeEventCount == 0 ||
+            job.eagerNativeEventCount > kAprNativeEventMaxPerJob) {
+            return false;
+        }
+        if (!ensure_native_execution_pool()) {
+            return false;
+        }
+        uint8_t* const commands = eager_native_event_commands(job);
+        volatile uint64_t* const progress = eager_native_event_progress(job);
+        SceAprResultBuffer* const result =
+            apr_native_event_result(job.poolSlot);
+        if (!commands || !progress || !result ||
+            job.eagerNativeEventCommandBytes == 0 ||
+            job.eagerNativeEventCommandBytes >
+                job.eagerNativeEventProgressOffset) {
+            return false;
+        }
+
+        __atomic_store_n(progress, 0ull, __ATOMIC_RELAXED);
+        result->errorOffset = 0;
+        __atomic_store_n(&result->result,
+                         kAprNativeEventResultPending,
+                         __ATOMIC_RELAXED);
+
+        SceAmprCommandBuffer commandView{};
+        commandView.buffer = commands;
+        commandView.bufsize = job.eagerNativeEventProgressOffset;
+        uint64_t& laneNextToken = eagerNativeNextToken[job.prioIndex];
+        if (laneNextToken < kAprNativeEventTokenBase) {
+            laneNextToken = kAprNativeEventTokenBase;
+        }
+        const uint64_t firstToken = laneNextToken + 1u;
+        const uint64_t lastToken = firstToken +
+            static_cast<uint64_t>(job.eagerNativeEventCount) - 1u;
+        if (firstToken == 0 || lastToken < firstToken) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.token.wrap file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        job.eagerNativeEventFirstToken = firstToken;
+        laneNextToken = lastToken;
+        volatile uint64_t* const laneRelease =
+            apr_native_event_lane_release_ptr(job.prioIndex);
+        if (!laneRelease) {
+            return false;
+        }
+
+        uint32_t commandOffset = 0;
+        uint32_t sourceOffset = 0;
+        uint32_t recordIndex = 0;
+        while (sourceOffset < job.sourceBytes) {
+            Op op{};
+            uint32_t packedBytes = 0;
+            uint32_t errorOffset = sourceOffset;
+            const int decodeRc = sce::Ampr::ampr_decode_apr_packed_op(
+                job.sourceBuffer,
+                job.sourceBytes,
+                sourceOffset,
+                &op,
+                &packedBytes,
+                &errorOffset);
+            if (decodeRc != 0 || packedBytes == 0 ||
+                packedBytes > job.sourceBytes - sourceOffset) {
+                if (recordIndex != job.eagerNativeEventCount) {
+                    return false;
+                }
+                break;
+            }
+            if (!eager_native_record_type(op.type)) {
+                sourceOffset += packedBytes;
+                continue;
+            }
+            if (recordIndex >= job.eagerNativeEventCount ||
+                packedBytes > kAprNativeEventPacketMaxBytes) {
+                return false;
+            }
+            const uint64_t recordToken = firstToken + recordIndex;
+            const bool nopOnCancel = op.type != OpType::WriteEqueue;
+
+            Op gate{};
+            gate.type = OpType::WaitOnAddress;
+            gate.ptra = const_cast<uint64_t*>(laneRelease);
+            gate.u64a = recordToken;
+            gate.u32a = static_cast<uint32_t>(
+                sce::Ampr::WaitCompare::kGreaterThanOrEqualWrapped);
+            // Event packets remain immutable and only need a door gate. Counter
+            // records retain refetch because error cancellation may replace an
+            // unconsumed packet with an equal-sized NOP after native submit.
+            gate.u32c = static_cast<uint32_t>(
+                nopOnCancel
+                    ? sce::Ampr::WaitFlush::kEnable
+                    : sce::Ampr::WaitFlush::kDisable);
+            const int gateRc = sce::Ampr::ampr_strict_write_op(
+                &commandView,
+                commandOffset,
+                gate,
+                kAprNativeEventGateBytes);
+            if (gateRc != 0) {
+                return false;
+            }
+            commandOffset += kAprNativeEventGateBytes;
+
+            if (commandOffset + packedBytes >
+                job.eagerNativeEventProgressOffset) {
+                return false;
+            }
+            std::memcpy(commands + commandOffset,
+                        job.sourceBuffer + sourceOffset,
+                        packedBytes);
+            commandOffset += packedBytes;
+
+            Op checkpoint{};
+            checkpoint.type = OpType::WriteAddress;
+            checkpoint.ptra = const_cast<uint64_t*>(progress);
+            checkpoint.u64a = recordToken;
+            checkpoint.u8a = 0;
+            const int checkpointRc = sce::Ampr::ampr_strict_write_op(
+                &commandView,
+                commandOffset,
+                checkpoint,
+                kAprNativeEventCheckpointBytes);
+            if (checkpointRc != 0) {
+                return false;
+            }
+            commandOffset += kAprNativeEventCheckpointBytes;
+            ++recordIndex;
+            sourceOffset += packedBytes;
+        }
+        if (recordIndex != job.eagerNativeEventCount ||
+            commandOffset != job.eagerNativeEventCommandBytes ||
+            commandOffset > job.eagerNativeEventProgressOffset) {
+            return false;
+        }
+
+        NativeAprCommandBufferView nativeCommandBuffer{};
+        nativeCommandBuffer.m_commandBuffer.type = job.nativeSubmitType;
+        nativeCommandBuffer.m_commandBuffer.offset = commandOffset;
+        nativeCommandBuffer.m_commandBuffer.num =
+            static_cast<int32_t>(job.eagerNativeEventCount * 3u);
+        nativeCommandBuffer.m_commandBuffer.bufsize = job.eagerNativeArenaBytes;
+        nativeCommandBuffer.m_commandBuffer.buffer = commands;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+
+        int submitRcRaw = 0;
+        SceAprSubmitId submitId = 0;
+        const int dispatchRc = apr_native_submit_dispatch(
+            reinterpret_cast<sce::Ampr::AprCommandBuffer*>(&nativeCommandBuffer),
+            job.prioIndex,
+            AprSubmitMode::kSubmitAndGetResult,
+            result,
+            &submitId,
+            &submitRcRaw);
+        const int submitRc = dispatchRc != 0
+            ? dispatchRc
+            : apr_libkernel_rc_to_sce(submitRcRaw);
+        if (submitRc != 0 || submitId == 0) {
+            AMPR_VLOGF("apr.reactor.native.fifo.submit.fail job=0x%llx lane=%u records=%u rc=0x%x raw=0x%x",
+                       (unsigned long long)job.id,
+                       (unsigned)job.prioIndex,
+                       (unsigned)job.eagerNativeEventCount,
+                       submitRc != 0 ? submitRc : SCE_KERNEL_ERROR_EIO,
+                       submitRcRaw);
+            return false;
+        }
+
+        job.eagerNativeEventCommandBytes = commandOffset;
+        job.eagerNativeEventSubmitId = submitId;
+        AMPR_TLOGF("apr.reactor.native.fifo.submit job=0x%llx lane=%u records=%u submitId=0x%x bytes=0x%x first=0x%llx last=0x%llx release=%p progress=%p flush=selective",
+                   (unsigned long long)job.id,
+                   (unsigned)job.prioIndex,
+                   (unsigned)job.eagerNativeEventCount,
+                   submitId,
+                   commandOffset,
+                   (unsigned long long)firstToken,
+                   (unsigned long long)lastToken,
+                   (void*)const_cast<uint64_t*>(laneRelease),
+                   (void*)const_cast<uint64_t*>(progress));
+        return true;
+    }
+
+    void link_eager_native_event_job_locked(JobState& job) {
+        if (!job.eagerNativeEventPlan || job.eagerNativeEventQueueLinked ||
+            job.prioIndex >= kPriorityCount) {
+            return;
+        }
+        JobPtr& tail = eagerNativeEventQueueTails[job.prioIndex];
+        job.eagerNativeEventQueueNext = nullptr;
+        if (tail) {
+            tail->eagerNativeEventQueueNext = &job;
+        } else {
+            eagerNativeEventQueueHeads[job.prioIndex] = &job;
+        }
+        tail = &job;
+        job.eagerNativeEventQueueLinked = true;
+    }
+
+    static uint64_t eager_native_record_token(const JobState& job,
+                                              uint32_t recordIndex) {
+        return job.eagerNativeEventFirstToken + recordIndex;
+    }
+
+    uint32_t eager_native_source_error_offset(
+        const JobState& job,
+        uint32_t nativeErrorOffset) const {
+        uint32_t sourceOffset = 0;
+        uint32_t nativeOffset = 0;
+        uint32_t lastNativeSourceOffset =
+            job.eagerNativeEventFirstSourceOffset;
+        while (sourceOffset < job.sourceBytes) {
+            Op op{};
+            uint32_t opBytes = 0;
+            uint32_t decodeErrorOffset = sourceOffset;
+            const int decodeRc = sce::Ampr::ampr_decode_apr_packed_op(
+                job.sourceBuffer,
+                job.sourceBytes,
+                sourceOffset,
+                &op,
+                &opBytes,
+                &decodeErrorOffset);
+            if (decodeRc != 0 || opBytes == 0 ||
+                opBytes > job.sourceBytes - sourceOffset) {
+                break;
+            }
+            if (eager_native_record_type(op.type)) {
+                lastNativeSourceOffset = sourceOffset;
+                const uint32_t nativeRecordBytes =
+                    kAprNativeEventGateBytes + opBytes +
+                    kAprNativeEventCheckpointBytes;
+                if (nativeErrorOffset < nativeOffset + nativeRecordBytes) {
+                    return sourceOffset;
+                }
+                nativeOffset += nativeRecordBytes;
+            }
+            sourceOffset += opBytes;
+        }
+        return lastNativeSourceOffset;
+    }
+
+    bool advance_eager_native_event_release_fifo(uint32_t laneIndex) {
+        if (laneIndex >= kPriorityCount) {
+            return false;
+        }
+        volatile uint64_t* const laneRelease =
+            apr_native_event_lane_release_ptr(laneIndex);
+        if (!laneRelease) {
+            return false;
+        }
+
+        bool progressed = false;
+        bool haveReleaseToken = false;
+        uint64_t releaseToken = 0;
+        const uint64_t releaseTimeNs = time_counter_now();
+        for (;;) {
+            bool stopAfterHead = false;
+            bool logReady = false;
+            uint64_t readyJobId = 0;
+            uint32_t readyFrontier = 0;
+            uint32_t readyCount = 0;
+            uint64_t readyToken = 0;
+            {
+                AmprLockGuard lk(m);
+                JobPtr const head = eagerNativeEventQueueHeads[laneIndex];
+                if (!head || head->eagerNativeEventPreparePending.load(
+                                 std::memory_order_acquire)) {
+                    stopAfterHead = true;
+                } else if (!head->eagerNativeEventPlan ||
+                           head->eagerNativeEventCount == 0) {
+                    AMPR_KLOGF("ampr.abort reason=apr.reactor.native.event.fifo.invalid file=%s line=%d", __FILE__, __LINE__);
+                    std::abort();
+                } else {
+                    const uint32_t frontier = head->eagerNativeEventCursor;
+                    if (frontier > head->eagerNativeEventCount ||
+                        frontier < head->eagerNativeEventReleaseCursor) {
+                        AMPR_KLOGF("ampr.abort reason=apr.reactor.native.event.fifo.frontier-invalid file=%s line=%d", __FILE__, __LINE__);
+                        std::abort();
+                    }
+                    if (frontier != head->eagerNativeEventReleaseCursor) {
+                        releaseToken = eager_native_record_token(
+                            *head, frontier - 1u);
+                        head->eagerNativeEventReleaseCursor = frontier;
+                        head->eagerNativeEventLastReleaseNs = releaseTimeNs;
+                        haveReleaseToken = true;
+                        progressed = true;
+                        logReady = true;
+                        readyJobId = head->id;
+                        readyFrontier = frontier;
+                        readyCount = head->eagerNativeEventCount;
+                        readyToken = releaseToken;
+                    }
+                    if (head->eagerNativeEventReleaseCursor !=
+                        head->eagerNativeEventCount) {
+                        stopAfterHead = true;
+                    } else {
+                        head->eagerNativeEventAllReleased = true;
+                        eagerNativeEventQueueHeads[laneIndex] =
+                            head->eagerNativeEventQueueNext;
+                        if (!eagerNativeEventQueueHeads[laneIndex]) {
+                            eagerNativeEventQueueTails[laneIndex] = nullptr;
+                        }
+                        head->eagerNativeEventQueueNext = nullptr;
+                        head->eagerNativeEventQueueLinked = false;
+                    }
+                }
+            }
+            if (logReady) {
+                AMPR_TLOGF("apr.reactor.native.event.fifo.ready job=0x%llx lane=%u frontier=%u/%u token=0x%llx",
+                           (unsigned long long)readyJobId,
+                           laneIndex,
+                           readyFrontier,
+                           readyCount,
+                           (unsigned long long)readyToken);
+            }
+            if (stopAfterHead) {
+                break;
+            }
+            // Keep scanning: if the next already-submitted job also has a
+            // contiguous ready prefix, one shared-lane release store can open
+            // both jobs while preserving FIFO token order.
+        }
+
+        if (haveReleaseToken) {
+            // All title-visible software stores and any error-path NOP rewrites
+            // for the released FIFO prefix are sequenced before publication.
+            std::atomic_thread_fence(std::memory_order_release);
+            __atomic_store_n(laneRelease, releaseToken, __ATOMIC_RELEASE);
+            AMPR_TLOGF("apr.reactor.native.event.fifo.release lane=%u token=0x%llx",
+                       laneIndex,
+                       (unsigned long long)releaseToken);
+        }
+        return progressed;
+    }
+
+    void cancel_and_drain_eager_native_records(JobState& job) {
+        if (!job.eagerNativeEventPlan || job.eagerNativeEventAllReleased) {
+            return;
+        }
+        if (job.eagerNativeEventCursor >= job.eagerNativeEventCount) {
+            return;
+        }
+        uint8_t* const commands = eager_native_event_commands(job);
+        if (!commands) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.cancel.arena-null file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        uint32_t commandOffset = 0;
+        uint32_t sourceOffset = 0;
+        uint32_t recordIndex = 0;
+        while (sourceOffset < job.sourceBytes) {
+            Op op{};
+            uint32_t opBytes = 0;
+            uint32_t errorOffset = sourceOffset;
+            const int decodeRc = sce::Ampr::ampr_decode_apr_packed_op(
+                job.sourceBuffer,
+                job.sourceBytes,
+                sourceOffset,
+                &op,
+                &opBytes,
+                &errorOffset);
+            if (decodeRc != 0 || opBytes == 0 ||
+                opBytes > job.sourceBytes - sourceOffset) {
+                break;
+            }
+            if (!eager_native_record_type(op.type)) {
+                sourceOffset += opBytes;
+                continue;
+            }
+            if (recordIndex >= job.eagerNativeEventCursor &&
+                op.type != OpType::WriteEqueue) {
+                if (opBytes < 4u || opBytes > 20u ||
+                    (opBytes & 3u) != 0 ||
+                    job.eagerNativeEventCommandBytes <
+                        kAprNativeEventGateBytes + 4u ||
+                    commandOffset > job.eagerNativeEventCommandBytes -
+                        kAprNativeEventGateBytes - 4u) {
+                    AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.cancel.record-invalid file=%s line=%d", __FILE__, __LINE__);
+                    std::abort();
+                }
+                const uint32_t headerIndex = opBytes / 4u - 1u;
+                std::memcpy(commands + commandOffset +
+                                kAprNativeEventGateBytes,
+                            &nativeBatchPaddingHeaders[headerIndex],
+                            sizeof(uint32_t));
+            }
+            commandOffset += kAprNativeEventGateBytes + opBytes +
+                kAprNativeEventCheckpointBytes;
+            ++recordIndex;
+            sourceOffset += opBytes;
+        }
+        if (recordIndex != job.eagerNativeEventCount ||
+            commandOffset != job.eagerNativeEventCommandBytes) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.cancel.scan-invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        job.eagerNativeEventCursor = job.eagerNativeEventCount;
+        (void)advance_eager_native_event_release_fifo(job.prioIndex);
+    }
+
+    bool consume_eager_native_record(JobState& job,
+                                    const Op& op,
+                                    uint32_t opBytes) {
+        if (!job.eagerNativeEventPlan || !eager_native_record_type(op.type) ||
+            job.eagerNativeEventCursor >= job.eagerNativeEventCount) {
+            return false;
+        }
+        if (!eager_native_event_commands(job) ||
+            op.bufOffsetBytes != job.sourceOffset || opBytes == 0 ||
+            opBytes > kAprNativeEventPacketMaxBytes) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.event.cursor.invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        const uint32_t recordIndex = job.eagerNativeEventCursor;
+        ++job.eagerNativeEventCursor;
+        if (op.type == OpType::WaitOnCounter) {
+            job.eagerNativeCounterWaitTarget =
+                eager_native_record_token(job, recordIndex);
+        }
+        advance_job_source(job, opBytes);
+        (void)advance_eager_native_event_release_fifo(job.prioIndex);
+        return true;
+    }
+
+    bool eager_native_released_work_pending(const JobState& job) const {
+        if (!job.eagerNativeEventPlan ||
+            job.eagerNativeEventReleaseCursor == 0 ||
+            job.eagerNativeEventSubmitId == 0) {
+            return false;
+        }
+        const volatile uint64_t* const progress =
+            eager_native_event_progress(job);
+        if (!progress) {
+            return true;
+        }
+        const uint64_t target = eager_native_record_token(
+            job, job.eagerNativeEventReleaseCursor - 1u);
+        const uint64_t observed = __atomic_load_n(
+            progress, __ATOMIC_ACQUIRE);
+        return !native_batch_token_reached(observed, target);
+    }
+
+    bool eager_native_counter_wait_pending(JobState& job) const {
+        if (job.eagerNativeCounterWaitTarget == 0) {
+            return false;
+        }
+        const volatile uint64_t* const progress =
+            eager_native_event_progress(job);
+        if (!progress) {
+            return true;
+        }
+        const uint64_t observed = __atomic_load_n(
+            progress, __ATOMIC_ACQUIRE);
+        if (!native_batch_token_reached(
+                observed, job.eagerNativeCounterWaitTarget)) {
+            return true;
+        }
+        job.eagerNativeCounterWaitTarget = 0;
+        return false;
+    }
+#endif
 
     static bool software_wait_compare(uint64_t observed,
                                       uint64_t reference,
@@ -5374,46 +6796,11 @@ private:
             set_cursor_read_wait_hint(job->prioIndex, read.fileId);
         }
 
-        ReadIssueBudget singleRequestBudget{1u, kSoftwareReadChunkMax};
-        ReadIssueBudget& budget = issueBudget ? *issueBudget : singleRequestBudget;
-        bool submittedAny = false;
-        while (budget.requestsLeft != 0 && budget.bytesLeft != 0) {
-            const DirectReadSubmitOutcome outcome =
-                submit_read_chain_slice(job, *chain, budget, admission);
-            if (outcome.result == DirectReadSubmitResult::Deferred) {
-                return submittedAny;
-            }
-            if (outcome.result == DirectReadSubmitResult::Failed ||
-                outcome.has_error() || job_failed(*job)) {
-                if (advanceSource) {
-                    clear_cursor_read_wait_hint(job->prioIndex);
-                }
-
-                // Detach cursor ownership before publishing an error. Error
-                // publication may call set_fail(), which abandons cursor chains and
-                // can synchronously return an unsubmitted chain to the fixed pool.
-                // After maybe_finish_read_chain(), do not dereference `chain`.
-                chain->allIssued = true;
-                chainSlot = nullptr;
-                maybe_finish_read_chain(chain);
-
-                if (outcome.has_error() && !job_failed(*job)) {
-                    set_or_defer_read_command_error(*job,
-                                                    outcome.errorReason,
-                                                    outcome.errorRc,
-                                                    outcome.errorOffset);
-                }
-                return submittedAny;
-            }
-
-            submittedAny = true;
-
-            if (!chain->allIssued) {
-                // Bounded A53-like allocation batch: up to eight requests,
-                // with a shared 512 KiB byte budget for the entire lane pass.
-                continue;
-            }
-
+        if (chain->remaining == 0) {
+            // The preceding reactor pass submitted this source-owned slice as
+            // part of an SDK multiple-submit call. Keep the chain attached
+            // until acceptance is known, then commit the source/GS cursor here.
+            chain->allIssued = true;
             chainSlot = nullptr;
             update_software_gs_cursor(gs, read);
             if (advanceSource) {
@@ -5423,12 +6810,38 @@ private:
             if (outLogicalIssued) {
                 *outLogicalIssued = true;
             }
+            maybe_finish_read_chain(chain);
             return true;
         }
 
-        // The logical read remains attached to its execution/speculative source
-        // cursor and resumes on a later priority-ordered reactor pass.
-        return submittedAny;
+        ReadIssueBudget singleRequestBudget{1u, kSoftwareReadChunkMax};
+        ReadIssueBudget& budget = issueBudget ? *issueBudget : singleRequestBudget;
+        const DirectReadSubmitOutcome outcome =
+            submit_read_chain_slice(job, *chain, budget, admission);
+        if (outcome.result == DirectReadSubmitResult::Pending) {
+            return false;
+        }
+
+        if (advanceSource) {
+            clear_cursor_read_wait_hint(job->prioIndex);
+        }
+
+        // Detach cursor ownership before publishing an error. Error publication
+        // may call set_fail(), which abandons cursor chains and can synchronously
+        // return an unsubmitted chain to the fixed pool. After
+        // maybe_finish_read_chain(), do not dereference `chain`.
+        chain->allIssued = true;
+        chainSlot = nullptr;
+        maybe_finish_read_chain(chain);
+
+        if (outcome.has_error() && !job_failed(*job)) {
+            set_or_defer_read_command_error(*job,
+                                            outcome.errorReason,
+                                            outcome.errorRc,
+                                            outcome.errorOffset,
+                                            outcome.backendRc);
+        }
+        return false;
     }
 
 #if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
@@ -6300,12 +7713,53 @@ private:
             const int submitRc = sce::Ampr::Emu::ammSubmitCommandBufferLeaf(
                 reinterpret_cast<uint64_t>(job.nativeCommandBuffer),
                 job.nativeSubmitBytes,
-                0u,
+                kAprNativeMicroAmmPriority,
                 nullptr);
             if (submitRc == 0) {
                 submitted = true;
             } else {
                 set_fail(job, "native-amm-submit", submitRc, job.nativeSourceOffset);
+            }
+        } else if (engine == NativeMicroEngine::Apr) {
+            AprNativeMicroSlot* const slot = apr_native_micro_slot(job.poolSlot);
+            if (!slot || job.nativeMicroSubmitId != 0) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.native.micro.apr.state-invalid file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            NativeAprCommandBufferView nativeCommandBuffer{};
+            nativeCommandBuffer.m_commandBuffer.type = job.nativeSubmitType;
+            nativeCommandBuffer.m_commandBuffer.offset = job.nativeSubmitBytes;
+            nativeCommandBuffer.m_commandBuffer.num = 2;
+            nativeCommandBuffer.m_commandBuffer.bufsize =
+                kAprNativeMicroCommandCapacity;
+            nativeCommandBuffer.m_commandBuffer.buffer = slot->commands;
+            slot->result.errorOffset = 0;
+            __atomic_store_n(&slot->result.result,
+                             kAprNativeMicroResultPending,
+                             __ATOMIC_RELAXED);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+
+            int submitRcRaw = 0;
+            SceAprSubmitId submitId = 0;
+            const int dispatchRc = apr_native_submit_dispatch(
+                reinterpret_cast<sce::Ampr::AprCommandBuffer*>(
+                    &nativeCommandBuffer),
+                job.prioIndex,
+                AprSubmitMode::kSubmitAndGetResult,
+                &slot->result,
+                &submitId,
+                &submitRcRaw);
+            const int submitRc = dispatchRc != 0
+                ? dispatchRc
+                : apr_libkernel_rc_to_sce(submitRcRaw);
+            if (submitRc == 0 && submitId != 0) {
+                job.nativeMicroSubmitId = submitId;
+                submitted = true;
+            } else {
+                set_fail(job,
+                         "native-apr-micro-submit",
+                         submitRc != 0 ? submitRc : SCE_KERNEL_ERROR_EIO,
+                         job.nativeSourceOffset);
             }
         }
         if (!submitted) {
@@ -6321,9 +7775,11 @@ private:
                    (unsigned long long)job.id,
                    job.nativeSourceOffset,
                    sce::Ampr::ampr_op_name(job.nativeSourceType),
-                   "amm",
+                   engine == NativeMicroEngine::Amm ? "amm" : "apr",
                    (unsigned)job.nativePrio,
-                   0u,
+                   engine == NativeMicroEngine::Amm
+                       ? kAprNativeMicroAmmPriority
+                       : (unsigned)job.prioIndex,
                    job.nativeSubmitBytes,
                    (void*)const_cast<uint64_t*>(job.nativeCompletionAddress));
         return true;
@@ -6338,6 +7794,11 @@ private:
         if (!job) {
             return false;
         }
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        if (job->eagerNativeEventPreparePending.load(std::memory_order_acquire)) {
+            return false;
+        }
+#endif
 #if !AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
         (void)speculativeCommandUsed;
 #endif
@@ -6411,6 +7872,11 @@ private:
                 return progressed;
             }
         }
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        if (job_failed(*job) && job->eagerNativeEventPlan) {
+            cancel_and_drain_eager_native_records(*job);
+        }
+#endif
         if (job_failed(*job)) {
             maybe_release_reactor_job(job);
             return progressed;
@@ -6434,6 +7900,11 @@ private:
             if (native_batch_wait_pending(job->prioIndex)) {
                 break;
             }
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+            if (eager_native_counter_wait_pending(*job)) {
+                break;
+            }
+#endif
 #if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
             if (skip_cross_eop_consumed_prefix(*job)) {
                 progressed = true;
@@ -6584,8 +8055,12 @@ private:
             // the software read fence, but let immediate writes and waits overlap
             // the single-threaded AIO reactor.
             const bool nativeBatchPending =
-                job->nativeSubmitted.load(std::memory_order_acquire) &&
-                job->nativeMicroEngine == NativeMicroEngine::AprBatch;
+                (job->nativeSubmitted.load(std::memory_order_acquire) &&
+                 job->nativeMicroEngine == NativeMicroEngine::AprBatch)
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+                || eager_native_released_work_pending(*job)
+#endif
+                ;
             uint64_t completionReadSequence = job->latestSubmittedReadSeq;
 #if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
             if (software_op_is_eop_completion(op)) {
@@ -6610,7 +8085,36 @@ private:
 #endif
             const bool readFencePending = priorReadFencePending ||
                 job->completedReadSeq < completionReadSequence;
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+            if (job->eagerNativeEventPlan &&
+                eager_native_record_type(op.type)) {
+                if (readFencePending && !software_op_is_sop(op)) {
+                    cache_decoded_op(*job, op, opBytes);
+                    break;
+                }
+                if (!consume_eager_native_record(*job, op, opBytes)) {
+                    AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.consume.fail file=%s line=%d", __FILE__, __LINE__);
+                    std::abort();
+                }
+                progressed = true;
+                break;
+            }
+#if !AMPR_EMU_APR_LOCAL_EQUEUE
+            if (eager_native_record_type(op.type)) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.unplanned-record file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+#endif
+#endif
             if (readFencePending && software_op_is_native_apr_eop(op)) {
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE && !AMPR_EMU_APR_LOCAL_EQUEUE
+                if (job->prioIndex == kAprNativeMicroAmmPriority) {
+                    // The just-in-time priority-0 micro must not enter A53 until
+                    // its accumulated read fence is complete.
+                    cache_decoded_op(*job, op, opBytes);
+                    break;
+                }
+#endif
                 if (!append_native_apr_batch(*job,
                                              op,
                                              job->sourceBuffer +
@@ -6674,6 +8178,32 @@ private:
                 }
                 advance_job_source(*job, opBytes);
                 progressed = true;
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+                if (op.type == OpType::WriteAddress &&
+                    job->eagerNativeEventPlan &&
+                    job->eagerNativeEventCursor < job->eagerNativeEventCount &&
+                    job->sourceOffset < job->sourceBytes) {
+                    Op nextOp{};
+                    uint32_t nextBytes = 0;
+                    uint32_t errorOffset = job->sourceOffset;
+                    const int decodeRc = sce::Ampr::ampr_decode_apr_packed_op(
+                        job->sourceBuffer,
+                        job->sourceBytes,
+                        job->sourceOffset,
+                        &nextOp,
+                        &nextBytes,
+                        &errorOffset);
+                    if (decodeRc == 0 && nextBytes != 0 &&
+                        nextBytes <= job->sourceBytes - job->sourceOffset &&
+                        nextOp.type == OpType::WriteEqueue) {
+                        nextOp.bufOffsetBytes = job->sourceOffset;
+                        cache_decoded_op(*job, nextOp, nextBytes);
+                        // Common Read -> WriteAddress -> WriteEvent tail: the
+                        // release store and event gate are handled in this pass.
+                        continue;
+                    }
+                }
+#endif
 #if AMPR_EMU_APR_LOCAL_EQUEUE
                 if (op.type == OpType::WriteAddress &&
                     job->sourceOffset < job->sourceBytes) {
@@ -6768,6 +8298,21 @@ private:
                                                      op.bufOffsetBytes);
                     break;
                 }
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE && !AMPR_EMU_APR_LOCAL_EQUEUE
+                if (job->prioIndex == kAprNativeMicroAmmPriority) {
+                    if (!prepare_native_micro_pair(*job,
+                                                   op,
+                                                   packedSource,
+                                                   opBytes,
+                                                   false) ||
+                        !submit_native_micro(*job, NativeMicroEngine::Apr)) {
+                        break;
+                    }
+                    advance_job_source(*job, opBytes);
+                    progressed = true;
+                    break;
+                }
+#endif
                 if (!append_native_apr_batch(*job,
                                              op,
                                              packedSource,
@@ -6823,6 +8368,7 @@ private:
     bool progress_all_jobs() {
         bool progressed = false;
         AioAdmissionContext admission{};
+        begin_aio_submit_round();
         JobPtr laneHeads[kPriorityCount]{};
         {
             AmprLockGuard lk(m);
@@ -6888,6 +8434,10 @@ private:
                 priorNativeBatchPending |=
                     nativeSubmitted &&
                     job->nativeMicroEngine == NativeMicroEngine::AprBatch;
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+                priorNativeBatchPending |=
+                    eager_native_released_work_pending(*job);
+#endif
                 job = next;
             }
             if (!seal_open_native_apr_batch_group(
@@ -6898,6 +8448,7 @@ private:
                 std::abort();
             }
         }
+        progressed |= flush_aio_submit_round(&admission);
         if (admission.initialized &&
             admission.snapshot.activeCount != activeReads.size()) {
             AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.admission.context.drift file=%s line=%d", __FILE__, __LINE__);
@@ -6907,11 +8458,10 @@ private:
     }
 
     bool resubmit_deferred_active_reads() {
-        constexpr SceKernelAioSubmitId kUnsetAioId =
-            static_cast<SceKernelAioSubmitId>(-1);
         if (deferredActiveReadCount == 0) {
             return false;
         }
+        begin_aio_submit_round();
         bool progressed = false;
         const uint64_t nowNs = time_counter_now();
         for (auto it = activeReads.begin(); it != activeReads.end();) {
@@ -6944,63 +8494,10 @@ private:
 
             active.result = {};
             active.request.result = &active.result;
-            ensure_aio_initialized();
-            SceKernelAioSubmitId aioId = kUnsetAioId;
-            const int submitRc = sceKernelAioSubmitReadCommands(
-                &active.request,
-                1,
-                active.aioPrio,
-                &aioId);
-            const uint64_t submitTimeNs = time_counter_now();
-            const int submitSceRc = apr_aio_api_rc_to_sce(submitRc);
-            note_aio_submit_result(submitSceRc);
-            if ((submitRc == 0 && aioId == kUnsetAioId) ||
-                (submitRc != 0 && aioId != kUnsetAioId)) {
-                AMPR_CRITICAL_LOGF("apr.reactor.aio.resubmit.single.inconsistent rc=0x%x aioId=%d prio=%d action=abort",
-                                   submitSceRc,
-                                   aioId,
-                                   active.aioPrio);
-                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.resubmit.single.inconsistent file=%s line=%d", __FILE__, __LINE__);
-                std::abort();
-            }
-            if (submitRc == 0) {
-                mark_active_read_submitted(active, aioId);
-                active.submitTimeNs = submitTimeNs;
-                active.retryNotBeforeNs = 0;
-                active.aioDeleteRetries = 0;
-                active.aioDeleteFirstFailureNs = 0;
-                #if AMPR_EMU_DEBUG_LOG
-                active.pollAttempts = 0;
-                note_accepted_aio_request(active.desc.length, job->prioIndex);
-#endif
-                arm_active_read_poll_after_submit(active, submitTimeNs);
-                progressed = true;
-                ++it;
-                continue;
-            }
-            if (apr_aio_submit_sce_rc_is_deferred(submitSceRc)) {
-                active.retryNotBeforeNs =
-                    submitTimeNs + AMPR_EMU_APR_AIO_SUBMIT_RETRY_DELAY_NS;
-                ++it;
-                continue;
-            }
-
-            const uint32_t errorOff = active.desc.errorOff;
-            set_or_defer_read_command_error(
-                *job,
-                "aio-resubmit",
-                apr_backend_read_error_to_apr(submitSceRc),
-                errorOff);
-            chain->allIssued = true;
-            apr_release_aio_read_desc(active.desc);
-            decrement_active_read_count(job);
-            decrement_read_chain_active(chain, active.readCreditBytes);
-            auto next = erase_active_read(it);
-            maybe_finish_read_chain(chain);
-            maybe_release_reactor_job(job);
-            it = next;
-            progressed = true;
+            stage_aio_submit(active, true);
+            ++it;
         }
+        progressed |= flush_aio_submit_round(nullptr);
         return progressed;
     }
 
@@ -7033,13 +8530,37 @@ private:
         bool completed{};
     };
 
-    void poll_active_aio_read(ActiveReadIt it, [[maybe_unused]] uint64_t pollNow, bool& completedAny) {
+    struct AioPollBatch {
+        ActiveReadRef items[kAioPollBatchLimit]{};
+        SceKernelAioSubmitId ids[kAioPollBatchLimit]{};
+        int states[kAioPollBatchLimit]{};
+        size_t count{};
+    };
+
+    void stage_active_aio_poll(AioPollBatch& batch, ActiveReadIt it) {
+        if (it == activeReads.end() || !active_read_is_submitted(*it) ||
+            batch.count >= kAioPollBatchLimit) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.poll.batch-stage.invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        for (size_t prior = 0; prior < batch.count; ++prior) {
+            if (batch.ids[prior] == it->aioId) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.poll.batch-id.duplicate file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+        }
+
+        const size_t item = batch.count++;
+        batch.items[item] = ActiveReadRef{
+            it->listSlot,
+            it->listGeneration,
+        };
+        batch.ids[item] = it->aioId;
+        batch.states[item] = INT32_MIN;
         it->hotPollQueued = false;
+        remove_poll_deadline(*it);
 #if AMPR_EMU_DEBUG_LOG
         note_active_read_due_poll();
-#endif
-        int state = 0;
-#if AMPR_EMU_DEBUG_LOG
         if (it->pollAttempts != UINT32_MAX) {
             ++it->pollAttempts;
         }
@@ -7050,9 +8571,21 @@ private:
         } else {
             ++runtimeAioPollBackgroundCalls;
         }
+#endif
+    }
+
+    AioObservationResult execute_active_aio_poll_batch(AioPollBatch& batch,
+                                                        uint64_t pollNow) {
+        if (batch.count == 0) {
+            return {};
+        }
+#if AMPR_EMU_DEBUG_LOG
         const uint64_t pollStartNs = time_counter_now();
 #endif
-        const int pollRc = sceKernelAioPollRequest(it->aioId, &state);
+        const int pollRc = sceKernelAioPollRequests(
+            batch.ids,
+            static_cast<int>(batch.count),
+            batch.states);
 #if AMPR_EMU_DEBUG_LOG
         const uint64_t pollEndNs = time_counter_now();
         note_aio_poll_call(pollEndNs >= pollStartNs ? pollEndNs - pollStartNs : 0);
@@ -7060,23 +8593,96 @@ private:
         const uint64_t pollEndNs = pollNow;
 #endif
         if (pollRc != 0) {
-            auto job = it->job;
-            if (job) {
-                set_or_defer_read_command_error(
-                    *job,
-                    "aio-poll",
-                    apr_backend_read_error_to_apr(
-                        apr_aio_api_rc_to_sce(pollRc)),
-                    it->desc.errorOff);
-            }
-            state = SCE_KERNEL_AIO_STATE_ABORTED;
+            AMPR_CRITICAL_LOGF("apr.reactor.aio.poll.multiple.fail rc=0x%x count=%zu action=abort",
+                               apr_aio_api_rc_to_sce(pollRc),
+                               batch.count);
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.poll.multiple.fail file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
 
-        const int finalState = state & ~SCE_KERNEL_AIO_STATE_NOTIFIED;
-        if (finalState == SCE_KERNEL_AIO_STATE_COMPLETED ||
-            finalState == SCE_KERNEL_AIO_STATE_ABORTED) {
-            auto finishedJob = it->job;
-            if (!finish_active_read(it, state)) {
+        size_t terminalItems[kAioPollBatchLimit]{};
+        SceKernelAioSubmitId deleteIds[kAioPollBatchLimit]{};
+        int deleteResults[kAioPollBatchLimit]{};
+        size_t terminalCount = 0;
+        for (size_t item = 0; item < batch.count; ++item) {
+            ActiveRead* const active = activeReads.active_at_slot(
+                batch.items[item].slot,
+                batch.items[item].generation);
+            if (!active || !active_read_is_submitted(*active) ||
+                active->aioId != batch.ids[item]) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.poll.batch-result.stale file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            int state = batch.states[item];
+            if (state == INT32_MIN) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.poll.multiple.result-unset file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            if (state < 0) {
+                // PollRequests reports an invalid/problematic ID in the
+                // corresponding states[] element. Preserve the former
+                // single-ID behavior for that read only: publish its poll
+                // error, retire its ID through the common delete batch, and
+                // leave unrelated IDs in this batch independently usable.
+                if (active->job) {
+                    set_or_defer_read_command_error(
+                        *active->job,
+                        "aio-poll",
+                        apr_backend_read_error_to_apr(
+                            apr_aio_api_rc_to_sce(state)),
+                        active->desc.errorOff);
+                }
+                state = SCE_KERNEL_AIO_STATE_ABORTED;
+                batch.states[item] = state;
+            }
+            const int finalState = state & ~SCE_KERNEL_AIO_STATE_NOTIFIED;
+            if (finalState == SCE_KERNEL_AIO_STATE_COMPLETED ||
+                finalState == SCE_KERNEL_AIO_STATE_ABORTED) {
+                terminalItems[terminalCount] = item;
+                deleteIds[terminalCount] = active->aioId;
+                deleteResults[terminalCount] = INT32_MIN;
+                ++terminalCount;
+            } else {
+                schedule_next_active_read_poll(*active, pollEndNs);
+            }
+        }
+
+        if (terminalCount == 0) {
+            batch.count = 0;
+            return {true, false};
+        }
+
+        const int deleteRc = sceKernelAioDeleteRequests(
+            deleteIds,
+            static_cast<int>(terminalCount),
+            deleteResults);
+        if (deleteRc != 0) {
+            AMPR_CRITICAL_LOGF("apr.reactor.aio.delete.multiple.fail rc=0x%x count=%zu action=abort",
+                               apr_aio_api_rc_to_sce(deleteRc),
+                               terminalCount);
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.delete.multiple.fail file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+
+        bool completedAny = false;
+        for (size_t terminal = 0; terminal < terminalCount; ++terminal) {
+            if (deleteResults[terminal] == INT32_MIN) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.delete.multiple.result-unset file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            const size_t item = terminalItems[terminal];
+            const ActiveReadRef& batchItem = batch.items[item];
+            ActiveReadIt it = activeReads.iterator_from_slot(batchItem.slot);
+            if (it == activeReads.end() ||
+                it->listGeneration != batchItem.generation ||
+                it->aioId != batch.ids[item]) {
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.delete.batch-result.stale file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
+            JobPtr finishedJob = it->job;
+            if (!finish_active_read_after_delete(it,
+                                                 batch.states[item],
+                                                 deleteResults[terminal])) {
                 (void)erase_active_read(it);
                 if (finishedJob && !activeReads.empty()) {
                     reset_completion_frontier_active_aio_poll_for_job(*finishedJob, pollEndNs);
@@ -7086,9 +8692,9 @@ private:
             } else if (!it->awaitingResubmit) {
                 schedule_next_active_read_poll(*it, pollEndNs);
             }
-        } else {
-            schedule_next_active_read_poll(*it, pollEndNs);
         }
+        batch.count = 0;
+        return {true, completedAny};
     }
 
     ActiveReadIt next_capacity_probe_active_read() {
@@ -7117,67 +8723,53 @@ private:
 
     AioObservationResult poll_active_aio_reads_for_capacity(uint64_t now) {
         if (!capacityPollRequested || submittedActiveReadCount == 0 ||
-            aio_poll_budget_cooldown_active(now) ||
             (nextCapacityPollNs != 0 && now < nextCapacityPollNs)) {
             return {};
         }
 
-        bool completedAny = false;
-        size_t pollCalls = 0;
-        while (pollCalls < kAioCapacityPollBatchLimit &&
-               submittedActiveReadCount != 0) {
+        AioPollBatch batch{};
+        const size_t itemLimit =
+            submittedActiveReadCount < kAioCapacityPollBatchLimit
+                ? submittedActiveReadCount
+                : kAioCapacityPollBatchLimit;
+        while (batch.count < itemLimit) {
             ActiveReadIt it = next_capacity_probe_active_read();
             if (it == activeReads.end()) {
                 break;
             }
-#if AMPR_EMU_DEBUG_LOG
-            note_log_counter(runtimeAioCapacityProbeCalls);
-#endif
-            poll_active_aio_read(it, time_counter_now(), completedAny);
-            ++pollCalls;
-            if (completedAny) {
-                // One observed completion is enough to make the last-known
-                // admission state less restrictive.  Let the queue traversal
-                // consume that slot before probing more requests.
-                break;
-            }
+            stage_active_aio_poll(batch, it);
         }
-        if (pollCalls != 0) {
+#if AMPR_EMU_DEBUG_LOG
+        if (batch.count != 0) {
+            note_log_counter(runtimeAioCapacityProbeCalls);
+        }
+#endif
+        const AioObservationResult result =
+            execute_active_aio_poll_batch(batch, now);
+        if (result.polled) {
             const uint64_t afterPollNs = time_counter_now();
             nextCapacityPollNs =
                 afterPollNs +
                 static_cast<uint64_t>(AMPR_EMU_APR_AIO_CAPACITY_POLL_INTERVAL_NS);
         }
-        return {pollCalls != 0, completedAny};
+        return result;
     }
 
     AioObservationResult poll_active_aio_reads_once() {
         const uint64_t observationNow = time_counter_now();
-        if (aio_poll_budget_cooldown_active(observationNow)) {
-            return {};
-        }
-        if (aioPollBudgetCooldownUntilNs != 0) {
-            clear_aio_poll_budget_cooldown();
-        }
 
-        bool completedAny = false;
-        size_t pollCalls = 0;
-        while (pollCalls < kAioHotPollLimit) {
+        AioPollBatch batch{};
+        while (batch.count < kAioPollBatchLimit) {
             auto hotIt = pop_hot_active_read_poll();
             if (hotIt == activeReads.end()) {
                 break;
             }
-            const uint64_t hotNow = time_counter_now();
             // Hot entries are queued only after their deadline is reset to now.
             // With a single reactor consumer they cannot become non-due before
             // observation, so the old defensive backoff-skip path was dead.
-            poll_active_aio_read(hotIt, hotNow, completedAny);
-            ++pollCalls;
+            stage_active_aio_poll(batch, hotIt);
         }
-        if (activeReads.empty()) {
-            return {pollCalls != 0, completedAny};
-        }
-        while (pollCalls < kAioPollBatchLimit && !activeReads.empty()) {
+        while (batch.count < kAioPollBatchLimit && !activeReads.empty()) {
             const uint64_t pollNow = time_counter_now();
             auto dueIt = first_due_active_read(pollNow);
             if (dueIt == activeReads.end()) {
@@ -7189,33 +8781,21 @@ private:
 #if AMPR_EMU_DEBUG_LOG
             note_deadline_heap_pick();
 #endif
-            ++pollCalls;
-            poll_active_aio_read(dueIt, pollNow, completedAny);
+            stage_active_aio_poll(batch, dueIt);
         }
 
-        if (pollCalls >= kAioPollBatchLimit && !activeReads.empty()) {
-            const uint64_t budgetNow = time_counter_now();
-            if (first_due_active_read(budgetNow) != activeReads.end() &&
-                !completedAny) {
-                arm_aio_poll_budget_cooldown(budgetNow);
-#if AMPR_EMU_DEBUG_LOG
-                note_aio_poll_budget_yield();
-#endif
-            }
-        }
-        if (completedAny) {
-            // A real completion changes admission/publication state; do not let
-            // a previous no-progress budget cooldown delay the next observation.
-            clear_aio_poll_budget_cooldown();
-        }
+        const AioObservationResult result =
+            execute_active_aio_poll_batch(batch, observationNow);
         // Polling is observation only.  Reactor sleeping is centralized in
         // worker() so command synchronization can contribute an independent
         // deadline and can never be delayed by an AIO helper.
-        return {pollCalls != 0, completedAny};
+        return result;
     }
 
 
-    bool finish_active_read(ActiveReadIt it, int state) {
+    bool finish_active_read_after_delete(ActiveReadIt it,
+                                         int state,
+                                         int deleteResult) {
         ActiveRead& active = *it;
         auto job = active.job;
         ReadChain* const chain = active.chain;
@@ -7241,8 +8821,6 @@ private:
             active.result.returnValue >= 0 &&
             static_cast<uint64_t>(active.result.returnValue) != active.desc.length;
 
-        int deleteResult = 0;
-        const int deleteRc = sceKernelAioDeleteRequest(active.aioId, &deleteResult);
         const int deleteResultSceRc = apr_aio_api_rc_to_sce(deleteResult);
         const auto bumpDeleteRetry = [&active]() -> uint32_t {
             const uint32_t nextRetry =
@@ -7271,13 +8849,12 @@ private:
                 (finishTimeNs == 0 &&
                  nextDeleteRetry >= AMPR_EMU_APR_AIO_DELETE_RETRY_LIMIT);
             if (shouldLogDeleteRetry(nextDeleteRetry)) {
-                AMPR_LOGF("apr.reactor.aio.delete.pending job=0x%llx seq=0x%llx retry=%u ageMs=%llu aioId=%d deleteRc=0x%x deleteResult=0x%x deleteSce=0x%x state=0x%x return=0x%llx fileId=%u",
+                AMPR_LOGF("apr.reactor.aio.delete.pending job=0x%llx seq=0x%llx retry=%u ageMs=%llu aioId=%d deleteResult=0x%x deleteSce=0x%x state=0x%x return=0x%llx fileId=%u",
                                job ? (unsigned long long)job->id : 0ull,
                                (unsigned long long)active.seq,
                                nextDeleteRetry,
                                (unsigned long long)(deleteFailureAgeNs / 1000000ull),
                                active.aioId,
-                               deleteRc,
                                deleteResult,
                                deleteResultSceRc,
                                state,
@@ -7285,14 +8862,13 @@ private:
                                active.desc.fileId);
             }
             if (timedOut) {
-                AMPR_CRITICAL_LOGF("apr.reactor.aio.delete.fatal job=0x%llx seq=0x%llx retry=%u ageMs=%llu aioId=%d rc=0x%x deleteRc=0x%x deleteResult=0x%x state=0x%x fileId=%u action=abort",
+                AMPR_CRITICAL_LOGF("apr.reactor.aio.delete.fatal job=0x%llx seq=0x%llx retry=%u ageMs=%llu aioId=%d rc=0x%x deleteResult=0x%x state=0x%x fileId=%u action=abort",
                                    job ? (unsigned long long)job->id : 0ull,
                                    (unsigned long long)active.seq,
                                    nextDeleteRetry,
                                    (unsigned long long)(deleteFailureAgeNs / 1000000ull),
                                    active.aioId,
                                    failureRc,
-                                   deleteRc,
                                    deleteResult,
                                    state,
                                    active.desc.fileId);
@@ -7301,9 +8877,6 @@ private:
             }
             return true;
         };
-        if (deleteRc != 0) {
-            return handleDeleteFailure(apr_aio_api_rc_to_sce(deleteRc));
-        }
         if (deleteResultSceRc != 0) {
             return handleDeleteFailure(deleteResultSceRc);
         }
@@ -7376,7 +8949,12 @@ private:
                           nextCompletionRetry);
             }
             if (rc == SCE_KERNEL_ERROR_EFAULT && logCompletionRetry) {
-                log_aio_efault_detail(active, rc, state, deleteRc, errorOff, finishTimeNs);
+                log_aio_efault_detail(active,
+                                      rc,
+                                      state,
+                                      deleteResultSceRc,
+                                      errorOff,
+                                      finishTimeNs);
             }
 #endif
         }
@@ -7461,7 +9039,7 @@ private:
             active.submitTimeNs = 0;
             active.result = {};
             active.request.result = &active.result;
-                    active.hotPollQueued = false;
+            active.hotPollQueued = false;
             remove_poll_deadline(active);
             if (logCompletionRetry) {
                 AMPR_LOGF("apr.reactor.aio.complete.retry-direct job=0x%llx seq=0x%llx retry=%u ammRetry=%u delayNs=%llu rc=0x%x fileId=%u buf=%p len=0x%llx off=0x%llx activeReads=%zu",
@@ -7811,7 +9389,7 @@ private:
                   (unsigned long long)runtimeAioAcceptedRequestCountByPriority[6],
                   (unsigned long long)runtimeAioAcceptedBytesByPriority[6],
                   (unsigned long long)counterWindowMs);
-        AMPR_LOGF("apr.reactor.counters.runtime reason=%s aioPollCalls=%llu aioPollsPerCompletionX100=%llu aioPollAttemptsPerCompletionX100=%llu aioFirstPollCompletion=%llu aioCompletionPollAttemptsMax=%llu aioPollCriticalCalls=%llu aioPollStagedEopCalls=%llu aioPollBackgroundCalls=%llu aioCapacityProbeCalls=%llu aioCapacityBlockedPasses=%llu waitAddressBlockedPasses=%llu aioPollBudgetYields=%llu aioPollWorkNs=%llu aioDrivenWaitNs=%llu deadlineHeapPicks=%llu deadlineHeapFutureStops=%llu activeReadDuePolls=%llu workerWakeups=%llu workerWakeupsPerSec=%llu aioDrivenWaits=%llu aioDrivenWaitsPerSec=%llu emfile=%llu directEmfile=%llu efaultRetry=%llu efaultRetryLimit=%llu fdCacheHit=%llu fdCacheMiss=%llu fdCacheEmfile=%llu aioLimit=%u aioBaseLimit=%u aioMaxLimit=%u aioSmallBoost=%u aioThrottle=%u aioSlowCooldown=%u aioBoostCooldown=%u aioInitState=%u aioInitLastRc=0x%x aioInitAttempts=%llu aioInitOk=%llu aioInitBusy=%llu aioInitFail=%llu aioSubmitEagain=%llu",
+        AMPR_LOGF("apr.reactor.counters.runtime reason=%s aioPollCalls=%llu aioPollsPerCompletionX100=%llu aioPollAttemptsPerCompletionX100=%llu aioFirstPollCompletion=%llu aioCompletionPollAttemptsMax=%llu aioPollCriticalCalls=%llu aioPollStagedEopCalls=%llu aioPollBackgroundCalls=%llu aioCapacityProbeCalls=%llu aioCapacityBlockedPasses=%llu waitAddressBlockedPasses=%llu aioPollWorkNs=%llu aioDrivenWaitNs=%llu deadlineHeapPicks=%llu deadlineHeapFutureStops=%llu activeReadDuePolls=%llu workerWakeups=%llu workerWakeupsPerSec=%llu aioDrivenWaits=%llu aioDrivenWaitsPerSec=%llu emfile=%llu directEmfile=%llu efaultRetry=%llu efaultRetryLimit=%llu fdCacheHit=%llu fdCacheMiss=%llu fdCacheEmfile=%llu aioLimit=%u aioBaseLimit=%u aioMaxLimit=%u aioSmallBoost=%u aioThrottle=%u aioSlowCooldown=%u aioBoostCooldown=%u aioInitState=%u aioInitLastRc=0x%x aioInitAttempts=%llu aioInitOk=%llu aioInitBusy=%llu aioInitFail=%llu aioSubmitEagain=%llu",
                   reason ? reason : "unknown",
                   (unsigned long long)runtimeAioPollCalls,
                   (unsigned long long)aioPollsPerCompletionX100,
@@ -7824,7 +9402,6 @@ private:
                   (unsigned long long)runtimeAioCapacityProbeCalls,
                   (unsigned long long)runtimeAioCapacityBlockedPasses,
                   (unsigned long long)runtimeWaitAddressBlockedPasses,
-                  (unsigned long long)runtimeAioPollBudgetYields,
                   (unsigned long long)runtimeAioPollWorkNs,
                   (unsigned long long)runtimeAioDrivenWaitNs,
                   (unsigned long long)runtimeDeadlineHeapPicks,
@@ -7879,7 +9456,6 @@ private:
             runtimeAioCapacityProbeCalls = 0;
             runtimeAioCapacityBlockedPasses = 0;
             runtimeWaitAddressBlockedPasses = 0;
-            runtimeAioPollBudgetYields = 0;
             runtimeAioPollWorkNs = 0;
             runtimeAioDrivenWaitNs = 0;
             runtimeDeadlineHeapPicks = 0;
@@ -7938,6 +9514,8 @@ private:
         const size_t observedOpen = fdStats.open + directOpen;
         const bool fdPressure = fdPressureUntilNs != 0 && now < fdPressureUntilNs;
         const uint32_t effectiveLimit = aio_effective_read_limit(now);
+        const size_t adaptiveDirectCap =
+            apr_adaptive_direct_fd_cap(fdCaps, effectiveLimit, fdPressure);
         const A53ReadGroupCounts groupActive = active_read_group_counts();
         const A53ReadGroupCounts groupTargets =
             read_group_targets(effectiveLimit, groupActive);
@@ -7978,7 +9556,7 @@ private:
                   observedOpen,
                   fdCaps.fdBudget,
                   fdCaps.cacheCap,
-                  fdCaps.directCap,
+                  adaptiveDirectCap,
                   fdStats.pinnedOpen,
                   fdStats.pins,
                   fdStats.evictable,
@@ -8309,6 +9887,173 @@ private:
         return progressed;
     }
 
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+    bool eager_native_completion_observed(JobState& job) {
+        if (!job.eagerNativeEventPlan || job.eagerNativeEventSubmitId == 0) {
+            return true;
+        }
+        if (job.eagerNativeEventCount == 0 ||
+            job.eagerNativeEventFirstToken == 0) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.completion.invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        volatile uint64_t* const progress =
+            eager_native_event_progress(job);
+        SceAprResultBuffer* const resultBuffer =
+            apr_native_event_result(job.poolSlot);
+        if (!progress || !resultBuffer) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.completion.storage-null file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        const uint64_t target = eager_native_record_token(
+            job, job.eagerNativeEventCount - 1u);
+        const uint64_t observed = __atomic_load_n(progress, __ATOMIC_ACQUIRE);
+        if (!native_batch_token_reached(observed, target)) {
+            if (job.eagerNativeEventAllReleased) {
+                const int earlyResult = __atomic_load_n(
+                    &resultBuffer->result, __ATOMIC_ACQUIRE);
+                const uint64_t now = time_counter_now();
+                const uint64_t ageNs =
+                    job.eagerNativeEventLastReleaseNs != 0 &&
+                            now >= job.eagerNativeEventLastReleaseNs
+                        ? now - job.eagerNativeEventLastReleaseNs
+                        : 0ull;
+                if (earlyResult != kAprNativeEventResultPending &&
+                    earlyResult != 0) {
+                    int waitRcRaw = 0;
+                    const SceAprSubmitId failedSubmitId =
+                        job.eagerNativeEventSubmitId;
+                    const int waitDispatchRc = apr_native_wait_dispatch(
+                        failedSubmitId, &waitRcRaw);
+                    const int waitRc = waitDispatchRc != 0
+                        ? waitDispatchRc
+                        : apr_libkernel_rc_to_sce(waitRcRaw);
+                    if (waitRc != 0) {
+                        AMPR_CRITICAL_LOGF("apr.reactor.native.fifo.wait.fail job=0x%llx lane=%u records=%u submitId=0x%x rc=0x%x raw=0x%x result=0x%x action=abort",
+                                           (unsigned long long)job.id,
+                                           (unsigned)job.prioIndex,
+                                           (unsigned)job.eagerNativeEventCount,
+                                           failedSubmitId,
+                                           waitRc,
+                                           waitRcRaw,
+                                           earlyResult);
+                        AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.wait.fail file=%s line=%d", __FILE__, __LINE__);
+                        std::abort();
+                    }
+                    set_fail(job,
+                             "native-fifo-result",
+                             earlyResult,
+                             eager_native_source_error_offset(
+                                 job, resultBuffer->errorOffset));
+                    job.eagerNativeEventSubmitId = 0;
+                    return true;
+                }
+                if (ageNs >= kNativeCompletionTimeoutNs) {
+                    const bool counterWaitPending =
+                        job.eagerNativeCounterWaitTarget != 0 &&
+                        !native_batch_token_reached(
+                            observed, job.eagerNativeCounterWaitTarget);
+                    if (counterWaitPending) {
+                        if (job.eagerNativeEventLastWatchdogNs == 0 ||
+                            now - job.eagerNativeEventLastWatchdogNs >=
+                                kNativeCompletionTimeoutNs) {
+                            job.eagerNativeEventLastWatchdogNs = now;
+                            AMPR_LOGF("apr.reactor.native.fifo.completion.pending job=0x%llx lane=%u records=%u submitId=0x%x target=0x%llx progress=0x%llx ageMs=%llu status=counter-wait",
+                                      (unsigned long long)job.id,
+                                      (unsigned)job.prioIndex,
+                                      (unsigned)job.eagerNativeEventCount,
+                                      job.eagerNativeEventSubmitId,
+                                      (unsigned long long)target,
+                                      (unsigned long long)observed,
+                                      (unsigned long long)(ageNs / 1000000ull));
+                        }
+                        return false;
+                    }
+                    [[maybe_unused]] const uint64_t release = __atomic_load_n(
+                        apr_native_event_lane_release_ptr(job.prioIndex),
+                        __ATOMIC_ACQUIRE);
+                    AMPR_CRITICAL_LOGF("apr.reactor.native.fifo.completion.timeout job=0x%llx lane=%u records=%u submitId=0x%x target=0x%llx progress=0x%llx release=0x%llx ageMs=%llu action=abort",
+                                       (unsigned long long)job.id,
+                                       (unsigned)job.prioIndex,
+                                       (unsigned)job.eagerNativeEventCount,
+                                       job.eagerNativeEventSubmitId,
+                                       (unsigned long long)target,
+                                       (unsigned long long)observed,
+                                       (unsigned long long)release,
+                                       (unsigned long long)(ageNs / 1000000ull));
+                    AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.completion.timeout file=%s line=%d", __FILE__, __LINE__);
+                    std::abort();
+                }
+            }
+            return false;
+        }
+
+        int waitRcRaw = 0;
+        const SceAprSubmitId completedSubmitId = job.eagerNativeEventSubmitId;
+        const int waitDispatchRc = apr_native_wait_dispatch(
+            completedSubmitId, &waitRcRaw);
+        const int waitRc = waitDispatchRc != 0
+            ? waitDispatchRc
+            : apr_libkernel_rc_to_sce(waitRcRaw);
+        if (waitRc != 0) {
+            AMPR_CRITICAL_LOGF("apr.reactor.native.fifo.wait.fail job=0x%llx lane=%u records=%u submitId=0x%x rc=0x%x raw=0x%x action=abort",
+                               (unsigned long long)job.id,
+                               (unsigned)job.prioIndex,
+                               (unsigned)job.eagerNativeEventCount,
+                               completedSubmitId,
+                               waitRc,
+                               waitRcRaw);
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.wait.fail file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        const int result = __atomic_load_n(
+            &resultBuffer->result, __ATOMIC_ACQUIRE);
+        if (result != 0) {
+            set_fail(job,
+                     "native-fifo-result",
+                     result,
+                     eager_native_source_error_offset(
+                         job, resultBuffer->errorOffset));
+        }
+        job.eagerNativeEventSubmitId = 0;
+        AMPR_TLOGF("apr.reactor.native.fifo.complete job=0x%llx lane=%u records=%u submitId=0x%x progress=0x%llx failed=%u",
+                   (unsigned long long)job.id,
+                   (unsigned)job.prioIndex,
+                   (unsigned)job.eagerNativeEventCount,
+                   completedSubmitId,
+                   (unsigned long long)observed,
+                   job_failed(job) ? 1u : 0u);
+        return true;
+    }
+#endif
+
+    int retire_native_apr_micro_submit(JobState& job,
+                                       AprNativeMicroSlot& slot) {
+        if (job.nativeMicroEngine != NativeMicroEngine::Apr ||
+            job.nativeMicroSubmitId == 0) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.micro.apr.retire-invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        int waitRcRaw = 0;
+        const SceAprSubmitId submitId = job.nativeMicroSubmitId;
+        const int waitDispatchRc = apr_native_wait_dispatch(submitId, &waitRcRaw);
+        const int waitRc = waitDispatchRc != 0
+            ? waitDispatchRc
+            : apr_libkernel_rc_to_sce(waitRcRaw);
+        if (waitRc != 0) {
+            AMPR_CRITICAL_LOGF("apr.reactor.native.micro.apr.wait.fail job=0x%llx lane=%u submitId=0x%x rc=0x%x raw=0x%x action=abort",
+                               (unsigned long long)job.id,
+                               (unsigned)job.prioIndex,
+                               submitId,
+                               waitRc,
+                               waitRcRaw);
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.micro.apr.wait.fail file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        job.nativeMicroSubmitId = 0;
+        return __atomic_load_n(&slot.result.result, __ATOMIC_ACQUIRE);
+    }
+
     bool native_micro_completion_observed(JobState& job) {
         if (!job.nativeSubmitted.load(std::memory_order_acquire)) {
             return true;
@@ -8399,6 +10144,15 @@ private:
             return true;
         }
 
+        const bool aprMicro =
+            job.nativeMicroEngine == NativeMicroEngine::Apr;
+        AprNativeMicroSlot* const microSlot = aprMicro
+            ? apr_native_micro_slot(job.poolSlot)
+            : nullptr;
+        if (aprMicro && (!microSlot || job.nativeMicroSubmitId == 0)) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.micro.apr.completion-invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
         const uint64_t completionValue = job.nativeCompletionAddress
             ? *job.nativeCompletionAddress
             : 0ull;
@@ -8409,11 +10163,48 @@ private:
             : 0ull;
         const bool timedOut = completionValue == 0 &&
                               ageNs >= kNativeCompletionTimeoutNs;
-        if (completionValue == 0 && !timedOut) {
+        bool aprTerminalError = false;
+        if (aprMicro && completionValue == 0) {
+            const int earlyResult = __atomic_load_n(
+                &microSlot->result.result, __ATOMIC_ACQUIRE);
+            if (earlyResult != kAprNativeMicroResultPending &&
+                earlyResult != 0) {
+                const int result = retire_native_apr_micro_submit(
+                    job, *microSlot);
+                set_fail(job,
+                         "native-apr-micro-result",
+                         result != 0 ? result : earlyResult,
+                         job.nativeSourceOffset);
+                aprTerminalError = true;
+            }
+        }
+        if (completionValue == 0 && !timedOut && !aprTerminalError) {
             return false;
         }
         std::atomic_thread_fence(std::memory_order_acquire);
-        if (timedOut) {
+        if (timedOut && !aprTerminalError) {
+            if (aprMicro) {
+                if (job.nativeSourceType == OpType::WaitOnCounter) {
+                    job.nativeSubmitTimeNs = now;
+                    AMPR_LOGF("apr.reactor.native.micro.apr.pending job=0x%llx lane=%u submitId=0x%x ageMs=%llu sourceOffset=0x%x sourceType=%s status=counter-wait",
+                              (unsigned long long)job.id,
+                              (unsigned)job.prioIndex,
+                              job.nativeMicroSubmitId,
+                              (unsigned long long)(ageNs / 1000000ull),
+                              job.nativeSourceOffset,
+                              sce::Ampr::ampr_op_name(job.nativeSourceType));
+                    return false;
+                }
+                AMPR_CRITICAL_LOGF("apr.reactor.native.micro.apr.completion.timeout job=0x%llx lane=%u submitId=0x%x ageMs=%llu sourceOffset=0x%x sourceType=%s action=abort",
+                                   (unsigned long long)job.id,
+                                   (unsigned)job.prioIndex,
+                                   job.nativeMicroSubmitId,
+                                   (unsigned long long)(ageNs / 1000000ull),
+                                   job.nativeSourceOffset,
+                                   sce::Ampr::ampr_op_name(job.nativeSourceType));
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.native.micro.apr.completion.timeout file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
             AMPR_CRITICAL_LOGF("apr.reactor.native.completion.timeout job=0x%llx lane=%u engine=%s ageMs=%llu sourceOffset=0x%x sourceType=%s completion=%p",
                                (unsigned long long)job.id,
                                (unsigned)job.prioIndex,
@@ -8426,13 +10217,22 @@ private:
                      "native-completion-timeout",
                      SCE_KERNEL_ERROR_ETIMEDOUT,
                      job.nativeSourceOffset);
-        } else if (!job_failed(job) &&
+        } else if (!aprTerminalError && !job_failed(job) &&
                    (!job.nativeCompletionAddress ||
                     *job.nativeCompletionAddress != kAprNativeMicroCompletionDone)) {
             set_fail(job,
                      "native-completion-write",
                      SCE_KERNEL_ERROR_EIO,
                      job.nativeSourceOffset);
+        }
+        if (aprMicro && !aprTerminalError) {
+            const int result = retire_native_apr_micro_submit(job, *microSlot);
+            if (result != 0) {
+                set_fail(job,
+                         "native-apr-micro-result",
+                         result,
+                         job.nativeSourceOffset);
+            }
         }
         AMPR_TLOGF("apr.reactor.native.micro.complete job=0x%llx sourceOffset=0x%x sourceType=%s engine=%s completion=%p value=0x%llx failed=%u",
                    (unsigned long long)job.id,
@@ -8454,6 +10254,19 @@ private:
         if (!job) {
             return;
         }
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        if (job_failed(*job) && job->eagerNativeEventPlan) {
+            // NOP-cancel only still-closed counter-family records. Immutable
+            // event packets are left intact and retire by gate release alone.
+            cancel_and_drain_eager_native_records(*job);
+        }
+#endif
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+        if (job->eagerNativeEventSubmitId != 0 &&
+            !eager_native_completion_observed(*job)) {
+            return;
+        }
+#endif
         if (job->nativeSubmitted.load(std::memory_order_acquire)) {
             if (!native_micro_completion_observed(*job)) {
                 return;
@@ -8543,7 +10356,7 @@ private:
             }
 
             // Phase 1: AIO observation.  Completion knowledge changes only via
-            // a real sceKernelAioPollRequest().  poll_active_aio_reads_once()
+            // a real sceKernelAioPollRequests().  poll_active_aio_reads_once()
             // touches only hot/deadline-due requests and never sleeps.
             bool aioPolledThisPass = false;
             if (has_submitted_active_reads()) {
@@ -8571,7 +10384,6 @@ private:
                 }
             } else {
                 capacityPollCursorSlot = UINT32_MAX;
-                clear_aio_poll_budget_cooldown();
             }
 
             // Retry/native maintenance uses the freshly observed AIO state.
@@ -8647,10 +10459,7 @@ private:
             }
 
             if (capacityPollRequested && submittedActiveReadCount != 0) {
-                uint64_t capacityReadyNs = nextCapacityPollNs;
-                if (aioPollBudgetCooldownUntilNs > capacityReadyNs) {
-                    capacityReadyNs = aioPollBudgetCooldownUntilNs;
-                }
+                const uint64_t capacityReadyNs = nextCapacityPollNs;
                 const uint64_t capacityWaitNs =
                     capacityReadyNs == 0 || capacityReadyNs <= nowNs
                         ? 0
@@ -8708,7 +10517,6 @@ private:
     bool passLocalEqueueBackpressure{false};
     bool capacityPollRequested{false};
     uint64_t nextCapacityPollNs{0};
-    uint64_t aioPollBudgetCooldownUntilNs{0};
     uint32_t capacityPollCursorSlot{UINT32_MAX};
 
     AmprMutex workerLifecycleMutex;
@@ -8749,12 +10557,13 @@ private:
     uint32_t readChainFreeHead{UINT32_MAX};
     uint32_t liveReadChainCount{};
     ActiveReadList activeReads;
+    AioSubmitRound aioSubmitRound{};
     uint32_t submittedActiveReadCount{};
     uint32_t deferredActiveReadCount{};
     CursorReadWaitHint cursorReadWaitHints[kPriorityCount]{};
     AioAgeThrottleLevel aioAgeThrottleLevel{AioAgeThrottleLevel::Normal};
     uint64_t aioSmallReadBoostBlockedUntilNs{0};
-    HotPollEntry hotPollQueue[kHotPollQueueCapacity]{};
+    ActiveReadRef hotPollQueue[kHotPollQueueCapacity]{};
     uint32_t hotPollQueueHead{};
     uint32_t hotPollQueueTail{};
     uint32_t hotPollQueueCount{};
@@ -8765,6 +10574,21 @@ private:
     bool nativeExecutionPoolReady{false};
     uint32_t nativeBatchPaddingHeaders[kAprNativeBatchPaddingHeaderCount]{};
     bool nativeMicroTemplateReady[kJobStatePoolCapacity]{};
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+    std::atomic<uint32_t> eagerNativeArenaLock{0};
+    EagerNativeArenaAllocation
+        eagerNativeArenaAllocations[kAprNativeEventArenaAllocationCount]{};
+    uint32_t eagerNativeArenaFreeHead{UINT32_MAX};
+    uint32_t eagerNativeArenaQueueHead{UINT32_MAX};
+    uint32_t eagerNativeArenaQueueTail{UINT32_MAX};
+    uint32_t eagerNativeArenaReadOffset{};
+    uint32_t eagerNativeArenaWriteOffset{};
+    uint32_t eagerNativeArenaUsedBytes{};
+    AmprMutex eagerNativeSubmitMutex[kPriorityCount];
+    JobPtr eagerNativeEventQueueHeads[kPriorityCount]{};
+    JobPtr eagerNativeEventQueueTails[kPriorityCount]{};
+    uint64_t eagerNativeNextToken[kPriorityCount]{};
+#endif
     NativeBatchLane nativeBatchLanes[kPriorityCount]{};
     SyntheticWaitSlot syntheticWaitSlots[kSyntheticRequestCapacity]{};
     SyntheticDoneSlot syntheticDoneSlots[kSyntheticDoneCapacity]{};
@@ -8794,7 +10618,6 @@ private:
     uint64_t runtimeAioCapacityProbeCalls{0};
     uint64_t runtimeAioCapacityBlockedPasses{0};
     uint64_t runtimeWaitAddressBlockedPasses{0};
-    uint64_t runtimeAioPollBudgetYields{0};
     uint64_t runtimeAioPollWorkNs{0};
     uint64_t runtimeAioDrivenWaitNs{0};
     uint64_t runtimeDeadlineHeapPicks{0};
@@ -8849,6 +10672,18 @@ AprAioReactor::AprAioReactor() {
     }
     jobStateFreeHead = kJobStatePoolCapacity != 0 ? 0u : UINT32_MAX;
     jobStateFreeCount.store(kJobStatePoolCapacity, std::memory_order_relaxed);
+#if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
+    for (uint32_t slot = 0;
+         slot < kAprNativeEventArenaAllocationCount;
+         ++slot) {
+        eagerNativeArenaAllocations[slot].next =
+            slot + 1u < kAprNativeEventArenaAllocationCount
+                ? slot + 1u
+                : UINT32_MAX;
+    }
+    eagerNativeArenaFreeHead =
+        kAprNativeEventArenaAllocationCount != 0 ? 0u : UINT32_MAX;
+#endif
     for (uint32_t slot = 0; slot < kSyntheticDoneCapacity; ++slot) {
         syntheticDoneSlots[slot].next =
             slot + 1u < kSyntheticDoneCapacity ? slot + 1u : UINT32_MAX;

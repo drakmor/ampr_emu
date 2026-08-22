@@ -572,6 +572,18 @@ class LogStats:
     equeue_direct_waits: int = 0
     equeue_direct_by_eq: Counter = field(default_factory=Counter)
     equeue_names: Dict[str, str] = field(default_factory=dict)
+    apr_local_equeue: Counter = field(default_factory=Counter)
+    apr_local_equeue_counter_lines: int = 0
+    apr_local_equeue_wait_lines: int = 0
+    apr_local_equeue_grace_lines: int = 0
+    apr_local_equeue_wake_skip_metric_lines: int = 0
+    apr_local_equeue_timeout_metric_lines: int = 0
+    apr_local_equeue_live_wait_intents: int = 0
+    apr_local_equeue_wait_intent_peak: int = 0
+    apr_local_equeue_grace_configured_us: int = 0
+    apr_local_equeue_grace_adaptive: int = 0
+    apr_local_equeue_grace_min_us: int = 0
+    apr_local_equeue_grace_max_us: int = 0
     autogen_events: int = 0
     reactor_blocked: int = 0
     reactor_backlog_reasons: Counter = field(default_factory=Counter)
@@ -2126,6 +2138,78 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
             ),
         )
 
+    if prefix == "apr.equeue.counters":
+        stats.apr_local_equeue_counter_lines += 1
+        if "wakeNoWaiterSkips" in kv:
+            stats.apr_local_equeue_wake_skip_metric_lines += 1
+        for name in (
+            "publishAttempts",
+            "published",
+            "backpressure",
+            "fallbackHooks",
+            "fallbackQueue",
+            "fallbackRegistration",
+            "fallbackWake",
+            "wakeTriggers",
+            "wakeElisions",
+            "wakeNoWaiterSkips",
+            "wakeFailures",
+        ):
+            stats.apr_local_equeue[name] += parse_int(kv.get(name)) or 0
+    elif prefix == "apr.equeue.wait.counters":
+        stats.apr_local_equeue_wait_lines += 1
+        if "nativeWaitZero" in kv:
+            stats.apr_local_equeue_timeout_metric_lines += 1
+        for name in (
+            "trackedWaits",
+            "directWaits",
+            "nativeWaits",
+            "nativeWaitZero",
+            "nativeWaitFinite",
+            "nativeWaitInfinite",
+            "nativeEvents",
+            "hiddenFiltered",
+            "staleWakes",
+            "syntheticEvents",
+            "syntheticDirectReturns",
+        ):
+            stats.apr_local_equeue[name] += parse_int(kv.get(name)) or 0
+        live_wait_intents = parse_int(kv.get("liveWaitIntents"))
+        wait_intent_peak = parse_int(kv.get("waitIntentPeak"))
+        if live_wait_intents is not None:
+            stats.apr_local_equeue_live_wait_intents = live_wait_intents
+        if wait_intent_peak is not None:
+            stats.apr_local_equeue_wait_intent_peak = max(
+                stats.apr_local_equeue_wait_intent_peak, wait_intent_peak
+            )
+    elif prefix == "apr.equeue.grace.counters":
+        stats.apr_local_equeue_grace_lines += 1
+        for name in (
+            "attempts",
+            "hits",
+            "misses",
+            "events",
+            "spinIterations",
+            "elapsedUs",
+            "increases",
+            "decreases",
+            "cooldowns",
+            "cooldownEvents",
+            "rearms",
+        ):
+            stats.apr_local_equeue[name] += parse_int(kv.get(name)) or 0
+        configured_us = parse_int(kv.get("configuredUs"))
+        if configured_us is not None:
+            stats.apr_local_equeue_grace_configured_us = configured_us
+        for name, attribute in (
+            ("adaptive", "apr_local_equeue_grace_adaptive"),
+            ("minUs", "apr_local_equeue_grace_min_us"),
+            ("maxUs", "apr_local_equeue_grace_max_us"),
+        ):
+            value = parse_int(kv.get(name))
+            if value is not None:
+                setattr(stats, attribute, value)
+
     if "eq.wait" in prefix or prefix.startswith("eq.wait"):
         stats.equeue_waits += 1
     if prefix == "eq.create.overlay":
@@ -3348,6 +3432,52 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
             for eq, count in stats.equeue_direct_by_eq.most_common(3)
         )
         print(f"  top direct equeues:  {top_direct}")
+    if stats.apr_local_equeue_counter_lines or stats.apr_local_equeue_wait_lines:
+        local = stats.apr_local_equeue
+        no_waiter_skip = (
+            str(local["wakeNoWaiterSkips"])
+            if stats.apr_local_equeue_wake_skip_metric_lines
+            else "n/a"
+        )
+        print(
+            "  APR local equeue:    "
+            f"publish={local['published']}/{local['publishAttempts']} "
+            f"fallback={local['fallbackHooks'] + local['fallbackQueue'] + local['fallbackRegistration'] + local['fallbackWake']} "
+            f"backpressure={local['backpressure']} wakeFail={local['wakeFailures']}"
+        )
+        print(
+            "  local wake activity: "
+            f"trigger={local['wakeTriggers']} armedSkip={local['wakeElisions']} "
+            f"noWaiterSkip={no_waiter_skip} stale={local['staleWakes']}"
+        )
+        if stats.apr_local_equeue_timeout_metric_lines:
+            print(
+                "  local wait timeout:  "
+                f"zero={local['nativeWaitZero']} finite={local['nativeWaitFinite']} "
+                f"infinite={local['nativeWaitInfinite']} "
+                f"intent={stats.apr_local_equeue_live_wait_intents}/"
+                f"{stats.apr_local_equeue_wait_intent_peak}"
+            )
+        else:
+            print("  local wait timeout:  metrics unavailable in this build")
+        if stats.apr_local_equeue_grace_lines:
+            adaptive = ""
+            if stats.apr_local_equeue_grace_adaptive:
+                adaptive = (
+                    f"adaptive={stats.apr_local_equeue_grace_min_us}-"
+                    f"{stats.apr_local_equeue_grace_max_us}us "
+                )
+            print(
+                "  local wait grace:    "
+                f"configured={stats.apr_local_equeue_grace_configured_us}us "
+                f"{adaptive}"
+                f"attempt/hit/miss={local['attempts']}/{local['hits']}/{local['misses']} "
+                f"events={local['events']} elapsed={local['elapsedUs']}us "
+                f"up/down/cooldown/rearm={local['increases']}/"
+                f"{local['decreases']}/{local['cooldowns']}/{local['rearms']}"
+            )
+        else:
+            print("  local wait grace:    metrics unavailable in this build")
     print(f"  autogen events:      {stats.autogen_events}")
     print(f"  blocked samples:     {stats.reactor_blocked}")
     print(
@@ -4309,6 +4439,20 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
             {"eq": eq, "name": stats.equeue_names.get(eq, "unknown"), "count": count}
             for eq, count in stats.equeue_direct_by_eq.most_common(top)
         ],
+        "apr_local_equeue": {
+            "counter_lines": stats.apr_local_equeue_counter_lines,
+            "wait_counter_lines": stats.apr_local_equeue_wait_lines,
+            "grace_counter_lines": stats.apr_local_equeue_grace_lines,
+            "wake_skip_metric_lines": stats.apr_local_equeue_wake_skip_metric_lines,
+            "timeout_metric_lines": stats.apr_local_equeue_timeout_metric_lines,
+            "counters": dict(stats.apr_local_equeue),
+            "live_wait_intents": stats.apr_local_equeue_live_wait_intents,
+            "wait_intent_peak": stats.apr_local_equeue_wait_intent_peak,
+            "grace_configured_us": stats.apr_local_equeue_grace_configured_us,
+            "grace_adaptive": stats.apr_local_equeue_grace_adaptive,
+            "grace_min_us": stats.apr_local_equeue_grace_min_us,
+            "grace_max_us": stats.apr_local_equeue_grace_max_us,
+        },
         "autogen_events": stats.autogen_events,
         "reactor_blocked": stats.reactor_blocked,
         "read_completion_backpressure_events": stats.read_completion_backpressure_events,
