@@ -1811,13 +1811,13 @@ __attribute__((noinline)) static bool is_app0_path_arg(const char* path) {
            is_normalized_app0_key(key, keyLen);
 }
 
-static bool app0_file_hook_should_try_index_fallback(int directRc) {
+static bool app0_file_hook_should_try_index_fallback(int directRc, int directErrno) {
     if (directRc == 0) {
         return false;
     }
     int err = 0;
     if (directRc == -1) {
-        err = errno;
+        err = directErrno;
     } else if ((static_cast<uint32_t>(directRc) & 0xFFFF0000u) == 0x80020000u) {
         err = ampr_posix_errno_from_sce(directRc);
     } else {
@@ -1826,25 +1826,34 @@ static bool app0_file_hook_should_try_index_fallback(int directRc) {
     return err == ENOENT || err == ENOTDIR;
 }
 
+static int app0_file_hook_return_direct(int directRc, int directErrno) {
+    if (directRc == -1) {
+        errno = directErrno;
+    }
+    return directRc;
+}
+
 // Retry failed /app0 path operations with the canonical indexed spelling.
 extern "C" int sceKernelOpen_emul(const char* path, int flags, SceKernelMode mode) {
     const int direct = ampr_real_sceKernelOpen(path, flags, mode);
-    const bool isApp0 = is_app0_path_arg(path);
+    const int directErrno = direct == -1 ? errno : 0;
     if (direct >= 0 ||
-        !isApp0 ||
         (flags & SCE_KERNEL_O_DIRECTORY) != 0 ||
-        !app0_file_hook_should_try_index_fallback(direct)) {
-        AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%s directRc=0x%x flags=0x%x mode=0x%x indexed=0",
+        !app0_file_hook_should_try_index_fallback(direct, directErrno)) {
+        AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%p directRc=0x%x flags=0x%x mode=0x%x indexed=0",
                                direct >= 0 ? "opened" : "failed",
-                               ampr_log_path_arg(path), direct, flags, (unsigned)mode);
-        return direct;
+                               path, direct, flags, (unsigned)mode);
+        return app0_file_hook_return_direct(direct, directErrno);
+    }
+    if (!is_app0_path_arg(path)) {
+        return app0_file_hook_return_direct(direct, directErrno);
     }
 
     const char* realPath = maybe_resolve_app0_path_arg(path);
     if (realPath == path) {
         AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=failed path=%s directRc=0x%x flags=0x%x mode=0x%x indexed=0",
                                ampr_log_path_arg(path), direct, flags, (unsigned)mode);
-        return direct;
+        return app0_file_hook_return_direct(direct, directErrno);
     }
     const int rc = ampr_real_sceKernelOpen(realPath, flags, mode);
     AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%s real=%s rc=0x%x flags=0x%x mode=0x%x indexed=1",
@@ -1855,18 +1864,21 @@ extern "C" int sceKernelOpen_emul(const char* path, int flags, SceKernelMode mod
 
 extern "C" int sceKernelStat_emul(const char* path, SceKernelStat* sb) {
     const int direct = ampr_real_sceKernelStat(path, sb);
-    const bool isApp0 = is_app0_path_arg(path);
-    if (direct == 0 || !isApp0 || !app0_file_hook_should_try_index_fallback(direct)) {
-        AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%s directRc=0x%x out=%p indexed=0",
-                               ampr_log_path_arg(path), direct, sb);
-        return direct;
+    const int directErrno = direct == -1 ? errno : 0;
+    if (direct == 0 || !app0_file_hook_should_try_index_fallback(direct, directErrno)) {
+        AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%p directRc=0x%x out=%p indexed=0",
+                               path, direct, sb);
+        return app0_file_hook_return_direct(direct, directErrno);
+    }
+    if (!is_app0_path_arg(path)) {
+        return app0_file_hook_return_direct(direct, directErrno);
     }
 
     const char* realPath = maybe_resolve_app0_path_arg(path);
     if (realPath == path) {
         AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%s directRc=0x%x out=%p indexed=0",
                                ampr_log_path_arg(path), direct, sb);
-        return direct;
+        return app0_file_hook_return_direct(direct, directErrno);
     }
     const int rc = ampr_real_sceKernelStat(realPath, sb);
     AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%s real=%s rc=0x%x out=%p indexed=1",
@@ -1876,18 +1888,21 @@ extern "C" int sceKernelStat_emul(const char* path, SceKernelStat* sb) {
 
 extern "C" int sceKernelCheckReachability_emul(const char* path) {
     const int direct = ampr_real_sceKernelCheckReachability(path);
-    const bool isApp0 = is_app0_path_arg(path);
-    if (direct == 0 || !isApp0 || !app0_file_hook_should_try_index_fallback(direct)) {
-        AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%s directRc=0x%x indexed=0",
-                               ampr_log_path_arg(path), direct);
-        return direct;
+    const int directErrno = direct == -1 ? errno : 0;
+    if (direct == 0 || !app0_file_hook_should_try_index_fallback(direct, directErrno)) {
+        AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%p directRc=0x%x indexed=0",
+                               path, direct);
+        return app0_file_hook_return_direct(direct, directErrno);
+    }
+    if (!is_app0_path_arg(path)) {
+        return app0_file_hook_return_direct(direct, directErrno);
     }
 
     const char* realPath = maybe_resolve_app0_path_arg(path);
     if (realPath == path) {
         AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%s directRc=0x%x indexed=0",
                                ampr_log_path_arg(path), direct);
-        return direct;
+        return app0_file_hook_return_direct(direct, directErrno);
     }
     const int rc = ampr_real_sceKernelCheckReachability(realPath);
     AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%s real=%s rc=0x%x indexed=1",
@@ -1897,18 +1912,21 @@ extern "C" int sceKernelCheckReachability_emul(const char* path) {
 
 extern "C" int sceKernelUnlink_emul(const char* path) {
     const int direct = ampr_real_sceKernelUnlink(path);
-    const bool isApp0 = is_app0_path_arg(path);
-    if (direct == 0 || !isApp0 || !app0_file_hook_should_try_index_fallback(direct)) {
-        AMPR_FILE_WRAPPER_LOGF("fs.unlink.emu path=%s directRc=0x%x indexed=0",
-                               ampr_log_path_arg(path), direct);
-        return direct;
+    const int directErrno = direct == -1 ? errno : 0;
+    if (direct == 0 || !app0_file_hook_should_try_index_fallback(direct, directErrno)) {
+        AMPR_FILE_WRAPPER_LOGF("fs.unlink.emu path=%p directRc=0x%x indexed=0",
+                               path, direct);
+        return app0_file_hook_return_direct(direct, directErrno);
+    }
+    if (!is_app0_path_arg(path)) {
+        return app0_file_hook_return_direct(direct, directErrno);
     }
 
     const char* realPath = maybe_resolve_app0_path_arg(path);
     if (realPath == path) {
         AMPR_FILE_WRAPPER_LOGF("fs.unlink.emu path=%s directRc=0x%x indexed=0",
                                ampr_log_path_arg(path), direct);
-        return direct;
+        return app0_file_hook_return_direct(direct, directErrno);
     }
     const int rc = ampr_real_sceKernelUnlink(realPath);
     AMPR_FILE_WRAPPER_LOGF("fs.unlink.emu path=%s real=%s rc=0x%x indexed=1",
@@ -1918,15 +1936,16 @@ extern "C" int sceKernelUnlink_emul(const char* path) {
 
 extern "C" int sceKernelRename_emul(const char* from, const char* to) {
     const int direct = ampr_real_sceKernelRename(from, to);
+    const int directErrno = direct == -1 ? errno : 0;
     if (direct == 0) {
         AMPR_FILE_WRAPPER_LOGF("fs.rename.emu from=%s to=%s directRc=0x%x indexedFrom=0 indexedTo=0",
                                ampr_log_path_arg(from), ampr_log_path_arg(to), direct);
         return direct;
     }
-    if (!app0_file_hook_should_try_index_fallback(direct)) {
-        AMPR_FILE_WRAPPER_LOGF("fs.rename.emu from=%s to=%s directRc=0x%x indexedFrom=0 indexedTo=0",
-                               ampr_log_path_arg(from), ampr_log_path_arg(to), direct);
-        return direct;
+    if (!app0_file_hook_should_try_index_fallback(direct, directErrno)) {
+        AMPR_FILE_WRAPPER_LOGF("fs.rename.emu from=%p to=%p directRc=0x%x indexedFrom=0 indexedTo=0",
+                               from, to, direct);
+        return app0_file_hook_return_direct(direct, directErrno);
     }
 
     const bool fromIsApp0 = is_app0_path_arg(from);
@@ -1934,14 +1953,14 @@ extern "C" int sceKernelRename_emul(const char* from, const char* to) {
     if (!fromIsApp0 && !toIsApp0) {
         AMPR_FILE_WRAPPER_LOGF("fs.rename.emu from=%s to=%s directRc=0x%x indexedFrom=0 indexedTo=0",
                                ampr_log_path_arg(from), ampr_log_path_arg(to), direct);
-        return direct;
+        return app0_file_hook_return_direct(direct, directErrno);
     }
     const char* realFrom = maybe_resolve_app0_path_arg(from);
     const char* realTo = maybe_resolve_app0_path_arg(to);
     if (realFrom == from && realTo == to) {
         AMPR_FILE_WRAPPER_LOGF("fs.rename.emu from=%s to=%s directRc=0x%x indexedFrom=0 indexedTo=0",
                                ampr_log_path_arg(from), ampr_log_path_arg(to), direct);
-        return direct;
+        return app0_file_hook_return_direct(direct, directErrno);
     }
     const int rc = ampr_real_sceKernelRename(realFrom, realTo);
     AMPR_FILE_WRAPPER_LOGF("fs.rename.emu from=%s realFrom=%s to=%s realTo=%s rc=0x%x indexedFrom=%u indexedTo=%u",

@@ -90,6 +90,15 @@ extern "C" int sceKernelWriteMapCommand(void* dst,
                                          uint64_t type,
                                          uint64_t prot,
                                          uint64_t* outSize);
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+extern "C" SceKernelModule sceKernelLoadStartModule_equeue_observer(
+    const char* moduleFileName,
+    size_t args,
+    const void* argp,
+    uint32_t flags,
+    const SceKernelLoadModuleOpt* opt,
+    int* result);
+#endif
 
 namespace {
 
@@ -127,6 +136,12 @@ struct HookSpec {
     InlineDetour detour;
 };
 
+struct ExternalEqueueHookSpec {
+    const char* symbol;
+    void* replacement;
+    InlineDetour detour;
+};
+
 constexpr bool kHookMandatory = true;
 constexpr bool kHookOptional = false;
 
@@ -150,7 +165,7 @@ enum HookFailReason : uint8_t {
     kHookFailInternalRelative = 9,
 };
 
-bool install_inline_detour(size_t hookIndex,
+bool install_inline_detour(void** originalSlot,
                            InlineDetour& detour,
                            void* target,
                            void* replacement,
@@ -230,18 +245,62 @@ HookSpec g_hooks[] = {
     {"sceKernelWriteModifyMtypeProtectWithGpuMaskIdCommand", reinterpret_cast<void*>(&sceKernelWriteModifyMtypeProtectWithGpuMaskIdCommand_emul), kHookMandatory, {}},
     {"sceKernelWriteRemapIntoPrtCommand", reinterpret_cast<void*>(&sceKernelWriteRemapIntoPrtCommand_emul), kHookOptional, {}},
 #if AMPR_EMU_APR_LOCAL_EQUEUE
+    {"sceKernelCreateEqueue", reinterpret_cast<void*>(&sceKernelCreateEqueue_emul), kHookOptional, {}},
     {"sceKernelWaitEqueue", reinterpret_cast<void*>(&sceKernelWaitEqueue_emul), kHookOptional, {}},
     {"sceKernelDeleteEqueue", reinterpret_cast<void*>(&sceKernelDeleteEqueue_emul), kHookOptional, {}},
     {"sceKernelAddAmprEvent", reinterpret_cast<void*>(&sceKernelAddAmprEvent_emul), kHookOptional, {}},
     {"sceKernelDeleteAmprEvent", reinterpret_cast<void*>(&sceKernelDeleteAmprEvent_emul), kHookOptional, {}},
+    {"sceKernelAddTimerEvent", reinterpret_cast<void*>(&sceKernelAddTimerEvent_emul), kHookOptional, {}},
+    {"sceKernelAddReadEvent", reinterpret_cast<void*>(&sceKernelAddReadEvent_emul), kHookOptional, {}},
+    {"sceKernelAddWriteEvent", reinterpret_cast<void*>(&sceKernelAddWriteEvent_emul), kHookOptional, {}},
+    {"sceKernelAddFileEvent", reinterpret_cast<void*>(&sceKernelAddFileEvent_emul), kHookOptional, {}},
+    {"sceKernelAddUserEvent", reinterpret_cast<void*>(&sceKernelAddUserEvent_emul), kHookOptional, {}},
+    {"sceKernelAddUserEventEdge", reinterpret_cast<void*>(&sceKernelAddUserEventEdge_emul), kHookOptional, {}},
+    {"sceKernelAddHRTimerEvent", reinterpret_cast<void*>(&sceKernelAddHRTimerEvent_emul), kHookOptional, {}},
+    {"sceKernelAddAmprSystemEvent", reinterpret_cast<void*>(&sceKernelAddAmprSystemEvent_emul), kHookOptional, {}},
+    {"sceKernelDeleteAmprSystemEvent", reinterpret_cast<void*>(&sceKernelDeleteAmprSystemEvent_emul), kHookOptional, {}},
 #endif
 };
+
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+ExternalEqueueHookSpec g_externalEqueueHooks[] = {
+    {"sceAgcDriverAddEqEvent",
+     reinterpret_cast<void*>(&sceAgcDriverAddEqEvent_emul),
+     {}},
+    {"sceVideoOutAddFlipEvent",
+     reinterpret_cast<void*>(&sceVideoOutAddFlipEvent_emul),
+     {}},
+    {"sceVideoOutAddVblankEvent",
+     reinterpret_cast<void*>(&sceVideoOutAddVblankEvent_emul),
+     {}},
+    {"sceVideoOutAddPreVblankStartEvent",
+     reinterpret_cast<void*>(&sceVideoOutAddPreVblankStartEvent_emul),
+     {}},
+    {"sceVideoOutAddOutputModeEvent",
+     reinterpret_cast<void*>(&sceVideoOutAddOutputModeEvent_emul),
+     {}},
+};
+constexpr size_t kExternalEqueueHookCount =
+    sizeof(g_externalEqueueHooks) / sizeof(g_externalEqueueHooks[0]);
+static_assert(kExternalEqueueHookCount == kAmprExternalEqueueHook_Count,
+              "external equeue hook ids must match hook table order");
+InlineDetour g_moduleLoadObserverDetour{};
+void* g_originalKernelLoadStartModule{};
+bool g_externalEqueueCoverageSafe{};
+constexpr size_t kModuleLoadObserverHookCount = 1;
+#else
+constexpr size_t kExternalEqueueHookCount = 0;
+constexpr size_t kModuleLoadObserverHookCount = 0;
+#endif
 
 constexpr size_t kHookCount = sizeof(g_hooks) / sizeof(g_hooks[0]);
 static_assert(kHookCount == kAmprLibkernelHook_Count, "AmprLibkernelHookId must match g_hooks order");
 static_assert(kHookCount <= 64, "hook capability mask is uint64_t-indexed by HookSpec order");
 constexpr size_t kMaxTrampolinePages =
-    (kHookCount + kTrampolineSlotsPerPage - 1u) / kTrampolineSlotsPerPage;
+    (kHookCount + kExternalEqueueHookCount +
+     kModuleLoadObserverHookCount +
+     kTrampolineSlotsPerPage - 1u) /
+    kTrampolineSlotsPerPage;
 
 static bool local_equeue_hooks_installed() {
 #if AMPR_EMU_APR_LOCAL_EQUEUE
@@ -249,6 +308,25 @@ static bool local_equeue_hooks_installed() {
            g_hooks[kAmprLibkernelHook_sceKernelDeleteEqueue].detour.installed &&
            g_hooks[kAmprLibkernelHook_sceKernelAddAmprEvent].detour.installed &&
            g_hooks[kAmprLibkernelHook_sceKernelDeleteAmprEvent].detour.installed;
+#else
+    return false;
+#endif
+}
+
+static bool local_equeue_classification_hooks_installed() {
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+    return g_hooks[kAmprLibkernelHook_sceKernelCreateEqueue].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelAddTimerEvent].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelAddReadEvent].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelAddWriteEvent].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelAddFileEvent].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelAddUserEvent].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelAddUserEventEdge].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelAddHRTimerEvent].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelAddAmprSystemEvent].detour.installed &&
+           g_hooks[kAmprLibkernelHook_sceKernelDeleteAmprSystemEvent].detour.installed &&
+           g_moduleLoadObserverDetour.installed &&
+           g_externalEqueueCoverageSafe;
 #else
     return false;
 #endif
@@ -335,10 +413,20 @@ HookLogRecord g_hookLogRecords[kHookCount]{};
 
 #if AMPR_EMU_APR_LOCAL_EQUEUE
 #define AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS \
+    , reinterpret_cast<void*>(&::sceKernelCreateEqueue) \
     , reinterpret_cast<void*>(&::sceKernelWaitEqueue) \
     , reinterpret_cast<void*>(&::sceKernelDeleteEqueue) \
     , reinterpret_cast<void*>(&::sceKernelAddAmprEvent) \
-    , reinterpret_cast<void*>(&::sceKernelDeleteAmprEvent)
+    , reinterpret_cast<void*>(&::sceKernelDeleteAmprEvent) \
+    , reinterpret_cast<void*>(&::sceKernelAddTimerEvent) \
+    , reinterpret_cast<void*>(&::sceKernelAddReadEvent) \
+    , reinterpret_cast<void*>(&::sceKernelAddWriteEvent) \
+    , reinterpret_cast<void*>(&::sceKernelAddFileEvent) \
+    , reinterpret_cast<void*>(&::sceKernelAddUserEvent) \
+    , reinterpret_cast<void*>(&::sceKernelAddUserEventEdge) \
+    , reinterpret_cast<void*>(&::sceKernelAddHRTimerEvent) \
+    , nullptr \
+    , nullptr
 #else
 #define AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS
 #endif
@@ -353,6 +441,10 @@ extern "C" {
 AMPR_LIBKERNEL_HOOK_EXPORT void* g_amprOriginalLibkernelById[kAmprLibkernelHook_Count]{
     AMPR_LIBKERNEL_SDK_FALLBACKS,
 };
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+AMPR_LIBKERNEL_HOOK_EXPORT void*
+    g_amprOriginalExternalEqueueById[kAmprExternalEqueueHook_Count]{};
+#endif
 }
 #undef AMPR_LIBKERNEL_SDK_FALLBACKS
 #undef AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS
@@ -462,13 +554,9 @@ void set_hooks_installed(bool installed) {
     g_installed.store(installed ? 1 : 0, std::memory_order_release);
 }
 
-void publish_hook_original(size_t hookIndex) {
-    if (hookIndex >= kHookCount) {
-        return;
-    }
-    HookSpec& hook = g_hooks[hookIndex];
-    if (hook.detour.installed) {
-        g_amprOriginalLibkernelById[hookIndex] = hook.detour.trampoline;
+void store_original_slot(void** slot, void* value) {
+    if (slot) {
+        __atomic_store_n(slot, value, __ATOMIC_RELEASE);
     }
 }
 
@@ -500,11 +588,29 @@ void refresh_hook_runtime_state_from_detours() {
                 ++mandatoryInstalled;
                 mandatoryCapabilityMask |= bit;
             }
-            g_amprOriginalLibkernelById[index] = hook.detour.trampoline;
+            store_original_slot(
+                &g_amprOriginalLibkernelById[index],
+                hook.detour.trampoline);
         } else {
-            g_amprOriginalLibkernelById[index] = g_amprSdkLibkernelFallbackById[index];
+            store_original_slot(
+                &g_amprOriginalLibkernelById[index],
+                g_amprSdkLibkernelFallbackById[index]);
         }
     }
+
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+    for (size_t index = 0; index < kExternalEqueueHookCount; ++index) {
+        ExternalEqueueHookSpec& hook = g_externalEqueueHooks[index];
+        store_original_slot(
+            &g_amprOriginalExternalEqueueById[index],
+            hook.detour.installed ? hook.detour.trampoline : nullptr);
+    }
+    store_original_slot(
+        &g_originalKernelLoadStartModule,
+        g_moduleLoadObserverDetour.installed
+            ? g_moduleLoadObserverDetour.trampoline
+            : nullptr);
+#endif
 
     g_hookInstalledCount = installed;
     g_hookMandatoryInstalledCount = mandatoryInstalled;
@@ -514,7 +620,9 @@ void refresh_hook_runtime_state_from_detours() {
     g_hookMandatoryCapabilityMask = mandatoryCapabilityMask;
     set_hooks_installed(mandatoryMask != 0 &&
                         mandatoryCapabilityMask == mandatoryMask);
-    apr_equeue_overlay_set_hooks_available(local_equeue_hooks_installed());
+    apr_equeue_overlay_set_hook_availability(
+        local_equeue_hooks_installed(),
+        local_equeue_classification_hooks_installed());
 }
 
 void reset_deferred_hook_log() {
@@ -533,6 +641,9 @@ void reset_deferred_hook_log() {
     g_hookMandatoryMask = 0;
     g_hookOptionalMask = 0;
     g_hookMandatoryCapabilityMask = 0;
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+    g_externalEqueueCoverageSafe = false;
+#endif
 #if AMPR_EMU_LIBKERNEL_HOOK_DIAGNOSTICS
     g_hookLogFlushed.store(0, std::memory_order_release);
 #endif
@@ -1146,6 +1257,15 @@ bool rip_relative_instruction_changes_stack(const hde64s& hs) {
     return false;
 }
 
+bool rip_relative_instruction_uses_rsp_operand(const hde64s& hs) {
+    // The specialized MOV/CMP relocation paths save their scratch register on
+    // the stack.  MOV RSP,[RIP+disp32] changes RSP before that save can be
+    // restored, while CMP [RIP+disp32],RSP would compare the post-push RSP.
+    return (hs.meta == HDE64_META_RIP_REL_MOV_R64_PTR ||
+            hs.meta == HDE64_META_RIP_REL_CMP_PTR_R64) &&
+           hs.operand_reg == 4u;
+}
+
 bool append_rip_relative_via_scratch(uint8_t* dst,
                                      size_t& dstLen,
                                      size_t dstCap,
@@ -1278,6 +1398,10 @@ bool relocate_instruction(uint8_t* dst,
             reason = kHookFailDecode;
             return false;
         }
+        if (rip_relative_instruction_uses_rsp_operand(hs)) {
+            reason = kHookFailUnsupportedRelative;
+            return false;
+        }
         if (hs.meta == HDE64_META_RIP_REL_LEA64) {
             if (!append_mov_reg_imm64(dst, dstLen, dstCap, hs.operand_reg, absolute)) {
                 reason = kHookFailTrampolineOverflow;
@@ -1330,6 +1454,7 @@ FixedWrapperDetourResult try_install_loader_status_wrapper_detour(InlineDetour& 
                                                                   uint8_t* src,
                                                                   void* replacement,
                                                                   uint8_t* trampoline,
+                                                                  void** originalSlot,
                                                                   HookFailReason& reason) {
     if (!src || !replacement || !trampoline) {
         reason = kHookFailInvalidArgument;
@@ -1381,12 +1506,12 @@ FixedWrapperDetourResult try_install_loader_status_wrapper_detour(InlineDetour& 
         return FixedWrapperDetourResult::kFailed;
     }
 
+    store_original_slot(originalSlot, trampoline);
     write_abs_jump(src, replacement);
     if (stolen > kJumpSize) {
         set_bytes(src + kJumpSize, 0x90, stolen - kJumpSize);
     }
     __builtin___clear_cache(reinterpret_cast<char*>(src), reinterpret_cast<char*>(src + stolen));
-
     detour.target = src;
     detour.replacement = replacement;
     detour.trampoline = trampoline;
@@ -1395,16 +1520,17 @@ FixedWrapperDetourResult try_install_loader_status_wrapper_detour(InlineDetour& 
     return FixedWrapperDetourResult::kInstalled;
 }
 
-bool install_inline_detour(size_t hookIndex,
+bool install_inline_detour(void** originalSlot,
                            InlineDetour& detour,
                            void* target,
                            void* replacement,
                            HookFailReason& reason) {
     reason = kHookFailNone;
     if (detour.installed) {
+        store_original_slot(originalSlot, detour.trampoline);
         return true;
     }
-    if (!target || !replacement || target == replacement) {
+    if (!originalSlot || !target || !replacement || target == replacement) {
         reason = kHookFailInvalidArgument;
         return false;
     }
@@ -1429,9 +1555,14 @@ bool install_inline_detour(size_t hookIndex,
         return false;
     };
 
-    switch (try_install_loader_status_wrapper_detour(detour, src, replacement, trampoline, reason)) {
+    switch (try_install_loader_status_wrapper_detour(
+                detour,
+                src,
+                replacement,
+                trampoline,
+                originalSlot,
+                reason)) {
         case FixedWrapperDetourResult::kInstalled:
-            publish_hook_original(hookIndex);
             restore_code_protection(target, kMaxStolenBytes);
             return true;
         case FixedWrapperDetourResult::kFailed:
@@ -1490,19 +1621,17 @@ bool install_inline_detour(size_t hookIndex,
         reason = kHookFailTrampolineProtect;
         return fail_after_target_mprotect();
     }
+    store_original_slot(originalSlot, trampoline);
     write_abs_jump(src, replacement);
     if (stolen > kJumpSize) {
         set_bytes(src + kJumpSize, 0x90, stolen - kJumpSize);
     }
     __builtin___clear_cache(reinterpret_cast<char*>(src), reinterpret_cast<char*>(src + stolen));
-
     detour.target = target;
     detour.replacement = replacement;
     detour.trampoline = trampoline;
     detour.stolenLen = stolen;
     detour.installed = true;
-
-    publish_hook_original(hookIndex);
     restore_code_protection(target, kMaxStolenBytes);
     return true;
 }
@@ -1533,6 +1662,129 @@ void* resolve_libkernel_symbol(SceKernelModule libkernel, const char* symbol) {
     }
     return addr;
 }
+
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+using KernelGetModuleListFn = int (*)(SceKernelModule*, size_t, size_t*);
+constexpr size_t kLoadedModuleScanCapacity = 256;
+
+bool all_external_equeue_hooks_installed() {
+    for (const ExternalEqueueHookSpec& hook : g_externalEqueueHooks) {
+        if (!hook.detour.installed) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool install_external_equeue_hooks(SceKernelModule libkernel) {
+    if (all_external_equeue_hooks_installed()) {
+        return true;
+    }
+    auto* const getModuleList = reinterpret_cast<KernelGetModuleListFn>(
+        resolve_libkernel_symbol(libkernel, "sceKernelGetModuleList"));
+    if (!getModuleList) {
+        hook_logf("external-equeue.scan status=missing-list-api symbol=sceKernelGetModuleList");
+        return false;
+    }
+
+    SceKernelModule modules[kLoadedModuleScanCapacity]{};
+    size_t moduleCount = 0;
+    const int listRc =
+        getModuleList(modules, kLoadedModuleScanCapacity, &moduleCount);
+    if (listRc != 0) {
+        hook_logf("external-equeue.scan status=failed rc=0x%x", listRc);
+        return false;
+    }
+    const bool truncated = moduleCount > kLoadedModuleScanCapacity;
+    bool coverageSafe = !truncated;
+    if (truncated) {
+        moduleCount = kLoadedModuleScanCapacity;
+    }
+
+    for (size_t hookIndex = 0; hookIndex < kExternalEqueueHookCount;
+         ++hookIndex) {
+        ExternalEqueueHookSpec& hook = g_externalEqueueHooks[hookIndex];
+        if (hook.detour.installed) {
+            continue;
+        }
+
+        void* target = nullptr;
+        SceKernelModule owner = -1;
+        for (size_t moduleIndex = 0; moduleIndex < moduleCount;
+             ++moduleIndex) {
+            if (sceKernelDlsym(modules[moduleIndex], hook.symbol, &target) == 0 &&
+                target) {
+                owner = modules[moduleIndex];
+                break;
+            }
+            target = nullptr;
+        }
+        if (!target) {
+            hook_logf("external-equeue.symbol=%s status=missing modules=%zu truncated=%u",
+                      hook.symbol,
+                      moduleCount,
+                      truncated ? 1u : 0u);
+            continue;
+        }
+
+        HookFailReason failReason = kHookFailNone;
+        if (!install_inline_detour(
+                &g_amprOriginalExternalEqueueById[hookIndex],
+                hook.detour,
+                target,
+                hook.replacement,
+                failReason)) {
+            hook_logf("external-equeue.symbol=%s status=failed owner=0x%x target=%p replacement=%p reason=%s",
+                      hook.symbol,
+                      static_cast<unsigned int>(owner),
+                      target,
+                      hook.replacement,
+                      hook_fail_reason_name(failReason));
+            coverageSafe = false;
+            continue;
+        }
+
+        hook_logf("external-equeue.symbol=%s status=installed owner=0x%x target=%p replacement=%p trampoline=%p stolen=%zu",
+                  hook.symbol,
+                  static_cast<unsigned int>(owner),
+                  hook.detour.target,
+                  hook.detour.replacement,
+                  hook.detour.trampoline,
+                  hook.detour.stolenLen);
+    }
+    return coverageSafe;
+}
+
+bool install_module_load_observer(SceKernelModule libkernel) {
+    if (g_moduleLoadObserverDetour.installed) {
+        return true;
+    }
+    void* const target =
+        resolve_libkernel_symbol(libkernel, "sceKernelLoadStartModule");
+    if (!target) {
+        hook_logf("external-equeue.loader status=missing symbol=sceKernelLoadStartModule");
+        return false;
+    }
+    HookFailReason failReason = kHookFailNone;
+    if (!install_inline_detour(
+            &g_originalKernelLoadStartModule,
+            g_moduleLoadObserverDetour,
+            target,
+            reinterpret_cast<void*>(
+                &sceKernelLoadStartModule_equeue_observer),
+            failReason)) {
+        hook_logf("external-equeue.loader status=failed target=%p reason=%s",
+                  target,
+                  hook_fail_reason_name(failReason));
+        return false;
+    }
+    hook_logf("external-equeue.loader status=installed target=%p trampoline=%p stolen=%zu",
+              g_moduleLoadObserverDetour.target,
+              g_moduleLoadObserverDetour.trampoline,
+              g_moduleLoadObserverDetour.stolenLen);
+    return true;
+}
+#endif
 
 using KernelDebugOutTextFn = int (*)(int, const char*);
 
@@ -1888,11 +2140,58 @@ extern "C" int sceKernelMapNamedDirectMemory_emul(void** addr,
     return call_original_sceKernelMapNamedDirectMemory(addr, len, protAdjust.adjusted, flags, directMemoryStart, alignment, name);
 }
 
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+extern "C" SceKernelModule sceKernelLoadStartModule_equeue_observer(
+    const char* moduleFileName,
+    size_t args,
+    const void* argp,
+    uint32_t flags,
+    const SceKernelLoadModuleOpt* opt,
+    int* result) {
+    using LoadStartModuleFn = SceKernelModule (*)(
+        const char*, size_t, const void*, uint32_t,
+        const SceKernelLoadModuleOpt*, int*);
+    auto* const original = reinterpret_cast<LoadStartModuleFn>(
+        __atomic_load_n(
+            &g_originalKernelLoadStartModule, __ATOMIC_ACQUIRE));
+    if (!original) {
+        return static_cast<SceKernelModule>(SCE_KERNEL_ERROR_ENOSYS);
+    }
+    const SceKernelModule module = original(
+        moduleFileName, args, argp, flags, opt, result);
+    if (module < 0) {
+        return module;
+    }
+
+    HookLock lock;
+    if (hooks_installed()) {
+        g_externalEqueueCoverageSafe =
+            g_externalEqueueCoverageSafe &&
+            install_external_equeue_hooks(kKnownLibkernelHandle);
+        refresh_hook_runtime_state_from_detours();
+        hook_logf("external-equeue.refresh trigger=module-load module=0x%x coverage=%s",
+                  static_cast<unsigned int>(module),
+                  g_externalEqueueCoverageSafe ? "ready" : "incomplete");
+    }
+    return module;
+}
+#endif
+
 static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
     HookLock lock;
     const SceKernelModule libkernel = static_cast<SceKernelModule>(libkernelHandle);
     emit_module_identity_system_log(libkernel);
     if (hooks_installed()) {
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+        const bool loaderReady = install_module_load_observer(libkernel);
+        g_externalEqueueCoverageSafe =
+            g_externalEqueueCoverageSafe && loaderReady &&
+            install_external_equeue_hooks(libkernel);
+        refresh_hook_runtime_state_from_detours();
+        hook_logf("external-equeue.install loader=%u coverage=%s",
+                  loaderReady ? 1u : 0u,
+                  g_externalEqueueCoverageSafe ? "ready" : "incomplete");
+#endif
         hook_logf("install status=already-installed");
         return 0;
     }
@@ -1918,7 +2217,9 @@ static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
             optionalMask |= hookBit;
         }
         if (hook.detour.installed) {
-            publish_hook_original(hookIndex);
+            store_original_slot(
+                &g_amprOriginalLibkernelById[hookIndex],
+                hook.detour.trampoline);
             ++installed;
             capabilityMask |= hookBit;
             if (hook.mandatory) {
@@ -1943,7 +2244,12 @@ static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
             continue;
         }
         HookFailReason failReason = kHookFailNone;
-        if (install_inline_detour(hookIndex, hook.detour, target, hook.replacement, failReason)) {
+        if (install_inline_detour(
+                &g_amprOriginalLibkernelById[hookIndex],
+                hook.detour,
+                target,
+                hook.replacement,
+                failReason)) {
             ++installed;
             capabilityMask |= hookBit;
             if (hook.mandatory) {
@@ -2022,8 +2328,17 @@ static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
         return -1;
     }
 
-    set_hooks_installed(true);
-    apr_equeue_overlay_set_hooks_available(local_equeue_hooks_installed());
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+    const bool loaderReady = install_module_load_observer(libkernel);
+    g_externalEqueueCoverageSafe =
+        loaderReady && install_external_equeue_hooks(libkernel);
+    hook_logf("external-equeue.install loader=%u coverage=%s total=%zu",
+              loaderReady ? 1u : 0u,
+              g_externalEqueueCoverageSafe ? "ready" : "incomplete",
+              kExternalEqueueHookCount);
+#endif
+
+    refresh_hook_runtime_state_from_detours();
     g_hookInstallResult = 0;
     return 0;
 }
@@ -2053,6 +2368,40 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprUninstallLibkernelHooks(void) {
     int failed = 0;
     (void)removed;
     (void)failed;
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+    g_externalEqueueCoverageSafe = false;
+    {
+        const bool wasInstalled = g_moduleLoadObserverDetour.installed;
+        const bool currentOk =
+            uninstall_inline_detour(g_moduleLoadObserverDetour);
+        ok = currentOk && ok;
+        if (wasInstalled && currentOk) {
+            ++removed;
+            store_original_slot(&g_originalKernelLoadStartModule, nullptr);
+            hook_logf("external-equeue.loader status=uninstalled");
+        } else if (wasInstalled) {
+            ++failed;
+            hook_logf("external-equeue.loader status=uninstall-failed");
+        }
+    }
+    for (size_t index = kExternalEqueueHookCount; index > 0; --index) {
+        ExternalEqueueHookSpec& hook = g_externalEqueueHooks[index - 1];
+        const bool wasInstalled = hook.detour.installed;
+        const bool currentOk = uninstall_inline_detour(hook.detour);
+        ok = currentOk && ok;
+        if (wasInstalled && currentOk) {
+            ++removed;
+            store_original_slot(
+                &g_amprOriginalExternalEqueueById[index - 1], nullptr);
+            hook_logf("external-equeue.symbol=%s status=uninstalled",
+                      hook.symbol);
+        } else if (wasInstalled) {
+            ++failed;
+            hook_logf("external-equeue.symbol=%s status=uninstall-failed",
+                      hook.symbol);
+        }
+    }
+#endif
     for (size_t index = kHookCount; index > 0; --index) {
         HookSpec& hook = g_hooks[index - 1];
         const bool wasInstalled = hook.detour.installed;

@@ -6,6 +6,7 @@
 
 #include "ampr_emu_command_buffer_types.h"
 #include "ampr_emu_amm.h"
+#include "ampr_emu_apr_equeue.h"
 #include "ampr_emu_errno.h"
 #include "ampr_emu_log.h"
 #include "ampr_emu_prot.h"
@@ -161,8 +162,14 @@ static int amm_prepare_cpu_visible_kernel_prot_pair_for_cb(const SceAmprCommandB
     return amm_prepare_cpu_visible_kernel_prot_pair(op, maskOp, cb, prot, protMask, kernelProt, kernelMask);
 }
 
-AmmCommandBuffer::AmmCommandBuffer(void) : CommandBuffer() {}
-AmmCommandBuffer::~AmmCommandBuffer(void) = default;
+AmmCommandBuffer::AmmCommandBuffer(void) : CommandBuffer() {
+    apr_equeue_register_amm_command_buffer(
+        static_cast<CommandBuffer*>(this));
+}
+AmmCommandBuffer::~AmmCommandBuffer(void) {
+    apr_equeue_unregister_amm_command_buffer(
+        static_cast<CommandBuffer*>(this));
+}
 
 int AmmCommandBuffer::map(uint64_t va, uint64_t size, int type, int prot) {
     uint64_t kernelProt = 0;

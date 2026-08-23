@@ -11,6 +11,7 @@
 #include "ampr_debug_log.h"
 #include "ampr_emu_log.h"
 #include "ampr_emu_amm.h"
+#include "ampr_emu_apr_equeue.h"
 #include "ampr_emu_apr_reactor.h"
 #include "ampr_emu_command_buffer_apr.h"
 #include "ampr_emu_command_buffer_common.h"
@@ -109,12 +110,16 @@ static int64_t ampr_measure_einval() {
 }
 
 extern "C" AMPR_EXPORT int64_t sceAmprAmmCommandBufferConstructor(sce::Ampr::AmmCommandBuffer* self) {
+    apr_equeue_register_amm_command_buffer(
+        static_cast<sce::Ampr::CommandBuffer*>(self));
     ampr_export_vlogf("exp.amm.cb.ctor this=%p no-op-derived-init", (void*)self);
     return 0;
 }
 
 
 extern "C" AMPR_EXPORT int64_t sceAmprAmmCommandBufferDestructor(sce::Ampr::AmmCommandBuffer* self) {
+    apr_equeue_unregister_amm_command_buffer(
+        static_cast<sce::Ampr::CommandBuffer*>(self));
     ampr_export_vlogf("exp.amm.cb.dtor this=%p no-op-derived-dtor", (void*)self);
     return 0;
 }

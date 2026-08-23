@@ -13,21 +13,32 @@
 #include "ampr_emu_kernel_lookup.h"
 #include "ampr_emu_log.h"
 #include "ampr_emu_sync.h"
+#include "ampr_libkernel_hook.h"
 
 #include <_kernel.h>
 #include <atomic>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <sys/event.h>
 #include <sys/sce_errno.h>
 
 namespace {
 
 using WaitEqueueFn = int (*)(SceKernelEqueue, SceKernelEvent*, int, int*, SceKernelUseconds*);
+using CreateEqueueFn = int (*)(SceKernelEqueue*, const char*);
 using DeleteEqueueFn = int (*)(SceKernelEqueue);
 using AddAmprEventFn = int (*)(SceKernelEqueue, int, void*);
 using DeleteAmprEventFn = int (*)(SceKernelEqueue, int);
+using AddAmprSystemEventFn = int (*)(SceKernelEqueue, int, int, void*);
+using AddTimerEventFn = int (*)(SceKernelEqueue, int, SceKernelUseconds, void*);
+using AddFdEventFn = int (*)(SceKernelEqueue, int, size_t, void*);
+using AddFileEventFn = int (*)(SceKernelEqueue, int, int, void*);
+using AddUserEventFn = int (*)(SceKernelEqueue, int);
+using AddHRTimerEventFn = int (*)(SceKernelEqueue, int, SceKernelTimespec*, void*);
+template <typename Value>
+using ExternalAddEventFn = int (*)(SceKernelEqueue, Value, void*);
 
 constexpr uint32_t kInvalidIndex = UINT32_MAX;
 constexpr uint32_t kHashTombstone = UINT32_MAX;
@@ -35,6 +46,7 @@ constexpr uint32_t kQueueCapacity = AMPR_EMU_APR_LOCAL_EQUEUE_QUEUE_CAPACITY;
 constexpr uint32_t kRegistrationCapacity = AMPR_EMU_APR_LOCAL_EQUEUE_REG_CAPACITY;
 constexpr uint32_t kPendingCapacity = AMPR_EMU_APR_LOCAL_EQUEUE_PENDING_CAPACITY;
 constexpr uint32_t kQueueHashCapacity = kQueueCapacity * 2u;
+constexpr uint32_t kAmmBufferHashCapacity = kQueueHashCapacity;
 constexpr uint32_t kRegistrationHashCapacity = kRegistrationCapacity * 2u;
 constexpr uint32_t kWakeIdBase = 0x5a4d5000u;
 constexpr uint32_t kWakeAttachAttempts = 64u;
@@ -42,49 +54,19 @@ constexpr uint16_t kRegistrationHashTombstone = UINT16_MAX;
 constexpr uint64_t kUsecondsPerSecond = 1000000ull;
 constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
 constexpr uint64_t kMaxScaledCounterFrequency = UINT64_MAX / kUsecondsPerSecond;
-constexpr SceKernelUseconds kWaitGraceUseconds =
-    static_cast<SceKernelUseconds>(AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_US);
-constexpr bool kWaitGraceAdaptive =
-    AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_ADAPTIVE != 0;
-constexpr uint8_t kWaitGraceInitialLevel = 2u;
-constexpr uint8_t kWaitGraceMaxLevel = 3u;
-constexpr int8_t kWaitGraceHitsToGrow = 2;
-constexpr int8_t kWaitGraceMissesToCooldown = 4;
-constexpr uint8_t kWaitGraceCooldownEvents = 32u;
-constexpr SceKernelUseconds kWaitGraceMinUseconds =
-    kWaitGraceUseconds == 0
-        ? 0
-        : (kWaitGraceUseconds / 4u != 0 ? kWaitGraceUseconds / 4u : 1u);
-constexpr SceKernelUseconds kWaitGraceLowUseconds =
-    kWaitGraceUseconds == 0
-        ? 0
-        : (kWaitGraceUseconds / 2u != 0 ? kWaitGraceUseconds / 2u : 1u);
-constexpr SceKernelUseconds kWaitGraceMaxUseconds =
-    kWaitGraceUseconds > UINT32_MAX / 2u
-        ? UINT32_MAX
-        : kWaitGraceUseconds * 2u;
-constexpr SceKernelUseconds kWaitGraceLevels[kWaitGraceMaxLevel + 1u] = {
-    kWaitGraceMinUseconds,
-    kWaitGraceLowUseconds,
-    kWaitGraceUseconds,
-    kWaitGraceMaxUseconds,
-};
+#ifdef SCE_KERNEL_EVFILT_AMPR_SYSTEM
+constexpr int16_t kAmprSystemEventFilter = SCE_KERNEL_EVFILT_AMPR_SYSTEM;
+#else
+// SDK 10.000 sys/event.h assigns EVFILT_AMPR_SYSTEM the stable ABI value -30.
+constexpr int16_t kAmprSystemEventFilter = -30;
+#endif
 
 static_assert(kQueueCapacity != 0 && kRegistrationCapacity != 0 && kPendingCapacity != 0,
               "APR local equeue pools must not be empty");
-static_assert(AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_US <= UINT32_MAX,
-              "APR local equeue wait grace does not fit SceKernelUseconds");
-static_assert(AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_ADAPTIVE == 0 ||
-                  AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_ADAPTIVE == 1,
-              "APR local equeue adaptive wait grace must be 0 or 1");
-static_assert(kWaitGraceInitialLevel <= kWaitGraceMaxLevel,
-              "APR local equeue initial wait grace level is out of range");
-static_assert(kWaitGraceMinUseconds <= kWaitGraceLowUseconds &&
-                  kWaitGraceLowUseconds <= kWaitGraceUseconds &&
-                  kWaitGraceUseconds <= kWaitGraceMaxUseconds,
-              "APR local equeue wait grace levels must be monotonic");
 static_assert((kQueueHashCapacity & (kQueueHashCapacity - 1u)) == 0,
               "APR local equeue hash capacity must be a power of two");
+static_assert((kAmmBufferHashCapacity & (kAmmBufferHashCapacity - 1u)) == 0,
+              "AMM command-buffer hash capacity must be a power of two");
 static_assert((kRegistrationHashCapacity & (kRegistrationHashCapacity - 1u)) == 0,
               "APR local equeue registration hash capacity must be a power of two");
 static_assert(kQueueCapacity <= UINT16_MAX - 1u,
@@ -93,6 +75,8 @@ static_assert(kRegistrationCapacity <= UINT16_MAX - 1u,
               "APR local equeue registration index does not fit fixed hash storage");
 static_assert(std::atomic<uint8_t>::is_always_lock_free,
               "APR local equeue wake state must use lock-free byte atomics");
+static_assert(std::atomic<uintptr_t>::is_always_lock_free,
+              "AMM-classified equeue cache must use lock-free pointer atomics");
 
 struct MirroredRegistration {
     uint32_t next{};
@@ -103,9 +87,12 @@ struct MirroredRegistration {
 
 struct PendingEvent {
     uint32_t next{};
+    uint32_t registrationIndex{kInvalidIndex};
     SceKernelEvent event{};
     uint64_t registrationGeneration{};
 };
+static_assert(sizeof(PendingEvent) == sizeof(SceKernelEvent) + 16u,
+              "APR local equeue pending metadata grew fixed .bss storage");
 
 struct TrackedEqueue {
     SceKernelEqueue eq{};
@@ -118,16 +105,14 @@ struct TrackedEqueue {
     uint32_t wakeId{};
     uint64_t lifetimeGeneration{};
     uint32_t nativeWaitIntent{};
-    uint8_t waitGraceLevel{};
-    int8_t waitGraceTrend{};
-    uint8_t waitGraceCooldownEvents{};
     bool used : 1;
     bool wakeRegistered : 1;
     bool wakeReady : 1;
     bool wakeArmed : 1;
     bool wakeTriggering : 1;
-    bool waitGraceEligible : 1;
-    bool waitGraceActive : 1;
+    bool amprSourceSeen : 1;
+    bool mixedSourceSeen : 1;
+    bool ammSourceSeen : 1;
 };
 static_assert(sizeof(TrackedEqueue) == 56u,
               "APR local equeue flag packing changed fixed .bss storage");
@@ -135,47 +120,58 @@ static_assert(sizeof(TrackedEqueue) == 56u,
 struct OverlayState {
     std::atomic<uint32_t> lock{0};
     std::atomic<bool> hooksAvailable{false};
-    std::atomic<uint64_t> publishEpoch{0};
+    std::atomic<bool> classificationHooksAvailable{false};
+    std::atomic<bool> localWaitSyncReady{false};
     bool initialized{};
+    ScePthreadMutex localWaitMutex{};
+    ScePthreadCond localWaitCond{};
     uint32_t queueFreeHead{};
     uint32_t registrationFreeHead{};
     uint32_t pendingFreeHead{};
     uint32_t nextWakeId{};
     uint64_t nextLifetimeGeneration{};
     uint64_t nextRegistrationGeneration{};
-    uint64_t nextPublishEpoch{};
     uint64_t processTimeCounterFrequency{};
     uint32_t liveQueues{};
     uint32_t liveRegistrations{};
     uint32_t livePending{};
     uint32_t queueHashTombstones{};
     uint32_t registrationHashTombstones{};
+    uint32_t ammQueueHashTombstones{};
     bool pendingPoolBackpressured{};
 #if AMPR_EMU_DEBUG_LOG
     uint32_t pendingPeak{};
     uint32_t liveWaitIntents{};
     uint32_t waitIntentPeak{};
-    uint64_t waitGraceIncreases{};
-    uint64_t waitGraceDecreases{};
-    uint64_t waitGraceCooldowns{};
-    uint64_t waitGraceCooldownEvents{};
-    uint64_t waitGraceRearms{};
 #endif
     // The bit in TrackedEqueue is the lock-protected hot-path predicate. This
     // slot-local atomic exists only for waiting after the overlay lock is
     // released, so completion on another queue cannot cause a false retry.
     alignas(64) std::atomic<uint8_t> wakeTriggerState[kQueueCapacity]{};
+    alignas(64) std::atomic<uint64_t> localWakeEpoch[kQueueCapacity]{};
+    alignas(64) std::atomic<uintptr_t> ammQueueHash[kQueueHashCapacity]{};
     TrackedEqueue queues[kQueueCapacity]{};
     MirroredRegistration registrations[kRegistrationCapacity]{};
     PendingEvent pending[kPendingCapacity]{};
     uint32_t queueHash[kQueueHashCapacity]{};
     uint16_t registrationHash[kRegistrationHashCapacity]{};
     uint16_t registrationOwners[kRegistrationCapacity]{};
+    int16_t registrationFilters[kRegistrationCapacity]{};
 };
 
 // Keep the large fixed pools zero-initialized in .bss. initialize_locked()
 // installs every nonzero free-list sentinel and generation seed before use.
 OverlayState g_overlay{};
+
+struct AmmCommandBufferRegistry {
+    std::atomic<uint32_t> lock{0};
+    std::atomic<bool> trackingLost{false};
+    uintptr_t slots[kAmmBufferHashCapacity]{};
+};
+
+// Address 0 is empty and 1 is a tombstone. Retail command-buffer objects are
+// naturally aligned, so neither value can name a live object.
+AmmCommandBufferRegistry g_ammCommandBuffers{};
 
 struct PrivateWakeRequest {
     SceKernelEqueue eq{};
@@ -183,13 +179,14 @@ struct PrivateWakeRequest {
     uint32_t wakeId{};
     uint32_t pendingIndex{kInvalidIndex};
     uint64_t queueGeneration{};
-    bool disableWakeOnFailure{};
 };
 
 struct PrivateWakeCompletion {
     int rc{};
     bool pendingPublished{};
+    bool replacementStillRequired{};
     uint32_t pendingCount{};
+    uint32_t nativeWaitIntent{};
 };
 
 #if AMPR_EMU_DEBUG_LOG
@@ -214,14 +211,19 @@ struct OverlayCounters {
     std::atomic<uint64_t> nativeEvents{0};
     std::atomic<uint64_t> hiddenFiltered{0};
     std::atomic<uint64_t> staleWakes{0};
+    std::atomic<uint64_t> staleRegistrationDrops{0};
     std::atomic<uint64_t> syntheticEvents{0};
     std::atomic<uint64_t> syntheticDirectReturns{0};
-    std::atomic<uint64_t> waitGraceAttempts{0};
-    std::atomic<uint64_t> waitGraceHits{0};
-    std::atomic<uint64_t> waitGraceMisses{0};
-    std::atomic<uint64_t> waitGraceEvents{0};
-    std::atomic<uint64_t> waitGraceSpinIterations{0};
-    std::atomic<uint64_t> waitGraceElapsedUs{0};
+    std::atomic<uint64_t> localWaits{0};
+    std::atomic<uint64_t> localWakeups{0};
+    std::atomic<uint64_t> localTimeouts{0};
+    std::atomic<uint64_t> localEntries{0};
+    std::atomic<uint64_t> localExits{0};
+    std::atomic<uint64_t> mixedPromotions{0};
+    std::atomic<uint64_t> ammEventQueues{0};
+    std::atomic<uint64_t> ammBufferRegistrations{0};
+    std::atomic<uint64_t> ammTrackingFailures{0};
+    std::atomic<uint64_t> silentUnclassifiedDeletes{0};
     std::atomic<uint64_t> addRegistrations{0};
     std::atomic<uint64_t> deleteRegistrations{0};
     std::atomic<uint64_t> queueCapacityFailures{0};
@@ -236,86 +238,10 @@ OverlayCounters g_counters;
 #define APR_EQ_COUNT(name) g_counters.name.fetch_add(1u, std::memory_order_relaxed)
 #define APR_EQ_ADD(name, value) \
     g_counters.name.fetch_add(static_cast<uint64_t>(value), std::memory_order_relaxed)
-#define APR_EQ_LOCKED_COUNT(name) (++g_overlay.name)
-#define APR_EQ_LOCKED_ADD(name, value) \
-    (g_overlay.name += static_cast<uint64_t>(value))
 #else
 #define APR_EQ_COUNT(name) ((void)0)
 #define APR_EQ_ADD(name, value) ((void)0)
-#define APR_EQ_LOCKED_COUNT(name) ((void)0)
-#define APR_EQ_LOCKED_ADD(name, value) ((void)0)
 #endif
-
-static SceKernelUseconds current_wait_grace_useconds_locked(
-    const TrackedEqueue& queue) {
-    return kWaitGraceAdaptive
-               ? kWaitGraceLevels[queue.waitGraceLevel]
-               : kWaitGraceUseconds;
-}
-
-static void note_wait_grace_delivery_locked(TrackedEqueue& queue,
-                                            uint32_t delivered) {
-    if (kWaitGraceUseconds == 0) {
-        queue.waitGraceEligible = false;
-        return;
-    }
-    if (!kWaitGraceAdaptive || queue.waitGraceCooldownEvents == 0) {
-        queue.waitGraceEligible = true;
-        return;
-    }
-
-    const uint32_t cooldown = queue.waitGraceCooldownEvents;
-    APR_EQ_LOCKED_ADD(waitGraceCooldownEvents,
-                      delivered < cooldown ? delivered : cooldown);
-    if (delivered < cooldown) {
-        queue.waitGraceCooldownEvents =
-            static_cast<uint8_t>(cooldown - delivered);
-        return;
-    }
-
-    queue.waitGraceCooldownEvents = 0;
-    queue.waitGraceLevel = 0;
-    queue.waitGraceTrend = 0;
-    queue.waitGraceEligible = true;
-    APR_EQ_LOCKED_COUNT(waitGraceRearms);
-}
-
-static void note_wait_grace_result_locked(TrackedEqueue& queue,
-                                          bool hit,
-                                          uint32_t delivered) {
-    queue.waitGraceActive = false;
-    if (!kWaitGraceAdaptive) {
-        queue.waitGraceEligible = hit && kWaitGraceUseconds != 0;
-        return;
-    }
-
-    if (hit) {
-        queue.waitGraceTrend =
-            queue.waitGraceTrend > 0 ? queue.waitGraceTrend + 1 : 1;
-        if (queue.waitGraceTrend >= kWaitGraceHitsToGrow) {
-            if (queue.waitGraceLevel < kWaitGraceMaxLevel) {
-                ++queue.waitGraceLevel;
-                APR_EQ_LOCKED_COUNT(waitGraceIncreases);
-            }
-            queue.waitGraceTrend = 0;
-        }
-        note_wait_grace_delivery_locked(queue, delivered);
-        return;
-    }
-
-    queue.waitGraceEligible = false;
-    queue.waitGraceTrend =
-        queue.waitGraceTrend < 0 ? queue.waitGraceTrend - 1 : -1;
-    if (queue.waitGraceLevel != 0) {
-        --queue.waitGraceLevel;
-        APR_EQ_LOCKED_COUNT(waitGraceDecreases);
-    }
-    if (queue.waitGraceTrend <= -kWaitGraceMissesToCooldown) {
-        queue.waitGraceCooldownEvents = kWaitGraceCooldownEvents;
-        queue.waitGraceTrend = 0;
-        APR_EQ_LOCKED_COUNT(waitGraceCooldowns);
-    }
-}
 
 class OverlayLock {
 public:
@@ -332,8 +258,28 @@ private:
     std::atomic<uint32_t>* lock_{};
 };
 
+class AmmCommandBufferLock {
+public:
+    AmmCommandBufferLock() : lock_(&g_ammCommandBuffers.lock) {
+        uint32_t spins = 0;
+        while (lock_->exchange(1u, std::memory_order_acquire) != 0u) {
+            ampr_spin_pause_or_yield(spins);
+        }
+    }
+    ~AmmCommandBufferLock() { lock_->store(0u, std::memory_order_release); }
+    AmmCommandBufferLock(const AmmCommandBufferLock&) = delete;
+    AmmCommandBufferLock& operator=(const AmmCommandBufferLock&) = delete;
+private:
+    std::atomic<uint32_t>* lock_{};
+};
+
 static WaitEqueueFn original_wait_equeue() {
     return ampr_fixed_kernel_slot<WaitEqueueFn>(kAmprLibkernelHook_sceKernelWaitEqueue);
+}
+
+static CreateEqueueFn original_create_equeue() {
+    return ampr_fixed_kernel_slot<CreateEqueueFn>(
+        kAmprLibkernelHook_sceKernelCreateEqueue);
 }
 
 static DeleteEqueueFn original_delete_equeue() {
@@ -346,6 +292,11 @@ static AddAmprEventFn original_add_ampr_event() {
 
 static DeleteAmprEventFn original_delete_ampr_event() {
     return ampr_fixed_kernel_slot<DeleteAmprEventFn>(kAmprLibkernelHook_sceKernelDeleteAmprEvent);
+}
+
+template <typename Fn>
+static Fn original_event_hook(AmprLibkernelHookId id) {
+    return ampr_fixed_kernel_slot<Fn>(id);
 }
 
 static uint64_t monotonic_ns() {
@@ -420,8 +371,23 @@ static void initialize_locked() {
     const uint64_t counterFrequency = sceKernelGetProcessTimeCounterFrequency();
     g_overlay.processTimeCounterFrequency =
         counterFrequency <= kMaxScaledCounterFrequency ? counterFrequency : 0;
+    if (!g_overlay.localWaitSyncReady.load(std::memory_order_relaxed)) {
+        const int mutexRc = scePthreadMutexInit(
+            &g_overlay.localWaitMutex, nullptr, "ampr_eq_local");
+        if (mutexRc == 0) {
+            const int condRc = scePthreadCondInit(
+                &g_overlay.localWaitCond, nullptr, "ampr_eq_local");
+            if (condRc == 0) {
+                g_overlay.localWaitSyncReady.store(
+                    true, std::memory_order_release);
+            } else {
+                (void)scePthreadMutexDestroy(&g_overlay.localWaitMutex);
+            }
+        }
+    }
     for (uint32_t i = 0; i < kQueueCapacity; ++i) {
         g_overlay.wakeTriggerState[i].store(0, std::memory_order_relaxed);
+        g_overlay.localWakeEpoch[i].store(0, std::memory_order_relaxed);
         g_overlay.queues[i] = {};
         g_overlay.queues[i].nextFree = i + 1u < kQueueCapacity ? i + 1u : kInvalidIndex;
     }
@@ -430,6 +396,7 @@ static void initialize_locked() {
         g_overlay.registrations[i].next =
             i + 1u < kRegistrationCapacity ? i + 1u : kInvalidIndex;
         g_overlay.registrationOwners[i] = 0;
+        g_overlay.registrationFilters[i] = 0;
     }
     for (uint32_t i = 0; i < kPendingCapacity; ++i) {
         g_overlay.pending[i] = {};
@@ -437,6 +404,9 @@ static void initialize_locked() {
     }
     for (uint32_t& slot : g_overlay.queueHash) {
         slot = 0;
+    }
+    for (std::atomic<uintptr_t>& slot : g_overlay.ammQueueHash) {
+        slot.store(0, std::memory_order_relaxed);
     }
     for (uint16_t& slot : g_overlay.registrationHash) {
         slot = 0;
@@ -447,14 +417,13 @@ static void initialize_locked() {
     g_overlay.nextWakeId = kWakeIdBase;
     g_overlay.nextLifetimeGeneration = 1;
     g_overlay.nextRegistrationGeneration = 1;
-    g_overlay.nextPublishEpoch = 1;
     g_overlay.liveQueues = 0;
     g_overlay.liveRegistrations = 0;
     g_overlay.livePending = 0;
     g_overlay.queueHashTombstones = 0;
     g_overlay.registrationHashTombstones = 0;
+    g_overlay.ammQueueHashTombstones = 0;
     g_overlay.pendingPoolBackpressured = false;
-    g_overlay.publishEpoch.store(0, std::memory_order_relaxed);
 #if AMPR_EMU_DEBUG_LOG
     g_overlay.pendingPeak = 0;
     g_overlay.liveWaitIntents = 0;
@@ -469,6 +438,130 @@ static uint32_t hash_queue(SceKernelEqueue eq) {
     value ^= value >> 17u;
     value *= static_cast<uintptr_t>(0x9e3779b97f4a7c15ull);
     return static_cast<uint32_t>(value) & (kQueueHashCapacity - 1u);
+}
+
+static bool amm_queue_classified_fast(SceKernelEqueue eq) {
+    if (!eq) {
+        return false;
+    }
+    const uintptr_t key = reinterpret_cast<uintptr_t>(eq);
+    uint32_t slot = hash_queue(eq);
+    for (uint32_t probe = 0; probe < kQueueHashCapacity; ++probe) {
+        const uintptr_t value = g_overlay.ammQueueHash[slot].load(
+            std::memory_order_acquire);
+        if (value == 0) {
+            return false;
+        }
+        if (value == key) {
+            return true;
+        }
+        slot = (slot + 1u) & (kQueueHashCapacity - 1u);
+    }
+    return false;
+}
+
+static bool insert_amm_queue_hash_raw_locked(SceKernelEqueue eq) {
+    const uintptr_t key = reinterpret_cast<uintptr_t>(eq);
+    uint32_t slot = hash_queue(eq);
+    uint32_t tombstone = kInvalidIndex;
+    for (uint32_t probe = 0; probe < kQueueHashCapacity; ++probe) {
+        const uintptr_t value = g_overlay.ammQueueHash[slot].load(
+            std::memory_order_relaxed);
+        if (value == key) {
+            return true;
+        }
+        if (value == 1 && tombstone == kInvalidIndex) {
+            tombstone = slot;
+        } else if (value == 0) {
+            const uint32_t target =
+                tombstone != kInvalidIndex ? tombstone : slot;
+            g_overlay.ammQueueHash[target].store(
+                key, std::memory_order_release);
+            if (tombstone != kInvalidIndex &&
+                g_overlay.ammQueueHashTombstones != 0) {
+                --g_overlay.ammQueueHashTombstones;
+            }
+            return true;
+        }
+        slot = (slot + 1u) & (kQueueHashCapacity - 1u);
+    }
+    if (tombstone != kInvalidIndex) {
+        g_overlay.ammQueueHash[tombstone].store(
+            key, std::memory_order_release);
+        if (g_overlay.ammQueueHashTombstones != 0) {
+            --g_overlay.ammQueueHashTombstones;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool rebuild_amm_queue_hash_locked() {
+    for (std::atomic<uintptr_t>& slot : g_overlay.ammQueueHash) {
+        slot.store(0, std::memory_order_release);
+    }
+    g_overlay.ammQueueHashTombstones = 0;
+    for (const TrackedEqueue& queue : g_overlay.queues) {
+        if (queue.used && queue.ammSourceSeen &&
+            !insert_amm_queue_hash_raw_locked(queue.eq)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool insert_amm_queue_hash_locked(SceKernelEqueue eq) {
+    if (g_overlay.ammQueueHashTombstones >= kQueueCapacity / 2u &&
+        !rebuild_amm_queue_hash_locked()) {
+        return false;
+    }
+    return insert_amm_queue_hash_raw_locked(eq);
+}
+
+static void erase_amm_queue_hash_locked(SceKernelEqueue eq) {
+    const uintptr_t key = reinterpret_cast<uintptr_t>(eq);
+    uint32_t slot = hash_queue(eq);
+    for (uint32_t probe = 0; probe < kQueueHashCapacity; ++probe) {
+        const uintptr_t value = g_overlay.ammQueueHash[slot].load(
+            std::memory_order_relaxed);
+        if (value == 0) {
+            return;
+        }
+        if (value == key) {
+            g_overlay.ammQueueHash[slot].store(1, std::memory_order_release);
+            ++g_overlay.ammQueueHashTombstones;
+            return;
+        }
+        slot = (slot + 1u) & (kQueueHashCapacity - 1u);
+    }
+}
+
+static uint32_t hash_amm_command_buffer(uintptr_t value) {
+    value >>= 3u;
+    value ^= value >> 17u;
+    value *= static_cast<uintptr_t>(0x9e3779b97f4a7c15ull);
+    return static_cast<uint32_t>(value) & (kAmmBufferHashCapacity - 1u);
+}
+
+static bool is_registered_amm_command_buffer(const void* commandBuffer) {
+    if (!commandBuffer ||
+        g_ammCommandBuffers.trackingLost.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const uintptr_t key = reinterpret_cast<uintptr_t>(commandBuffer);
+    AmmCommandBufferLock lock;
+    uint32_t slot = hash_amm_command_buffer(key);
+    for (uint32_t probe = 0; probe < kAmmBufferHashCapacity; ++probe) {
+        const uintptr_t value = g_ammCommandBuffers.slots[slot];
+        if (value == 0) {
+            return false;
+        }
+        if (value == key) {
+            return true;
+        }
+        slot = (slot + 1u) & (kAmmBufferHashCapacity - 1u);
+    }
+    return false;
 }
 
 static uint32_t find_queue_index_locked(SceKernelEqueue eq) {
@@ -491,6 +584,171 @@ static uint32_t find_queue_index_locked(SceKernelEqueue eq) {
         slot = (slot + 1u) & (kQueueHashCapacity - 1u);
     }
     return kInvalidIndex;
+}
+
+static constexpr bool ownership_allows_local_wait(bool amprSourceSeen,
+                                                  bool mixedSourceSeen,
+                                                  bool ammSourceSeen) {
+    return amprSourceSeen && !mixedSourceSeen && !ammSourceSeen;
+}
+static_assert(ownership_allows_local_wait(true, false, false));
+static_assert(!ownership_allows_local_wait(false, false, false));
+static_assert(!ownership_allows_local_wait(true, true, false));
+static_assert(!ownership_allows_local_wait(true, false, true));
+
+static bool queue_is_exclusive_local_ignoring_amm_health_locked(
+    const TrackedEqueue& queue) {
+    return g_overlay.hooksAvailable.load(std::memory_order_relaxed) &&
+           ownership_allows_local_wait(
+               queue.amprSourceSeen,
+               queue.mixedSourceSeen,
+               queue.ammSourceSeen) &&
+           queue.registrationHead < kRegistrationCapacity &&
+           g_overlay.classificationHooksAvailable.load(
+               std::memory_order_relaxed) &&
+           g_overlay.localWaitSyncReady.load(std::memory_order_relaxed);
+}
+
+static bool queue_is_exclusive_local_locked(const TrackedEqueue& queue) {
+    return !g_ammCommandBuffers.trackingLost.load(
+               std::memory_order_relaxed) &&
+           queue_is_exclusive_local_ignoring_amm_health_locked(queue);
+}
+
+static constexpr bool queue_has_meaningful_classification(
+    bool amprSourceSeen,
+    bool mixedSourceSeen,
+    bool ammSourceSeen) {
+    return amprSourceSeen || mixedSourceSeen || ammSourceSeen;
+}
+static_assert(!queue_has_meaningful_classification(
+                  false, false, false),
+              "a filterless queue must delete silently");
+static_assert(queue_has_meaningful_classification(
+                  true, false, false),
+              "an AMPR queue must retain diagnostics");
+
+[[noreturn]] static void abort_local_wait_sync(const char* operation, int rc) {
+    AMPR_CRITICAL_LOGF("apr.equeue.local-wait.sync-fail operation=%s rc=0x%x action=abort",
+                       operation ? operation : "unknown",
+                       rc);
+    AMPR_KLOGF("ampr.abort reason=apr.equeue.local-wait.sync-fail file=%s line=%d",
+               __FILE__,
+               __LINE__);
+    std::abort();
+}
+
+static void notify_local_waiters() {
+    if (!g_overlay.localWaitSyncReady.load(std::memory_order_acquire)) {
+        return;
+    }
+    const int lockRc = scePthreadMutexLock(&g_overlay.localWaitMutex);
+    if (lockRc != 0) {
+        abort_local_wait_sync("notify-lock", lockRc);
+    }
+    const int broadcastRc = scePthreadCondBroadcast(&g_overlay.localWaitCond);
+    if (broadcastRc != 0) {
+        abort_local_wait_sync("notify-broadcast", broadcastRc);
+    }
+    const int unlockRc = scePthreadMutexUnlock(&g_overlay.localWaitMutex);
+    if (unlockRc != 0) {
+        abort_local_wait_sync("notify-unlock", unlockRc);
+    }
+}
+
+struct QueuePromotion {
+    bool changed{};
+    bool wasExclusive{};
+};
+
+static void log_queue_classification_change(SceKernelEqueue eq,
+                                            const char* from,
+                                            const char* to,
+                                            const char* reason) {
+    AMPR_LOGF("apr.equeue.classification.change eq=%p from=%s to=%s reason=%s",
+              eq,
+              from ? from : "unknown",
+              to ? to : "unknown",
+              reason ? reason : "unknown");
+}
+
+static QueuePromotion mark_queue_mixed_locked(
+    uint32_t queueIndex,
+    TrackedEqueue& queue) {
+    QueuePromotion result{};
+    if (queue.mixedSourceSeen) {
+        return result;
+    }
+    result.wasExclusive = queue_is_exclusive_local_locked(queue);
+    queue.mixedSourceSeen = true;
+    if (result.wasExclusive) {
+        APR_EQ_COUNT(localExits);
+    }
+    g_overlay.localWakeEpoch[queueIndex].fetch_add(
+        1u, std::memory_order_release);
+    APR_EQ_COUNT(mixedPromotions);
+    result.changed = true;
+    return result;
+}
+
+static void disable_exclusive_local_waits_for_amm_tracking_loss() {
+    bool notify = false;
+    uint32_t promoted = 0;
+    {
+        OverlayLock lock;
+        if (g_overlay.initialized) {
+            for (uint32_t i = 0; i < kQueueCapacity; ++i) {
+                TrackedEqueue& queue = g_overlay.queues[i];
+                if (!queue.used) {
+                    continue;
+                }
+                const bool wasExclusiveBeforeTrackingLoss =
+                    queue_is_exclusive_local_ignoring_amm_health_locked(queue);
+                if (mark_queue_mixed_locked(i, queue).changed) {
+                    if (wasExclusiveBeforeTrackingLoss) {
+                        // trackingLost was published before this conservative
+                        // promotion, so mark_queue_mixed_locked cannot observe
+                        // the immediately preceding local-only state itself.
+                        APR_EQ_COUNT(localExits);
+                    }
+                    notify = true;
+                    ++promoted;
+                }
+            }
+        }
+    }
+    if (notify) {
+        notify_local_waiters();
+        AMPR_LOGF("apr.equeue.classification.change eq=* from=apr-candidate to=mixed reason=amm-buffer-tracking-lost queues=%u",
+                  promoted);
+    }
+}
+
+template <typename Call>
+static int forward_non_ampr_add(SceKernelEqueue eq,
+                                const char* reason,
+                                Call&& call) {
+    if (!g_overlay.hooksAvailable.load(std::memory_order_acquire)) {
+        return call();
+    }
+    QueuePromotion promotion{};
+    {
+        OverlayLock lock;
+        const uint32_t queueIndex = find_queue_index_locked(eq);
+        if (queueIndex < kQueueCapacity) {
+            promotion = mark_queue_mixed_locked(
+                queueIndex, g_overlay.queues[queueIndex]);
+        }
+    }
+    if (promotion.changed) {
+        notify_local_waiters();
+        log_queue_classification_change(
+            eq,
+            promotion.wasExclusive ? "apr-local" : "apr-candidate",
+            "mixed",
+            reason);
+    }
+    return call();
 }
 
 static bool insert_queue_hash_raw_locked(SceKernelEqueue eq,
@@ -586,7 +844,6 @@ static uint32_t allocate_queue_locked(SceKernelEqueue eq) {
     queue.pendingHead = kInvalidIndex;
     queue.pendingTail = kInvalidIndex;
     queue.nextFree = kInvalidIndex;
-    queue.waitGraceLevel = kWaitGraceInitialLevel;
     queue.lifetimeGeneration = next_generation64(g_overlay.nextLifetimeGeneration);
     if (!insert_queue_hash_locked(eq, index)) {
         queue = {};
@@ -599,9 +856,12 @@ static uint32_t allocate_queue_locked(SceKernelEqueue eq) {
     return index;
 }
 
-static uint32_t hash_registration(uint32_t queueIndex, int32_t id) {
+static uint32_t hash_registration(uint32_t queueIndex,
+                                  int16_t filter,
+                                  int32_t id) {
     uint32_t value = static_cast<uint32_t>(id);
     value ^= queueIndex * 0x9e3779b9u;
+    value ^= static_cast<uint32_t>(static_cast<uint16_t>(filter)) * 0x27d4eb2du;
     value ^= value >> 16u;
     value *= 0x85ebca6bu;
     value ^= value >> 13u;
@@ -610,6 +870,7 @@ static uint32_t hash_registration(uint32_t queueIndex, int32_t id) {
 
 static bool registration_hash_entry_matches_locked(uint16_t value,
                                                    uint32_t queueIndex,
+                                                   int16_t filter,
                                                    int32_t id) {
     if (value == 0 || value == kRegistrationHashTombstone) {
         return false;
@@ -617,13 +878,15 @@ static bool registration_hash_entry_matches_locked(uint16_t value,
     const uint32_t registrationIndex = static_cast<uint32_t>(value - 1u);
     return registrationIndex < kRegistrationCapacity &&
            g_overlay.registrationOwners[registrationIndex] == queueIndex + 1u &&
+           g_overlay.registrationFilters[registrationIndex] == filter &&
            g_overlay.registrations[registrationIndex].id == id;
 }
 
 static bool insert_registration_hash_raw_locked(uint32_t queueIndex,
+                                                int16_t filter,
                                                 int32_t id,
                                                 uint32_t registrationIndex) {
-    uint32_t slot = hash_registration(queueIndex, id);
+    uint32_t slot = hash_registration(queueIndex, filter, id);
     uint32_t tombstone = kInvalidIndex;
     for (uint32_t probe = 0; probe < kRegistrationHashCapacity; ++probe) {
         const uint16_t value = g_overlay.registrationHash[slot];
@@ -663,6 +926,7 @@ static bool rebuild_registration_hash_locked() {
         if (owner != 0 &&
             !insert_registration_hash_raw_locked(
                 static_cast<uint32_t>(owner - 1u),
+                g_overlay.registrationFilters[registrationIndex],
                 g_overlay.registrations[registrationIndex].id,
                 registrationIndex)) {
             return false;
@@ -673,23 +937,28 @@ static bool rebuild_registration_hash_locked() {
 }
 
 static bool insert_registration_hash_locked(uint32_t queueIndex,
+                                            int16_t filter,
                                             int32_t id,
                                             uint32_t registrationIndex) {
     if (g_overlay.registrationHashTombstones >= kRegistrationCapacity / 2u &&
         !rebuild_registration_hash_locked()) {
         return false;
     }
-    return insert_registration_hash_raw_locked(queueIndex, id, registrationIndex);
+    return insert_registration_hash_raw_locked(
+        queueIndex, filter, id, registrationIndex);
 }
 
-static void erase_registration_hash_locked(uint32_t queueIndex, int32_t id) {
-    uint32_t slot = hash_registration(queueIndex, id);
+static void erase_registration_hash_locked(uint32_t queueIndex,
+                                           int16_t filter,
+                                           int32_t id) {
+    uint32_t slot = hash_registration(queueIndex, filter, id);
     for (uint32_t probe = 0; probe < kRegistrationHashCapacity; ++probe) {
         const uint16_t value = g_overlay.registrationHash[slot];
         if (value == 0) {
             return;
         }
-        if (registration_hash_entry_matches_locked(value, queueIndex, id)) {
+        if (registration_hash_entry_matches_locked(
+                value, queueIndex, filter, id)) {
             g_overlay.registrationHash[slot] = kRegistrationHashTombstone;
             ++g_overlay.registrationHashTombstones;
             return;
@@ -700,21 +969,24 @@ static void erase_registration_hash_locked(uint32_t queueIndex, int32_t id) {
 
 static uint32_t find_registration_locked(uint32_t queueIndex,
                                          TrackedEqueue& queue,
+                                         int16_t filter,
                                          int32_t id) {
     if (queue.registrationCache < kRegistrationCapacity &&
         g_overlay.registrationOwners[queue.registrationCache] == queueIndex + 1u &&
+        g_overlay.registrationFilters[queue.registrationCache] == filter &&
         g_overlay.registrations[queue.registrationCache].id == id) {
         APR_EQ_COUNT(registrationCacheHits);
         return queue.registrationCache;
     }
     APR_EQ_COUNT(registrationCacheMisses);
-    uint32_t slot = hash_registration(queueIndex, id);
+    uint32_t slot = hash_registration(queueIndex, filter, id);
     for (uint32_t probe = 0; probe < kRegistrationHashCapacity; ++probe) {
         const uint16_t value = g_overlay.registrationHash[slot];
         if (value == 0) {
             return kInvalidIndex;
         }
-        if (registration_hash_entry_matches_locked(value, queueIndex, id)) {
+        if (registration_hash_entry_matches_locked(
+                value, queueIndex, filter, id)) {
             const uint32_t registrationIndex = static_cast<uint32_t>(value - 1u);
             queue.registrationCache = registrationIndex;
             return registrationIndex;
@@ -726,9 +998,10 @@ static uint32_t find_registration_locked(uint32_t queueIndex,
 
 static uint32_t allocate_registration_locked(uint32_t queueIndex,
                                              TrackedEqueue& queue,
+                                             int16_t filter,
                                              int32_t id,
                                              void* udata) {
-    uint32_t index = find_registration_locked(queueIndex, queue, id);
+    uint32_t index = find_registration_locked(queueIndex, queue, filter, id);
     if (index < kRegistrationCapacity) {
         MirroredRegistration& registration = g_overlay.registrations[index];
         registration.udata = udata;
@@ -747,8 +1020,10 @@ static uint32_t allocate_registration_locked(uint32_t queueIndex,
     registration.udata = udata;
     registration.generation = next_generation64(g_overlay.nextRegistrationGeneration);
     registration.next = queue.registrationHead;
-    if (!insert_registration_hash_locked(queueIndex, id, index)) {
+    g_overlay.registrationFilters[index] = filter;
+    if (!insert_registration_hash_locked(queueIndex, filter, id, index)) {
         registration = {};
+        g_overlay.registrationFilters[index] = 0;
         registration.next = g_overlay.registrationFreeHead;
         g_overlay.registrationFreeHead = index;
         APR_EQ_COUNT(registrationCapacityFailures);
@@ -767,14 +1042,16 @@ static uint32_t allocate_registration_locked(uint32_t queueIndex,
 
 static void remove_registration_locked(uint32_t queueIndex,
                                        TrackedEqueue& queue,
+                                       int16_t filter,
                                        int32_t id) {
     uint32_t previous = kInvalidIndex;
     uint32_t index = queue.registrationHead;
     while (index < kRegistrationCapacity) {
         MirroredRegistration& registration = g_overlay.registrations[index];
         const uint32_t next = registration.next;
-        if (registration.id == id) {
-            erase_registration_hash_locked(queueIndex, id);
+        if (registration.id == id &&
+            g_overlay.registrationFilters[index] == filter) {
+            erase_registration_hash_locked(queueIndex, filter, id);
             if (previous < kRegistrationCapacity) {
                 g_overlay.registrations[previous].next = next;
             } else {
@@ -784,6 +1061,7 @@ static void remove_registration_locked(uint32_t queueIndex,
                 queue.registrationCache = kInvalidIndex;
             }
             g_overlay.registrationOwners[index] = 0;
+            g_overlay.registrationFilters[index] = 0;
             registration = {};
             registration.next = g_overlay.registrationFreeHead;
             g_overlay.registrationFreeHead = index;
@@ -852,14 +1130,31 @@ static void append_pending_locked(TrackedEqueue& queue, uint32_t index) {
     ++queue.pendingCount;
 }
 
-static int drain_pending_locked(TrackedEqueue& queue,
+static bool pending_registration_is_current_locked(
+    uint32_t queueIndex,
+    const PendingEvent& pending) {
+    const uint32_t registrationIndex = pending.registrationIndex;
+    return registrationIndex < kRegistrationCapacity &&
+           g_overlay.registrationOwners[registrationIndex] == queueIndex + 1u &&
+           g_overlay.registrations[registrationIndex].generation ==
+               pending.registrationGeneration;
+}
+
+static int drain_pending_locked(uint32_t queueIndex,
+                                TrackedEqueue& queue,
                                 SceKernelEvent* events,
                                 int capacity,
                                 bool* outNotifyReactor) {
     int count = 0;
-    while (count < capacity && queue.pendingHead < kPendingCapacity) {
+    bool releasedPending = false;
+    while (queue.pendingHead < kPendingCapacity) {
         const uint32_t index = queue.pendingHead;
         PendingEvent& pending = g_overlay.pending[index];
+        const bool registrationCurrent =
+            pending_registration_is_current_locked(queueIndex, pending);
+        if (registrationCurrent && count >= capacity) {
+            break;
+        }
         queue.pendingHead = pending.next;
         if (queue.pendingHead >= kPendingCapacity) {
             queue.pendingTail = kInvalidIndex;
@@ -867,10 +1162,15 @@ static int drain_pending_locked(TrackedEqueue& queue,
         if (queue.pendingCount != 0) {
             --queue.pendingCount;
         }
-        events[count++] = pending.event;
+        if (registrationCurrent) {
+            events[count++] = pending.event;
+        } else {
+            APR_EQ_COUNT(staleRegistrationDrops);
+        }
         release_pending_locked(index);
+        releasedPending = true;
     }
-    if (count != 0 && outNotifyReactor &&
+    if (releasedPending && outNotifyReactor &&
         take_pending_backpressure_progress_locked()) {
         *outNotifyReactor = true;
     }
@@ -891,7 +1191,6 @@ static BeginPrivateWakeResult begin_private_wake_locked(
     uint32_t queueIndex,
     TrackedEqueue& queue,
     uint32_t pendingIndex,
-    bool disableWakeOnFailure,
     PrivateWakeRequest* request) {
     if (queue.wakeArmed) {
         APR_EQ_COUNT(wakeElisions);
@@ -908,7 +1207,6 @@ static BeginPrivateWakeResult begin_private_wake_locked(
     request->wakeId = queue.wakeId;
     request->pendingIndex = pendingIndex;
     request->queueGeneration = queue.lifetimeGeneration;
-    request->disableWakeOnFailure = disableWakeOnFailure;
     return BeginPrivateWakeResult::Scheduled;
 }
 
@@ -946,18 +1244,21 @@ static PrivateWakeCompletion execute_private_wake(
                 if (result.rc == 0 &&
                     request.pendingIndex < kPendingCapacity) {
                     append_pending_locked(queue, request.pendingIndex);
-                    if (queue.waitGraceActive) {
-                        g_overlay.publishEpoch.store(
-                            next_generation64(g_overlay.nextPublishEpoch),
-                            std::memory_order_release);
-                    }
                     result.pendingPublished = true;
-                    result.pendingCount = queue.pendingCount;
-                } else if (result.rc != 0 &&
-                           request.disableWakeOnFailure) {
+                } else if (result.rc != 0) {
+                    // Documented trigger failures are permanent for this
+                    // (equeue, id) pair. Keep existing FIFO nodes drainable,
+                    // but route later publications through native fallback.
                     queue.wakeReady = false;
                 }
                 queue.wakeTriggering = false;
+                result.pendingCount = queue.pendingCount;
+                result.nativeWaitIntent = queue.nativeWaitIntent;
+                result.replacementStillRequired =
+                    result.rc != 0 &&
+                    request.pendingIndex >= kPendingCapacity &&
+                    queue.pendingCount != 0 &&
+                    queue.nativeWaitIntent != 0;
             }
         }
 
@@ -973,14 +1274,45 @@ static PrivateWakeCompletion execute_private_wake(
     return result;
 }
 
+static void execute_replacement_wake_or_abort(
+    const PrivateWakeRequest& request) {
+    const PrivateWakeCompletion completion = execute_private_wake(request);
+    if (completion.rc == 0 || !completion.replacementStillRequired) {
+        return;
+    }
+
+    // A publication wake can fall back before its reserved node becomes
+    // visible. Replacement wakes cover nodes already in the synthetic FIFO,
+    // so returning after a permanent EBADF/ENOENT trigger failure would strand
+    // those nodes behind an infinite native waiter with no armed edge.
+    AMPR_CRITICAL_LOGF("apr.equeue.replacement-wake.fail eq=%p wakeId=%u queue=%u generation=%llu pending=%u nativeWaitIntent=%u rc=0x%x action=abort",
+                       request.eq,
+                       request.wakeId,
+                       request.queueIndex,
+                       (unsigned long long)request.queueGeneration,
+                       completion.pendingCount,
+                       completion.nativeWaitIntent,
+                       completion.rc);
+    AMPR_KLOGF("ampr.abort reason=apr.equeue.replacement-wake.fail file=%s line=%d",
+               __FILE__,
+               __LINE__);
+    std::abort();
+}
+
 static bool attach_hidden_wake_locked(TrackedEqueue& queue) {
+    AddUserEventFn const addUserEventEdge =
+        original_event_hook<AddUserEventFn>(
+            kAmprLibkernelHook_sceKernelAddUserEventEdge);
+    if (!addUserEventEdge) {
+        return false;
+    }
     for (uint32_t attempt = 0; attempt < kWakeAttachAttempts; ++attempt) {
         uint32_t candidate = g_overlay.nextWakeId++;
         if (candidate < kWakeIdBase || candidate == 0 || candidate > INT_MAX) {
             g_overlay.nextWakeId = kWakeIdBase + 1u;
             candidate = kWakeIdBase;
         }
-        const int rc = sceKernelAddUserEventEdge(queue.eq, static_cast<int>(candidate));
+        const int rc = addUserEventEdge(queue.eq, static_cast<int>(candidate));
         if (rc == 0) {
             queue.wakeId = candidate;
             queue.wakeRegistered = true;
@@ -1023,8 +1355,11 @@ static bool release_queue_locked(uint32_t queueIndex) {
         const uint32_t index = queue.registrationHead;
         queue.registrationHead = g_overlay.registrations[index].next;
         erase_registration_hash_locked(
-            queueIndex, g_overlay.registrations[index].id);
+            queueIndex,
+            g_overlay.registrationFilters[index],
+            g_overlay.registrations[index].id);
         g_overlay.registrationOwners[index] = 0;
+        g_overlay.registrationFilters[index] = 0;
         g_overlay.registrations[index] = {};
         g_overlay.registrations[index].next = g_overlay.registrationFreeHead;
         g_overlay.registrationFreeHead = index;
@@ -1039,6 +1374,11 @@ static bool release_queue_locked(uint32_t queueIndex) {
     }
     const bool notifyReactor = take_pending_backpressure_progress_locked();
     note_wait_intents_removed_locked(queue.nativeWaitIntent);
+    g_overlay.localWakeEpoch[queueIndex].fetch_add(
+        1u, std::memory_order_release);
+    if (queue.ammSourceSeen) {
+        erase_amm_queue_hash_locked(queue.eq);
+    }
     erase_queue_hash_locked(queue.eq);
     queue = {};
     queue.nextFree = g_overlay.queueFreeHead;
@@ -1051,8 +1391,16 @@ static bool release_queue_locked(uint32_t queueIndex) {
             slot = 0;
         }
         g_overlay.queueHashTombstones = 0;
+        for (std::atomic<uintptr_t>& slot : g_overlay.ammQueueHash) {
+            slot.store(0, std::memory_order_release);
+        }
+        g_overlay.ammQueueHashTombstones = 0;
     } else if (g_overlay.queueHashTombstones >= kQueueCapacity / 2u) {
         (void)rebuild_queue_hash_locked();
+    }
+    if (g_overlay.liveQueues != 0 &&
+        g_overlay.ammQueueHashTombstones >= kQueueCapacity / 2u) {
+        (void)rebuild_amm_queue_hash_locked();
     }
     if (g_overlay.liveRegistrations == 0) {
         for (uint16_t& slot : g_overlay.registrationHash) {
@@ -1087,8 +1435,7 @@ static NativeWaitTransition prepare_native_wait(
     uint32_t queueIndex,
     uint64_t queueGeneration,
     SceKernelEvent* events,
-    int num,
-    bool leavingWaitGrace) {
+    int num) {
     for (;;) {
         NativeWaitTransition result{};
         {
@@ -1102,19 +1449,9 @@ static NativeWaitTransition prepare_native_wait(
             TrackedEqueue& queue = g_overlay.queues[queueIndex];
             if (!private_wake_in_flight_locked(queue)) {
                 result.syntheticCount =
-                    drain_pending_locked(queue, events, num, &result.notifyReactor);
-                if (result.syntheticCount != 0) {
-                    if (leavingWaitGrace) {
-                        note_wait_grace_result_locked(
-                            queue, true, static_cast<uint32_t>(result.syntheticCount));
-                    } else {
-                        note_wait_grace_delivery_locked(
-                            queue, static_cast<uint32_t>(result.syntheticCount));
-                    }
-                } else {
-                    if (leavingWaitGrace) {
-                        note_wait_grace_result_locked(queue, false, 0);
-                    }
+                    drain_pending_locked(
+                        queueIndex, queue, events, num, &result.notifyReactor);
+                if (result.syntheticCount == 0) {
                     ++queue.nativeWaitIntent;
                     note_wait_intent_added_locked();
                     result.nativeWaitIntentInstalled = true;
@@ -1171,102 +1508,162 @@ static SceKernelUseconds remaining_timeout_us(const NativeWaitDeadline& deadline
     return static_cast<SceKernelUseconds>(remainingUs);
 }
 
-#if AMPR_EMU_DEBUG_LOG
-static uint64_t counter_ticks_to_useconds(uint64_t ticks,
-                                          uint64_t frequency) {
-    if (frequency == 0) {
-        return 0;
+static void wait_for_local_change(uint32_t queueIndex,
+                                  uint64_t observedEpoch,
+                                  const SceKernelUseconds* timeout) {
+    if (queueIndex >= kQueueCapacity ||
+        !g_overlay.localWaitSyncReady.load(std::memory_order_acquire)) {
+        return;
     }
-    const uint64_t wholeSeconds = ticks / frequency;
-    const uint64_t partialTicks = ticks % frequency;
-    if (wholeSeconds > UINT64_MAX / kUsecondsPerSecond) {
-        return UINT64_MAX;
+    const int lockRc = scePthreadMutexLock(&g_overlay.localWaitMutex);
+    if (lockRc != 0) {
+        abort_local_wait_sync("wait-lock", lockRc);
     }
-    const uint64_t wholeUseconds = wholeSeconds * kUsecondsPerSecond;
-    const uint64_t partialUseconds =
-        (partialTicks * kUsecondsPerSecond) / frequency;
-    return partialUseconds > UINT64_MAX - wholeUseconds
-               ? UINT64_MAX
-               : wholeUseconds + partialUseconds;
+    if (g_overlay.localWakeEpoch[queueIndex].load(
+            std::memory_order_acquire) == observedEpoch) {
+        APR_EQ_COUNT(localWaits);
+        int waitRc = 0;
+        if (timeout) {
+            waitRc = scePthreadCondTimedwait(
+                &g_overlay.localWaitCond,
+                &g_overlay.localWaitMutex,
+                *timeout);
+        } else {
+            waitRc = scePthreadCondWait(
+                &g_overlay.localWaitCond,
+                &g_overlay.localWaitMutex);
+        }
+        if (waitRc != 0 && waitRc != SCE_KERNEL_ERROR_ETIMEDOUT &&
+            waitRc != ETIMEDOUT) {
+            abort_local_wait_sync("wait-cond", waitRc);
+        }
+        APR_EQ_COUNT(localWakeups);
+    }
+    const int unlockRc = scePthreadMutexUnlock(&g_overlay.localWaitMutex);
+    if (unlockRc != 0) {
+        abort_local_wait_sync("wait-unlock", unlockRc);
+    }
 }
-#endif
 
-static NativeWaitTransition wait_for_recent_apr_event(
-    uint32_t queueIndex,
-    uint64_t queueGeneration,
-    uint64_t observedPublishEpoch,
-    uint64_t counterFrequency,
-    SceKernelUseconds waitGraceUseconds,
-    SceKernelEvent* events,
-    int num) {
-    NativeWaitTransition result{};
-    APR_EQ_COUNT(waitGraceAttempts);
+template <typename Call>
+static int forward_ampr_registration_add(SceKernelEqueue eq,
+                                         int16_t filter,
+                                         int id,
+                                         void* udata,
+                                         Call&& call) {
+    if (!g_overlay.hooksAvailable.load(std::memory_order_acquire)) {
+        return call();
+    }
 
-    const uint64_t start = sceKernelGetProcessTimeCounter();
-    const uint64_t duration =
-        timeout_to_counter_ticks(waitGraceUseconds, counterFrequency);
-    const uint64_t expires = duration > UINT64_MAX - start
-                                 ? UINT64_MAX
-                                 : start + duration;
-    uint64_t currentEpoch = observedPublishEpoch;
-    uint32_t spins = 0;
-    for (;;) {
-        const uint64_t published =
-            g_overlay.publishEpoch.load(std::memory_order_acquire);
-        if (published != currentEpoch) {
-            OverlayLock lock;
-            if (queueIndex >= kQueueCapacity ||
-                !g_overlay.queues[queueIndex].used ||
-                g_overlay.queues[queueIndex].lifetimeGeneration !=
-                    queueGeneration) {
-                break;
+    bool classificationChanged = false;
+    QueuePromotion forcedMixed{};
+    uint64_t queueGeneration = 0;
+    int rc = 0;
+    {
+        OverlayLock lock;
+        if (!g_overlay.hooksAvailable.load(std::memory_order_relaxed)) {
+            return call();
+        }
+        const uint32_t queueIndex = find_queue_index_locked(eq);
+        if (queueIndex >= kQueueCapacity) {
+            return call();
+        }
+
+        // Keep the native AMPR registration and its mirror in one transaction.
+        // DeleteAmprEvent and DeleteEqueue use the same lock, so neither can
+        // remove/recreate this lifetime between native success and mirroring.
+        rc = call();
+        if (rc != 0) {
+            return rc;
+        }
+
+        TrackedEqueue& queue = g_overlay.queues[queueIndex];
+        const bool wasExclusive = queue_is_exclusive_local_locked(queue);
+        if (!queue.wakeRegistered && !attach_hidden_wake_locked(queue)) {
+            forcedMixed = mark_queue_mixed_locked(queueIndex, queue);
+        } else if (allocate_registration_locked(
+                       queueIndex, queue, filter, id, udata) >=
+                   kRegistrationCapacity) {
+            forcedMixed = mark_queue_mixed_locked(queueIndex, queue);
+        } else {
+            queue.amprSourceSeen = true;
+            classificationChanged =
+                !wasExclusive && queue_is_exclusive_local_locked(queue);
+            if (classificationChanged) {
+                APR_EQ_COUNT(localEntries);
             }
-            TrackedEqueue& queue = g_overlay.queues[queueIndex];
-            if (!private_wake_in_flight_locked(queue)) {
-                result.syntheticCount = drain_pending_locked(
-                    queue, events, num, &result.notifyReactor);
-                if (result.syntheticCount != 0) {
-                    note_wait_grace_result_locked(
-                        queue, true, static_cast<uint32_t>(result.syntheticCount));
-                    break;
+            APR_EQ_COUNT(addRegistrations);
+            queueGeneration = queue.lifetimeGeneration;
+        }
+    }
+    if (forcedMixed.changed) {
+        notify_local_waiters();
+        log_queue_classification_change(
+            eq,
+            forcedMixed.wasExclusive ? "apr-local" : "apr-candidate",
+            "mixed",
+            "ampr-registration-overlay-unavailable");
+    }
+    if (classificationChanged) {
+        AMPR_TLOGF("apr.equeue.classification.change eq=%p from=apr-candidate to=apr-local reason=%s",
+                   eq,
+                   filter == kAmprSystemEventFilter
+                       ? "ampr-system-registration-add"
+                       : "ampr-registration-add");
+    }
+    if (queueGeneration != 0) {
+        AMPR_TLOGF("apr.equeue.registration.add eq=%p filter=%d id=%d udata=%p queueGeneration=%llu",
+                   eq,
+                   static_cast<int>(filter),
+                   id,
+                   udata,
+                   (unsigned long long)queueGeneration);
+    }
+    return rc;
+}
+
+template <typename Call>
+static int forward_ampr_registration_delete(SceKernelEqueue eq,
+                                            int16_t filter,
+                                            int id,
+                                            Call&& call) {
+    if (!g_overlay.hooksAvailable.load(std::memory_order_acquire)) {
+        return call();
+    }
+
+    bool classificationChanged = false;
+    int rc = 0;
+    {
+        OverlayLock lock;
+        if (!g_overlay.hooksAvailable.load(std::memory_order_relaxed)) {
+            return call();
+        }
+        rc = call();
+        if (rc == 0) {
+            const uint32_t queueIndex = find_queue_index_locked(eq);
+            if (queueIndex < kQueueCapacity) {
+                TrackedEqueue& queue = g_overlay.queues[queueIndex];
+                const bool wasExclusive = queue_is_exclusive_local_locked(queue);
+                remove_registration_locked(queueIndex, queue, filter, id);
+                queue.amprSourceSeen =
+                    queue.registrationHead < kRegistrationCapacity;
+                classificationChanged =
+                    wasExclusive && !queue_is_exclusive_local_locked(queue);
+                if (classificationChanged) {
+                    APR_EQ_COUNT(localExits);
                 }
+                APR_EQ_COUNT(deleteRegistrations);
             }
-            currentEpoch =
-                g_overlay.publishEpoch.load(std::memory_order_relaxed);
-        }
-
-        __builtin_ia32_pause();
-        ++spins;
-        if ((spins & 31u) == 0 &&
-            sceKernelGetProcessTimeCounter() >= expires) {
-            break;
         }
     }
-
-#if AMPR_EMU_DEBUG_LOG
-    const uint64_t finish = sceKernelGetProcessTimeCounter();
-    APR_EQ_ADD(waitGraceSpinIterations, spins);
-    APR_EQ_ADD(waitGraceElapsedUs,
-               counter_ticks_to_useconds(finish - start, counterFrequency));
-#endif
-
-    // This final pending check and native-intent transition share the overlay
-    // lock with publication. An event therefore either drains here or observes
-    // nativeWaitIntent and triggers the private wake after this lock is released.
-    if (result.syntheticCount == 0) {
-        result = prepare_native_wait(
-            queueIndex, queueGeneration, events, num, true);
+    if (classificationChanged) {
+        AMPR_TLOGF("apr.equeue.classification.change eq=%p from=apr-local to=apr-candidate reason=%s",
+                   eq,
+                   filter == kAmprSystemEventFilter
+                       ? "ampr-system-registration-delete"
+                       : "ampr-registration-delete");
     }
-
-#if AMPR_EMU_DEBUG_LOG
-    if (result.syntheticCount != 0) {
-        APR_EQ_COUNT(waitGraceHits);
-        APR_EQ_ADD(waitGraceEvents, result.syntheticCount);
-    } else {
-        APR_EQ_COUNT(waitGraceMisses);
-    }
-#endif
-    return result;
+    return rc;
 }
 
 } // namespace
@@ -1283,6 +1680,7 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
     [[maybe_unused]] void* registrationUdata = nullptr;
     [[maybe_unused]] uint64_t registrationGeneration = 0;
     [[maybe_unused]] uint32_t pendingCount = 0;
+    bool notifyLocal = false;
     for (;;) {
         PrivateWakeRequest wakeRequest{};
         uint32_t waitQueueIndex = kInvalidIndex;
@@ -1305,7 +1703,8 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
                 waitForWakeCompletion = true;
             } else {
                 const uint32_t registrationIndex =
-                    find_registration_locked(queueIndex, queue, id);
+                    find_registration_locked(
+                        queueIndex, queue, SCE_KERNEL_EVFILT_AMPR, id);
                 if (registrationIndex >= kRegistrationCapacity) {
                     APR_EQ_COUNT(fallbackRegistration);
                     return AprEqueuePublishResult::NativeFallback;
@@ -1324,6 +1723,7 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
                 const MirroredRegistration& registration =
                     g_overlay.registrations[registrationIndex];
                 PendingEvent& pending = g_overlay.pending[pendingIndex];
+                pending.registrationIndex = registrationIndex;
                 pending.event.ident =
                     static_cast<uintptr_t>(static_cast<uint32_t>(id));
                 pending.event.filter = SCE_KERNEL_EVFILT_AMPR;
@@ -1346,7 +1746,6 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
                             queueIndex,
                             queue,
                             pendingIndex,
-                            true,
                             &wakeRequest);
                     if (wakeResult == BeginPrivateWakeResult::Scheduled) {
                         executeWake = true;
@@ -1364,10 +1763,10 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
                 }
 
                 if (!executeWake) {
-                    if (queue.waitGraceActive) {
-                        g_overlay.publishEpoch.store(
-                            next_generation64(g_overlay.nextPublishEpoch),
-                            std::memory_order_release);
+                    if (queue_is_exclusive_local_locked(queue)) {
+                        g_overlay.localWakeEpoch[queueIndex].fetch_add(
+                            1u, std::memory_order_release);
+                        notifyLocal = true;
                     }
                     pendingCount = queue.pendingCount;
                     APR_EQ_COUNT(published);
@@ -1396,6 +1795,9 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
         }
         break;
     }
+    if (notifyLocal) {
+        notify_local_waiters();
+    }
     AMPR_TLOGF("apr.equeue.publish eq=%p id=%d data=0x%llx udata=%p regGeneration=%llu pending=%u",
                eq,
                id,
@@ -1406,12 +1808,149 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
     return AprEqueuePublishResult::Published;
 }
 
-void apr_equeue_overlay_set_hooks_available(bool available) {
-    g_overlay.hooksAvailable.store(available, std::memory_order_release);
+void apr_equeue_overlay_set_hook_availability(bool hooksAvailable,
+                                               bool classificationAvailable) {
+    bool wakeLocal = false;
+    bool availabilityChanged = false;
+    {
+        OverlayLock lock;
+        const bool wasComplete =
+            g_overlay.hooksAvailable.load(std::memory_order_relaxed) &&
+            g_overlay.classificationHooksAvailable.load(
+                std::memory_order_relaxed);
+        availabilityChanged =
+            wasComplete != (hooksAvailable && classificationAvailable);
+        if (wasComplete && (!hooksAvailable || !classificationAvailable) &&
+            g_overlay.initialized) {
+            for (uint32_t i = 0; i < kQueueCapacity; ++i) {
+                if (g_overlay.queues[i].used) {
+                    if (queue_is_exclusive_local_locked(
+                            g_overlay.queues[i])) {
+                        APR_EQ_COUNT(localExits);
+                    }
+                    g_overlay.localWakeEpoch[i].fetch_add(
+                        1u, std::memory_order_release);
+                    wakeLocal = true;
+                }
+            }
+        }
+        g_overlay.classificationHooksAvailable.store(
+            classificationAvailable, std::memory_order_relaxed);
+        g_overlay.hooksAvailable.store(
+            hooksAvailable, std::memory_order_release);
+    }
+    if (wakeLocal) {
+        notify_local_waiters();
+    }
+    if (availabilityChanged) {
+        AMPR_LOGF("apr.equeue.classifier.availability core=%u complete=%u",
+                  hooksAvailable ? 1u : 0u,
+                  classificationAvailable ? 1u : 0u);
+    }
+}
+
+void apr_equeue_register_amm_command_buffer(const void* commandBuffer) {
+    if (!commandBuffer ||
+        g_ammCommandBuffers.trackingLost.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const uintptr_t key = reinterpret_cast<uintptr_t>(commandBuffer);
+    bool inserted = false;
+    bool trackingLost = false;
+    {
+        AmmCommandBufferLock lock;
+        uint32_t slot = hash_amm_command_buffer(key);
+        uint32_t tombstone = kInvalidIndex;
+        for (uint32_t probe = 0; probe < kAmmBufferHashCapacity; ++probe) {
+            const uintptr_t value = g_ammCommandBuffers.slots[slot];
+            if (value == key) {
+                return;
+            }
+            if (value == 1 && tombstone == kInvalidIndex) {
+                tombstone = slot;
+            } else if (value == 0) {
+                g_ammCommandBuffers.slots[
+                    tombstone != kInvalidIndex ? tombstone : slot] = key;
+                inserted = true;
+                break;
+            }
+            slot = (slot + 1u) & (kAmmBufferHashCapacity - 1u);
+        }
+        if (!inserted && tombstone != kInvalidIndex) {
+            g_ammCommandBuffers.slots[tombstone] = key;
+            inserted = true;
+        }
+        if (!inserted) {
+            trackingLost = !g_ammCommandBuffers.trackingLost.exchange(
+                true, std::memory_order_acq_rel);
+        }
+    }
+    if (inserted) {
+        APR_EQ_COUNT(ammBufferRegistrations);
+    } else if (trackingLost) {
+        APR_EQ_COUNT(ammTrackingFailures);
+        disable_exclusive_local_waits_for_amm_tracking_loss();
+    }
+}
+
+void apr_equeue_unregister_amm_command_buffer(const void* commandBuffer) {
+    if (!commandBuffer ||
+        g_ammCommandBuffers.trackingLost.load(std::memory_order_acquire)) {
+        return;
+    }
+    const uintptr_t key = reinterpret_cast<uintptr_t>(commandBuffer);
+    AmmCommandBufferLock lock;
+    uint32_t slot = hash_amm_command_buffer(key);
+    for (uint32_t probe = 0; probe < kAmmBufferHashCapacity; ++probe) {
+        const uintptr_t value = g_ammCommandBuffers.slots[slot];
+        if (value == 0) {
+            return;
+        }
+        if (value == key) {
+            g_ammCommandBuffers.slots[slot] = 1;
+            return;
+        }
+        slot = (slot + 1u) & (kAmmBufferHashCapacity - 1u);
+    }
+}
+
+void apr_equeue_note_command_buffer_event(const void* commandBuffer,
+                                          SceKernelEqueue eq) {
+    if (!eq || amm_queue_classified_fast(eq)) {
+        return;
+    }
+    if (!is_registered_amm_command_buffer(commandBuffer)) {
+        return;
+    }
+    APR_EQ_COUNT(ammEventQueues);
+    QueuePromotion promotion{};
+    {
+        OverlayLock lock;
+        const uint32_t queueIndex = find_queue_index_locked(eq);
+        if (queueIndex >= kQueueCapacity) {
+            return;
+        }
+        TrackedEqueue& queue = g_overlay.queues[queueIndex];
+        queue.ammSourceSeen = true;
+        promotion = mark_queue_mixed_locked(queueIndex, queue);
+        // Publish the lock-free fast-path key only after mixed classification
+        // is committed. A concurrent recorder that observes the key may then
+        // return without taking either registry or overlay lock.
+        (void)insert_amm_queue_hash_locked(eq);
+    }
+    if (promotion.changed) {
+        notify_local_waiters();
+        log_queue_classification_change(
+            eq,
+            promotion.wasExclusive ? "apr-local" : "apr-candidate",
+            "mixed",
+            "amm-write-equeue-record");
+    }
 }
 
 void apr_equeue_overlay_shutdown() {
-    g_overlay.hooksAvailable.store(false, std::memory_order_release);
+    apr_equeue_overlay_set_hook_availability(false, false);
     bool notifyReactor = false;
     {
         OverlayLock lock;
@@ -1461,92 +2000,244 @@ void apr_equeue_overlay_shutdown() {
     if (notifyReactor) {
         apr_reactor_notify_external_progress();
     }
+    notify_local_waiters();
+}
+
+extern "C" int sceKernelCreateEqueue_emul(SceKernelEqueue* eq,
+                                            const char* name) {
+    CreateEqueueFn const original = original_create_equeue();
+    if (!original) {
+        return SCE_KERNEL_ERROR_ENOSYS;
+    }
+    if (!g_overlay.hooksAvailable.load(std::memory_order_acquire)) {
+        return original(eq, name);
+    }
+
+    OverlayLock lock;
+    if (!g_overlay.hooksAvailable.load(std::memory_order_relaxed)) {
+        return original(eq, name);
+    }
+    const int rc = original(eq, name);
+    if (rc == 0 && eq && *eq &&
+        g_overlay.classificationHooksAvailable.load(
+            std::memory_order_relaxed) &&
+        find_queue_index_locked(*eq) >= kQueueCapacity) {
+        (void)allocate_queue_locked(*eq);
+    }
+    return rc;
+}
+
+extern "C" int sceKernelAddTimerEvent_emul(SceKernelEqueue eq, int id,
+                                             SceKernelUseconds usec,
+                                             void* udata) {
+    AddTimerEventFn const original = original_event_hook<AddTimerEventFn>(
+        kAmprLibkernelHook_sceKernelAddTimerEvent);
+    return original
+               ? forward_non_ampr_add(
+                     eq,
+                     "timer-registration",
+                     [&]() { return original(eq, id, usec, udata); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
+
+extern "C" int sceKernelAddReadEvent_emul(SceKernelEqueue eq, int fd,
+                                            size_t size, void* udata) {
+    AddFdEventFn const original = original_event_hook<AddFdEventFn>(
+        kAmprLibkernelHook_sceKernelAddReadEvent);
+    return original
+               ? forward_non_ampr_add(
+                     eq,
+                     "read-registration",
+                     [&]() { return original(eq, fd, size, udata); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
+
+extern "C" int sceKernelAddWriteEvent_emul(SceKernelEqueue eq, int fd,
+                                             size_t size, void* udata) {
+    AddFdEventFn const original = original_event_hook<AddFdEventFn>(
+        kAmprLibkernelHook_sceKernelAddWriteEvent);
+    return original
+               ? forward_non_ampr_add(
+                     eq,
+                     "write-registration",
+                     [&]() { return original(eq, fd, size, udata); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
+
+extern "C" int sceKernelAddFileEvent_emul(SceKernelEqueue eq, int fd,
+                                            int watch, void* udata) {
+    AddFileEventFn const original = original_event_hook<AddFileEventFn>(
+        kAmprLibkernelHook_sceKernelAddFileEvent);
+    return original
+               ? forward_non_ampr_add(
+                     eq,
+                     "file-registration",
+                     [&]() { return original(eq, fd, watch, udata); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
+
+extern "C" int sceKernelAddUserEvent_emul(SceKernelEqueue eq, int id) {
+    AddUserEventFn const original = original_event_hook<AddUserEventFn>(
+        kAmprLibkernelHook_sceKernelAddUserEvent);
+    return original
+               ? forward_non_ampr_add(
+                     eq,
+                     "user-registration",
+                     [&]() { return original(eq, id); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
+
+extern "C" int sceKernelAddUserEventEdge_emul(SceKernelEqueue eq, int id) {
+    AddUserEventFn const original = original_event_hook<AddUserEventFn>(
+        kAmprLibkernelHook_sceKernelAddUserEventEdge);
+    return original
+               ? forward_non_ampr_add(
+                     eq,
+                     "user-edge-registration",
+                     [&]() { return original(eq, id); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
+
+extern "C" int sceKernelAddHRTimerEvent_emul(SceKernelEqueue eq, int id,
+                                               SceKernelTimespec* ts,
+                                               void* udata) {
+    AddHRTimerEventFn const original =
+        original_event_hook<AddHRTimerEventFn>(
+            kAmprLibkernelHook_sceKernelAddHRTimerEvent);
+    return original
+               ? forward_non_ampr_add(
+                     eq,
+                     "hrtimer-registration",
+                     [&]() { return original(eq, id, ts, udata); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
+
+template <typename Value>
+static int forward_external_event_add(AmprExternalEqueueHookId hookId,
+                                      SceKernelEqueue eq,
+                                      Value value,
+                                      void* udata,
+                                      const char* reason) {
+    auto* const original =
+        ampr_fixed_external_equeue_slot<ExternalAddEventFn<Value>>(hookId);
+    return original
+               ? forward_non_ampr_add(
+                     eq,
+                     reason,
+                     [&]() { return original(eq, value, udata); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
+
+extern "C" int sceAgcDriverAddEqEvent_emul(SceKernelEqueue eq,
+                                             uint32_t type,
+                                             void* udata) {
+    return forward_external_event_add(
+        kAmprExternalEqueueHook_sceAgcDriverAddEqEvent,
+        eq,
+        type,
+        udata,
+        "agc-registration");
+}
+
+extern "C" int sceVideoOutAddFlipEvent_emul(SceKernelEqueue eq,
+                                              int32_t handle,
+                                              void* udata) {
+    return forward_external_event_add(
+        kAmprExternalEqueueHook_sceVideoOutAddFlipEvent,
+        eq,
+        handle,
+        udata,
+        "videoout-flip-registration");
+}
+
+extern "C" int sceVideoOutAddVblankEvent_emul(SceKernelEqueue eq,
+                                                int32_t handle,
+                                                void* udata) {
+    return forward_external_event_add(
+        kAmprExternalEqueueHook_sceVideoOutAddVblankEvent,
+        eq,
+        handle,
+        udata,
+        "videoout-vblank-registration");
+}
+
+extern "C" int sceVideoOutAddPreVblankStartEvent_emul(
+    SceKernelEqueue eq,
+    int32_t handle,
+    void* udata) {
+    return forward_external_event_add(
+        kAmprExternalEqueueHook_sceVideoOutAddPreVblankStartEvent,
+        eq,
+        handle,
+        udata,
+        "videoout-pre-vblank-start-registration");
+}
+
+extern "C" int sceVideoOutAddOutputModeEvent_emul(SceKernelEqueue eq,
+                                                    int32_t handle,
+                                                    void* udata) {
+    return forward_external_event_add(
+        kAmprExternalEqueueHook_sceVideoOutAddOutputModeEvent,
+        eq,
+        handle,
+        udata,
+        "videoout-output-mode-registration");
 }
 
 extern "C" int sceKernelAddAmprEvent_emul(SceKernelEqueue eq,
                                            int id,
                                            void* udata) {
     AddAmprEventFn const original = original_add_ampr_event();
-    if (!original) {
-        return SCE_KERNEL_ERROR_ENOSYS;
-    }
-    if (!g_overlay.hooksAvailable.load(std::memory_order_acquire)) {
-        return original(eq, id, udata);
-    }
-
-    SceKernelEqueue cleanupWakeEq = nullptr;
-    uint32_t cleanupWakeId = 0;
-    int rc = 0;
-    {
-        OverlayLock lock;
-        if (!g_overlay.hooksAvailable.load(std::memory_order_relaxed)) {
-            return original(eq, id, udata);
-        }
-        rc = original(eq, id, udata);
-        if (rc != 0) {
-            return rc;
-        }
-
-        uint32_t queueIndex = find_queue_index_locked(eq);
-        bool allocatedQueue = false;
-        if (queueIndex >= kQueueCapacity) {
-            queueIndex = allocate_queue_locked(eq);
-            allocatedQueue = queueIndex < kQueueCapacity;
-            if (!allocatedQueue) {
-                return rc;
-            }
-            if (!attach_hidden_wake_locked(g_overlay.queues[queueIndex])) {
-                release_queue_locked(queueIndex);
-                return rc;
-            }
-        }
-
-        TrackedEqueue& queue = g_overlay.queues[queueIndex];
-        if (allocate_registration_locked(queueIndex, queue, id, udata) >=
-            kRegistrationCapacity) {
-            if (allocatedQueue) {
-                cleanupWakeEq = queue.eq;
-                cleanupWakeId = queue.wakeId;
-                release_queue_locked(queueIndex);
-            }
-        } else {
-            APR_EQ_COUNT(addRegistrations);
-            AMPR_TLOGF("apr.equeue.registration.add eq=%p id=%d udata=%p queueGeneration=%llu",
-                       eq,
-                       id,
-                       udata,
-                       (unsigned long long)queue.lifetimeGeneration);
-        }
-    }
-    if (cleanupWakeEq) {
-        (void)sceKernelDeleteUserEvent(
-            cleanupWakeEq, static_cast<int>(cleanupWakeId));
-    }
-    return rc;
+    return original
+               ? forward_ampr_registration_add(
+                     eq,
+                     SCE_KERNEL_EVFILT_AMPR,
+                     id,
+                     udata,
+                     [&]() { return original(eq, id, udata); })
+               : SCE_KERNEL_ERROR_ENOSYS;
 }
 
 extern "C" int sceKernelDeleteAmprEvent_emul(SceKernelEqueue eq, int id) {
     DeleteAmprEventFn const original = original_delete_ampr_event();
-    if (!original) {
-        return SCE_KERNEL_ERROR_ENOSYS;
-    }
-    if (!g_overlay.hooksAvailable.load(std::memory_order_acquire)) {
-        return original(eq, id);
-    }
+    return original
+               ? forward_ampr_registration_delete(
+                     eq,
+                     SCE_KERNEL_EVFILT_AMPR,
+                     id,
+                     [&]() { return original(eq, id); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
 
-    OverlayLock lock;
-    if (!g_overlay.hooksAvailable.load(std::memory_order_relaxed)) {
-        return original(eq, id);
-    }
-    const int rc = original(eq, id);
-    if (rc == 0) {
-        const uint32_t queueIndex = find_queue_index_locked(eq);
-        if (queueIndex < kQueueCapacity) {
-            remove_registration_locked(queueIndex, g_overlay.queues[queueIndex], id);
-            APR_EQ_COUNT(deleteRegistrations);
-        }
-    }
-    return rc;
+extern "C" int sceKernelAddAmprSystemEvent_emul(SceKernelEqueue eq,
+                                                 int id,
+                                                 int watch,
+                                                 void* udata) {
+    AddAmprSystemEventFn const original =
+        original_event_hook<AddAmprSystemEventFn>(
+            kAmprLibkernelHook_sceKernelAddAmprSystemEvent);
+    return original
+               ? forward_ampr_registration_add(
+                     eq,
+                     kAmprSystemEventFilter,
+                     id,
+                     udata,
+                     [&]() { return original(eq, id, watch, udata); })
+               : SCE_KERNEL_ERROR_ENOSYS;
+}
+
+extern "C" int sceKernelDeleteAmprSystemEvent_emul(SceKernelEqueue eq,
+                                                    int id) {
+    DeleteAmprEventFn const original =
+        original_event_hook<DeleteAmprEventFn>(
+            kAmprLibkernelHook_sceKernelDeleteAmprSystemEvent);
+    return original
+               ? forward_ampr_registration_delete(
+                     eq,
+                     kAmprSystemEventFilter,
+                     id,
+                     [&]() { return original(eq, id); })
+               : SCE_KERNEL_ERROR_ENOSYS;
 }
 
 extern "C" int sceKernelDeleteEqueue_emul(SceKernelEqueue eq) {
@@ -1559,6 +2250,10 @@ extern "C" int sceKernelDeleteEqueue_emul(SceKernelEqueue eq) {
     }
 
     bool notifyReactor = false;
+    bool notifyLocal = false;
+    bool classificationRemoved = false;
+    bool removedWasExclusive = false;
+    bool removedWasMixed = false;
     int rc = 0;
     for (;;) {
         uint32_t waitQueueIndex = kInvalidIndex;
@@ -1578,7 +2273,22 @@ extern "C" int sceKernelDeleteEqueue_emul(SceKernelEqueue eq) {
                 if (rc == 0 && queueIndex < kQueueCapacity) {
                     // The successful real equeue deletion already removed the
                     // private EVFILT_USER registration.
+                    const TrackedEqueue& queue = g_overlay.queues[queueIndex];
+                    removedWasExclusive = queue_is_exclusive_local_locked(queue);
+                    if (removedWasExclusive) {
+                        APR_EQ_COUNT(localExits);
+                    }
+                    removedWasMixed =
+                        queue.mixedSourceSeen || queue.ammSourceSeen;
+                    classificationRemoved = queue_has_meaningful_classification(
+                        queue.amprSourceSeen,
+                        queue.mixedSourceSeen,
+                        queue.ammSourceSeen);
+                    if (!classificationRemoved) {
+                        APR_EQ_COUNT(silentUnclassifiedDeletes);
+                    }
                     notifyReactor = release_queue_locked(queueIndex);
+                    notifyLocal = true;
                 }
             }
         }
@@ -1590,6 +2300,18 @@ extern "C" int sceKernelDeleteEqueue_emul(SceKernelEqueue eq) {
     }
     if (notifyReactor) {
         apr_reactor_notify_external_progress();
+    }
+    if (notifyLocal) {
+        notify_local_waiters();
+    }
+    if (classificationRemoved) {
+        log_queue_classification_change(
+            eq,
+            removedWasMixed
+                ? "mixed"
+                : (removedWasExclusive ? "apr-local" : "apr-candidate"),
+            "untracked",
+            "equeue-delete");
     }
     return rc;
 }
@@ -1619,18 +2341,23 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
     uint64_t queueGeneration = 0;
     uint64_t counterFrequency = 0;
     TrackedEqueue* wakeToken = nullptr;
-    SceKernelUseconds requestedTimeout = 0;
+    const SceKernelUseconds requestedTimeout = timeout ? *timeout : 0;
+    NativeWaitDeadline deadline{};
     bool trackedQueue = false;
+    bool countedTrackedWait = false;
     bool notifyReactor = false;
-    bool waitGraceAttempted = false;
+    bool localWaitAttempted = false;
     bool nativeWaitIntentInstalled = false;
-    uint64_t observedPublishEpoch = 0;
-    SceKernelUseconds waitGraceUseconds = 0;
-    PrivateWakeRequest replacementWake{};
-    bool executeReplacementWake = false;
     for (;;) {
+        trackedQueue = false;
+        notifyReactor = false;
+        PrivateWakeRequest replacementWake{};
+        bool executeReplacementWake = false;
         uint32_t waitQueueIndex = kInvalidIndex;
         bool waitForWakeCompletion = false;
+        bool useLocalWait = false;
+        bool localPollTimeout = false;
+        uint64_t observedLocalEpoch = 0;
         {
             OverlayLock lock;
             const uint32_t queueIndex = find_queue_index_locked(eq);
@@ -1648,11 +2375,10 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
                     wakeToken = &g_overlay.queues[queueIndex];
                     *out = 0;
                     const int synthetic =
-                        drain_pending_locked(queue, events, num, &notifyReactor);
+                        drain_pending_locked(
+                            queueIndex, queue, events, num, &notifyReactor);
                     if (synthetic != 0) {
                         *out = synthetic;
-                        note_wait_grace_delivery_locked(
-                            queue, static_cast<uint32_t>(synthetic));
                         APR_EQ_COUNT(syntheticDirectReturns);
                         APR_EQ_ADD(syntheticEvents, synthetic);
                         if (queue.pendingCount != 0 &&
@@ -1662,37 +2388,22 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
                                     queueIndex,
                                     queue,
                                     kInvalidIndex,
-                                    false,
                                     &replacementWake) ==
                                 BeginPrivateWakeResult::Scheduled;
                         }
-                    } else {
-                        if (timeout) {
-                            requestedTimeout = *timeout;
-                        }
-                        const bool nonPollingWait =
-                            !timeout || requestedTimeout != 0;
-                        SceKernelUseconds candidateGraceUseconds = 0;
-                        if (counterFrequency != 0 && nonPollingWait &&
-                            queue.waitGraceEligible &&
-                            queue.nativeWaitIntent == 0) {
-                            candidateGraceUseconds =
-                                current_wait_grace_useconds_locked(queue);
-                        }
-                        if (candidateGraceUseconds != 0 &&
-                            (!timeout ||
-                             requestedTimeout > candidateGraceUseconds)) {
-                            queue.waitGraceEligible = false;
-                            queue.waitGraceActive = true;
-                            waitGraceAttempted = true;
-                            waitGraceUseconds = candidateGraceUseconds;
-                            observedPublishEpoch = g_overlay.publishEpoch.load(
-                                std::memory_order_relaxed);
+                    } else if (queue_is_exclusive_local_locked(queue)) {
+                        if (timeout && requestedTimeout == 0) {
+                            localPollTimeout = true;
                         } else {
-                            ++queue.nativeWaitIntent;
-                            note_wait_intent_added_locked();
-                            nativeWaitIntentInstalled = true;
+                            useLocalWait = true;
+                            observedLocalEpoch =
+                                g_overlay.localWakeEpoch[queueIndex].load(
+                                    std::memory_order_relaxed);
                         }
+                    } else {
+                        ++queue.nativeWaitIntent;
+                        note_wait_intent_added_locked();
+                        nativeWaitIntentInstalled = true;
                     }
                 }
             }
@@ -1701,49 +2412,77 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
             wait_for_private_wake(waitQueueIndex);
             continue;
         }
-        break;
-    }
-    if (executeReplacementWake) {
-        (void)execute_private_wake(replacementWake);
-    }
-    if (!trackedQueue) {
-        APR_EQ_COUNT(directWaits);
-        return original(eq, events, num, out, timeout);
-    }
-    APR_EQ_COUNT(trackedWaits);
-    if (*out != 0) {
-        if (notifyReactor) {
-            apr_reactor_notify_external_progress();
+        if (executeReplacementWake) {
+            execute_replacement_wake_or_abort(replacementWake);
         }
-        return 0;
-    }
-
-    // Start a finite deadline before the optional userspace grace so the grace
-    // consumes, rather than extends, the application's timeout.
-    const NativeWaitDeadline deadline = timeout && requestedTimeout != 0
-                                            ? make_native_wait_deadline(
-                                                  requestedTimeout,
-                                                  counterFrequency)
-                                            : NativeWaitDeadline{};
-    if (waitGraceAttempted) {
-        const NativeWaitTransition grace = wait_for_recent_apr_event(
-            trackedQueueIndex,
-            queueGeneration,
-            observedPublishEpoch,
-            counterFrequency,
-            waitGraceUseconds,
-            events,
-            num);
-        nativeWaitIntentInstalled = grace.nativeWaitIntentInstalled;
-        if (grace.notifyReactor) {
-            apr_reactor_notify_external_progress();
+        if (!trackedQueue) {
+            APR_EQ_COUNT(directWaits);
+            SceKernelUseconds remaining = requestedTimeout;
+            SceKernelUseconds* remainingPtr = timeout;
+            if (localWaitAttempted && timeout && requestedTimeout != 0 &&
+                deadline.expires != 0) {
+                remaining = remaining_timeout_us(deadline);
+                remainingPtr = &remaining;
+            }
+            return original(eq, events, num, out, remainingPtr);
         }
-        if (grace.syntheticCount != 0) {
-            *out = grace.syntheticCount;
-            APR_EQ_ADD(syntheticEvents, grace.syntheticCount);
-            APR_EQ_COUNT(syntheticDirectReturns);
+        if (!countedTrackedWait) {
+            APR_EQ_COUNT(trackedWaits);
+            countedTrackedWait = true;
+        }
+        if (*out != 0) {
+            if (notifyReactor) {
+                apr_reactor_notify_external_progress();
+            }
             return 0;
         }
+        if (localPollTimeout) {
+            APR_EQ_COUNT(localTimeouts);
+            return SCE_KERNEL_ERROR_ETIMEDOUT;
+        }
+        if (!useLocalWait) {
+            break;
+        }
+
+        if (timeout && requestedTimeout != 0 && deadline.expires == 0) {
+            deadline = make_native_wait_deadline(
+                requestedTimeout, counterFrequency);
+            if (deadline.expires == 0) {
+                const NativeWaitTransition transition = prepare_native_wait(
+                    trackedQueueIndex, queueGeneration, events, num);
+                nativeWaitIntentInstalled =
+                    transition.nativeWaitIntentInstalled;
+                if (transition.notifyReactor) {
+                    apr_reactor_notify_external_progress();
+                }
+                if (transition.syntheticCount != 0) {
+                    *out = transition.syntheticCount;
+                    APR_EQ_ADD(syntheticEvents, transition.syntheticCount);
+                    APR_EQ_COUNT(syntheticDirectReturns);
+                    return 0;
+                }
+                break;
+            }
+        }
+
+        SceKernelUseconds localTimeout = 0;
+        const SceKernelUseconds* localTimeoutPtr = nullptr;
+        if (timeout) {
+            localTimeout = remaining_timeout_us(deadline);
+            if (localTimeout == 0) {
+                APR_EQ_COUNT(localTimeouts);
+                return SCE_KERNEL_ERROR_ETIMEDOUT;
+            }
+            localTimeoutPtr = &localTimeout;
+        }
+        localWaitAttempted = true;
+        wait_for_local_change(
+            trackedQueueIndex, observedLocalEpoch, localTimeoutPtr);
+    }
+
+    if (timeout && requestedTimeout != 0 && deadline.expires == 0) {
+        deadline = make_native_wait_deadline(
+            requestedTimeout, counterFrequency);
     }
     if (!timeout) {
         APR_EQ_COUNT(nativeWaitInfinite);
@@ -1753,12 +2492,12 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
         APR_EQ_COUNT(nativeWaitFinite);
     }
 
-    bool firstNativeWait = !waitGraceAttempted;
+    bool firstNativeWait = !localWaitAttempted;
     bool nativeWaitAttempted = false;
     for (;;) {
         if (!nativeWaitIntentInstalled) {
             const NativeWaitTransition transition = prepare_native_wait(
-                trackedQueueIndex, queueGeneration, events, num, false);
+                trackedQueueIndex, queueGeneration, events, num);
             nativeWaitIntentInstalled =
                 transition.nativeWaitIntentInstalled;
             if (transition.notifyReactor) {
@@ -1842,14 +2581,11 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
                             queue.wakeArmed = false;
                         }
                         syntheticCount = drain_pending_locked(
+                            trackedQueueIndex,
                             queue,
                             events + realCount,
                             num - realCount,
                             &notifyReactorAfterDrain);
-                        if (syntheticCount != 0) {
-                            note_wait_grace_delivery_locked(
-                                queue, static_cast<uint32_t>(syntheticCount));
-                        }
                         APR_EQ_ADD(syntheticEvents, syntheticCount);
                         if (queue.pendingCount != 0 &&
                             queue.nativeWaitIntent != 0) {
@@ -1858,7 +2594,6 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
                                     trackedQueueIndex,
                                     queue,
                                     kInvalidIndex,
-                                    false,
                                     &replacementWake) ==
                                 BeginPrivateWakeResult::Scheduled;
                         }
@@ -1872,7 +2607,7 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
             break;
         }
         if (executeReplacementWake) {
-            (void)execute_private_wake(replacementWake);
+            execute_replacement_wake_or_abort(replacementWake);
         }
 
         const int total = realCount + syntheticCount;
@@ -1916,14 +2651,20 @@ void apr_equeue_log_counters(const char* reason, bool reset) {
     const uint64_t nativeEvents = APR_EQ_READ(nativeEvents);
     const uint64_t hiddenFiltered = APR_EQ_READ(hiddenFiltered);
     const uint64_t staleWakes = APR_EQ_READ(staleWakes);
+    const uint64_t staleRegistrationDrops = APR_EQ_READ(staleRegistrationDrops);
     const uint64_t syntheticEvents = APR_EQ_READ(syntheticEvents);
     const uint64_t syntheticDirectReturns = APR_EQ_READ(syntheticDirectReturns);
-    const uint64_t waitGraceAttempts = APR_EQ_READ(waitGraceAttempts);
-    const uint64_t waitGraceHits = APR_EQ_READ(waitGraceHits);
-    const uint64_t waitGraceMisses = APR_EQ_READ(waitGraceMisses);
-    const uint64_t waitGraceEvents = APR_EQ_READ(waitGraceEvents);
-    const uint64_t waitGraceSpinIterations = APR_EQ_READ(waitGraceSpinIterations);
-    const uint64_t waitGraceElapsedUs = APR_EQ_READ(waitGraceElapsedUs);
+    const uint64_t localWaits = APR_EQ_READ(localWaits);
+    const uint64_t localWakeups = APR_EQ_READ(localWakeups);
+    const uint64_t localTimeouts = APR_EQ_READ(localTimeouts);
+    const uint64_t localEntries = APR_EQ_READ(localEntries);
+    const uint64_t localExits = APR_EQ_READ(localExits);
+    const uint64_t mixedPromotions = APR_EQ_READ(mixedPromotions);
+    const uint64_t ammEventQueues = APR_EQ_READ(ammEventQueues);
+    const uint64_t ammBufferRegistrations = APR_EQ_READ(ammBufferRegistrations);
+    const uint64_t ammTrackingFailures = APR_EQ_READ(ammTrackingFailures);
+    const uint64_t silentUnclassifiedDeletes =
+        APR_EQ_READ(silentUnclassifiedDeletes);
     const uint64_t addRegistrations = APR_EQ_READ(addRegistrations);
     const uint64_t deleteRegistrations = APR_EQ_READ(deleteRegistrations);
     const uint64_t queueCapacityFailures = APR_EQ_READ(queueCapacityFailures);
@@ -1939,11 +2680,6 @@ void apr_equeue_log_counters(const char* reason, bool reset) {
     uint32_t liveQueues = 0;
     uint32_t liveRegistrations = 0;
     uint32_t livePending = 0;
-    uint64_t waitGraceIncreases = 0;
-    uint64_t waitGraceDecreases = 0;
-    uint64_t waitGraceCooldowns = 0;
-    uint64_t waitGraceCooldownEvents = 0;
-    uint64_t waitGraceRearms = 0;
     {
         OverlayLock lock;
         liveQueues = g_overlay.liveQueues;
@@ -1955,19 +2691,9 @@ void apr_equeue_log_counters(const char* reason, bool reset) {
         // cannot be overwritten by a later store.
         pendingPeak = g_overlay.pendingPeak;
         waitIntentPeak = g_overlay.waitIntentPeak;
-        waitGraceIncreases = g_overlay.waitGraceIncreases;
-        waitGraceDecreases = g_overlay.waitGraceDecreases;
-        waitGraceCooldowns = g_overlay.waitGraceCooldowns;
-        waitGraceCooldownEvents = g_overlay.waitGraceCooldownEvents;
-        waitGraceRearms = g_overlay.waitGraceRearms;
         if (reset) {
             g_overlay.pendingPeak = livePending;
             g_overlay.waitIntentPeak = static_cast<uint32_t>(liveWaitIntents);
-            g_overlay.waitGraceIncreases = 0;
-            g_overlay.waitGraceDecreases = 0;
-            g_overlay.waitGraceCooldowns = 0;
-            g_overlay.waitGraceCooldownEvents = 0;
-            g_overlay.waitGraceRearms = 0;
         }
     }
     AMPR_LOGF("apr.equeue.counters reason=%s hooks=%u publishAttempts=%llu published=%llu backpressure=%llu fallbackHooks=%llu fallbackQueue=%llu fallbackRegistration=%llu fallbackWake=%llu wakeTriggers=%llu wakeElisions=%llu wakeNoWaiterSkips=%llu wakeFailures=%llu",
@@ -1984,7 +2710,7 @@ void apr_equeue_log_counters(const char* reason, bool reset) {
               (unsigned long long)wakeElisions,
               (unsigned long long)wakeNoWaiterSkips,
               (unsigned long long)wakeFailures);
-    AMPR_LOGF("apr.equeue.wait.counters reason=%s trackedWaits=%llu directWaits=%llu nativeWaits=%llu nativeWaitZero=%llu nativeWaitFinite=%llu nativeWaitInfinite=%llu liveWaitIntents=%llu waitIntentPeak=%llu nativeEvents=%llu hiddenFiltered=%llu staleWakes=%llu syntheticEvents=%llu syntheticDirectReturns=%llu",
+    AMPR_LOGF("apr.equeue.wait.counters reason=%s trackedWaits=%llu directWaits=%llu nativeWaits=%llu nativeWaitZero=%llu nativeWaitFinite=%llu nativeWaitInfinite=%llu liveWaitIntents=%llu waitIntentPeak=%llu nativeEvents=%llu hiddenFiltered=%llu staleWakes=%llu staleRegistrationDrops=%llu syntheticEvents=%llu syntheticDirectReturns=%llu",
               reason ? reason : "unknown",
               (unsigned long long)trackedWaits,
               (unsigned long long)directWaits,
@@ -1997,29 +2723,25 @@ void apr_equeue_log_counters(const char* reason, bool reset) {
               (unsigned long long)nativeEvents,
               (unsigned long long)hiddenFiltered,
               (unsigned long long)staleWakes,
+              (unsigned long long)staleRegistrationDrops,
               (unsigned long long)syntheticEvents,
               (unsigned long long)syntheticDirectReturns);
-    AMPR_LOGF("apr.equeue.grace.counters reason=%s configuredUs=%u adaptive=%u minUs=%u maxUs=%u attempts=%llu hits=%llu misses=%llu events=%llu spinIterations=%llu elapsedUs=%llu increases=%llu decreases=%llu cooldowns=%llu cooldownEvents=%llu rearms=%llu",
+    AMPR_LOGF("apr.equeue.local-wait.counters reason=%s classifiers=%u sync=%u waits=%llu wakeups=%llu timeouts=%llu localEntries=%llu localExits=%llu mixedPromotions=%llu ammEventQueues=%llu ammBufferRegistrations=%llu ammTrackingFailures=%llu silentUnclassifiedDeletes=%llu",
               reason ? reason : "unknown",
-              static_cast<unsigned>(kWaitGraceUseconds),
-              kWaitGraceAdaptive ? 1u : 0u,
-              static_cast<unsigned>(
-                  kWaitGraceAdaptive ? kWaitGraceMinUseconds
-                                     : kWaitGraceUseconds),
-              static_cast<unsigned>(
-                  kWaitGraceAdaptive ? kWaitGraceMaxUseconds
-                                     : kWaitGraceUseconds),
-              (unsigned long long)waitGraceAttempts,
-              (unsigned long long)waitGraceHits,
-              (unsigned long long)waitGraceMisses,
-              (unsigned long long)waitGraceEvents,
-              (unsigned long long)waitGraceSpinIterations,
-              (unsigned long long)waitGraceElapsedUs,
-              (unsigned long long)waitGraceIncreases,
-              (unsigned long long)waitGraceDecreases,
-              (unsigned long long)waitGraceCooldowns,
-              (unsigned long long)waitGraceCooldownEvents,
-              (unsigned long long)waitGraceRearms);
+              g_overlay.classificationHooksAvailable.load(
+                  std::memory_order_acquire) ? 1u : 0u,
+              g_overlay.localWaitSyncReady.load(
+                  std::memory_order_acquire) ? 1u : 0u,
+              (unsigned long long)localWaits,
+              (unsigned long long)localWakeups,
+              (unsigned long long)localTimeouts,
+              (unsigned long long)localEntries,
+              (unsigned long long)localExits,
+              (unsigned long long)mixedPromotions,
+              (unsigned long long)ammEventQueues,
+              (unsigned long long)ammBufferRegistrations,
+              (unsigned long long)ammTrackingFailures,
+              (unsigned long long)silentUnclassifiedDeletes);
     AMPR_LOGF("apr.equeue.storage.counters reason=%s addRegistrations=%llu deleteRegistrations=%llu queueCapacityFailures=%llu registrationCapacityFailures=%llu queueHashRebuilds=%llu registrationHashRebuilds=%llu registrationCacheHits=%llu registrationCacheMisses=%llu pendingPeak=%llu liveQueues=%u liveRegistrations=%u livePending=%u",
               reason ? reason : "unknown",
               (unsigned long long)addRegistrations,

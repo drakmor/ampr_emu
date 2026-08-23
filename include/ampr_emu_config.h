@@ -163,18 +163,17 @@
 #endif
 
 #ifndef AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS
-// A logical ReadChain is sliced at up to 512 KiB and its charged-byte window is
-// also 512 KiB, so only one slice can be live at a time. Small-file batching
-// happens across read commands/jobs through the shared priority-lane budget.
-#define AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS 4u //1u
+// Hard safety ceiling for one logical ReadChain. Runtime admission contracts to
+// one or two live slices under pressure/competition and borrows up to this
+// ceiling only for a healthy exclusive bulk lane.
+#define AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS 4u
 #endif
 
 #ifndef AMPR_EMU_APR_PER_READ_ACTIVE_BYTES
-// Maximum charged in-flight bytes for one logical readFile. Each request is
-// rounded up to AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES for admission only.
-// Thus a full 512 KiB chunk consumes the complete per-read window. The separate
-// priority-lane pass budget may still batch up to eight <=64 KiB read commands.
-#define AMPR_EMU_APR_PER_READ_ACTIVE_BYTES  0x200000u // 0x80000u
+// Hard charged-byte ceiling paired with PER_READ_ACTIVE_CHUNKS. Each request is
+// rounded up to AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES for admission only. The
+// adaptive effective window never exceeds the smaller of these two ceilings.
+#define AMPR_EMU_APR_PER_READ_ACTIVE_BYTES 0x200000u
 #endif
 
 #ifndef AMPR_EMU_APR_GROUP_SOFT_TARGETS
@@ -384,8 +383,10 @@
 
 #ifndef AMPR_EMU_APR_AIO_CROSS_EOP_MAX_FENCES
 // Maximum number of source-ordered completion fences retained by one job.
-// Read-ahead itself is deliberately not depth-tunable: the reactor may execute
-// at most one speculative command per priority lane in each reactor tick.
+// Read-ahead itself is deliberately not depth-tunable. One priority pass may
+// scan a fixed multiple of the existing read quantum and stage one source-owned
+// read from each adjacent FIFO job, while actual AIO remains bounded by that
+// quantum and the shared charged-byte budget.
 #define AMPR_EMU_APR_AIO_CROSS_EOP_MAX_FENCES 64
 #endif
 
@@ -489,22 +490,6 @@
 #define AMPR_EMU_APR_LOCAL_EQUEUE_PENDING_CAPACITY AMPR_EMU_APR_COMMAND_BUFFER_LIVE_MAX
 #endif
 
-#ifndef AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_US
-// After a synthetic APR event was delivered, briefly keep the next blocking
-// wait in userspace so a nearby APR completion can be consumed without a
-// private EVFILT_USER trigger. This is the initial adaptive window, or the
-// fixed window when adaptive mode is disabled. Polling waits never use it.
-// Set to 0 to disable the wait optimization completely.
-#define AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_US 10u // 10u
-#endif
-
-#ifndef AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_ADAPTIVE
-// Adapt the grace independently for each tracked equeue. The controller uses
-// four bounded levels derived from WAIT_GRACE_US (1/4, 1/2, 1x, and 2x), grows
-// after two hits, shrinks after every miss, and cools down after repeated misses.
-#define AMPR_EMU_APR_LOCAL_EQUEUE_WAIT_GRACE_ADAPTIVE 1
-#endif
-
 #ifndef AMPR_EMU_APR_REACTOR_STALL_WARN_NS
 // Emit one asynchronous reactor-stall snapshot after this much *wall-clock*
 // time without parser, submit, native-batch, or AIO completion progress while
@@ -538,7 +523,7 @@
 //   bit 0 (1) -> APR submits
 //   bit 1 (2) -> AMM submits
 // Enable 3 for a complete AMPR command trace. 
-#define AMPR_EMU_COMMAND_LOG 3
+#define AMPR_EMU_COMMAND_LOG 0
 #endif
 
 #ifndef AMPR_EMU_COMMAND_LOG_PATH
@@ -634,7 +619,7 @@
 
 // Version
 #ifndef AMPR_EMU_VERSION
-#define AMPR_EMU_VERSION "0.3.6.4 (public beta) (c) Drakmor"
+#define AMPR_EMU_VERSION "0.3.6.6 (public beta) (c) Drakmor"
 #endif
 
 #ifndef AMPR_EMU_DEBUG_LOG
@@ -642,7 +627,7 @@
 // The first log write in each process truncates the file; later writes in the
 // same run continue on the open fd.
 // 0 -> compile out log callsites and the logger backend.
-#define AMPR_EMU_DEBUG_LOG 1
+#define AMPR_EMU_DEBUG_LOG 0
 #endif
 
 #if AMPR_EMU_COMMAND_LOG && !AMPR_EMU_DEBUG_LOG

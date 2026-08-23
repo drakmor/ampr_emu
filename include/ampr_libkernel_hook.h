@@ -66,13 +66,39 @@ typedef enum AmprLibkernelHookId {
     kAmprLibkernelHook_sceKernelWriteModifyMtypeProtectWithGpuMaskIdCommand,
     kAmprLibkernelHook_sceKernelWriteRemapIntoPrtCommand,
 #if AMPR_EMU_APR_LOCAL_EQUEUE
+    kAmprLibkernelHook_sceKernelCreateEqueue,
     kAmprLibkernelHook_sceKernelWaitEqueue,
     kAmprLibkernelHook_sceKernelDeleteEqueue,
     kAmprLibkernelHook_sceKernelAddAmprEvent,
     kAmprLibkernelHook_sceKernelDeleteAmprEvent,
+    kAmprLibkernelHook_sceKernelAddTimerEvent,
+    kAmprLibkernelHook_sceKernelAddReadEvent,
+    kAmprLibkernelHook_sceKernelAddWriteEvent,
+    kAmprLibkernelHook_sceKernelAddFileEvent,
+    kAmprLibkernelHook_sceKernelAddUserEvent,
+    kAmprLibkernelHook_sceKernelAddUserEventEdge,
+    kAmprLibkernelHook_sceKernelAddHRTimerEvent,
+    kAmprLibkernelHook_sceKernelAddAmprSystemEvent,
+    kAmprLibkernelHook_sceKernelDeleteAmprSystemEvent,
 #endif
     kAmprLibkernelHook_Count
 } AmprLibkernelHookId;
+
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+/*
+ * Event producers exported by loaded system libraries other than libkernel.
+ * They use separate detour/original storage because the libkernel capability
+ * mask already occupies all 64 bits.
+ */
+typedef enum AmprExternalEqueueHookId {
+    kAmprExternalEqueueHook_sceAgcDriverAddEqEvent = 0,
+    kAmprExternalEqueueHook_sceVideoOutAddFlipEvent,
+    kAmprExternalEqueueHook_sceVideoOutAddVblankEvent,
+    kAmprExternalEqueueHook_sceVideoOutAddPreVblankStartEvent,
+    kAmprExternalEqueueHook_sceVideoOutAddOutputModeEvent,
+    kAmprExternalEqueueHook_Count
+} AmprExternalEqueueHookId;
+#endif
 
 /*
  * Process-wide libkernel detour control.
@@ -102,6 +128,10 @@ static inline int amprFormatLibkernelHookStatus(char*, unsigned long long) { ret
 AMPR_LIBKERNEL_HOOK_EXPORT void* amprResolveLibkernelFunction(const char* symbol);
 
 extern AMPR_LIBKERNEL_HOOK_EXPORT void* g_amprOriginalLibkernelById[kAmprLibkernelHook_Count];
+#if AMPR_EMU_APR_LOCAL_EQUEUE
+extern AMPR_LIBKERNEL_HOOK_EXPORT void*
+    g_amprOriginalExternalEqueueById[kAmprExternalEqueueHook_Count];
+#endif
 
 #ifdef __cplusplus
 } // extern "C"

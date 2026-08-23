@@ -388,6 +388,16 @@ class ReactorIoAggregate:
 
 
 @dataclass
+class AdaptiveReadWindowAggregate:
+    windows: int = 0
+    window_ms: int = 0
+    hard_chunks: int = 0
+    hard_bytes: int = 0
+    staged: Counter = field(default_factory=Counter)
+    blocked: Counter = field(default_factory=Counter)
+
+
+@dataclass
 class FdStatus:
     line: int
     seq: int
@@ -575,11 +585,15 @@ class LogStats:
     apr_local_equeue: Counter = field(default_factory=Counter)
     apr_local_equeue_counter_lines: int = 0
     apr_local_equeue_wait_lines: int = 0
+    apr_local_equeue_local_wait_lines: int = 0
     apr_local_equeue_grace_lines: int = 0
     apr_local_equeue_wake_skip_metric_lines: int = 0
     apr_local_equeue_timeout_metric_lines: int = 0
+    apr_local_equeue_transition_metric_lines: int = 0
     apr_local_equeue_live_wait_intents: int = 0
     apr_local_equeue_wait_intent_peak: int = 0
+    apr_local_equeue_classifiers_available: int = 0
+    apr_local_equeue_local_sync_available: int = 0
     apr_local_equeue_grace_configured_us: int = 0
     apr_local_equeue_grace_adaptive: int = 0
     apr_local_equeue_grace_min_us: int = 0
@@ -650,6 +664,9 @@ class LogStats:
     )
     aio_batch_metrics: ReactorBatchAggregate = field(default_factory=ReactorBatchAggregate)
     aio_io_metrics: ReactorIoAggregate = field(default_factory=ReactorIoAggregate)
+    adaptive_read_window: AdaptiveReadWindowAggregate = field(
+        default_factory=AdaptiveReadWindowAggregate
+    )
     fd_statuses: List[FdStatus] = field(default_factory=list)
     heap_statuses: List[HeapStatus] = field(default_factory=list)
     index_runtime_build_started: Optional[Tuple[int, int, str]] = None
@@ -1873,6 +1890,20 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
             io.priority_count[priority] += parse_int(kv.get(f"apr{priority}Count")) or 0
             io.priority_bytes[priority] += parse_int(kv.get(f"apr{priority}Bytes")) or 0
 
+    elif prefix == "apr.reactor.counters.readWindow":
+        window = stats.adaptive_read_window
+        window.windows += 1
+        window.window_ms += parse_int(kv.get("counterWindowMs")) or 0
+        window.hard_chunks = max(
+            window.hard_chunks, parse_int(kv.get("hardChunks")) or 0
+        )
+        window.hard_bytes = max(
+            window.hard_bytes, parse_int(kv.get("hardBytes")) or 0
+        )
+        for mode in ("pressure", "contended", "shared", "exclusive"):
+            window.staged[mode] += parse_int(kv.get(f"{mode}Staged")) or 0
+            window.blocked[mode] += parse_int(kv.get(f"{mode}Blocked")) or 0
+
     elif prefix == "apr.reactor.state":
         first_job_id = parse_int(kv.get("firstJob")) or 0
         if first_job_id:
@@ -2170,6 +2201,7 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
             "nativeEvents",
             "hiddenFiltered",
             "staleWakes",
+            "staleRegistrationDrops",
             "syntheticEvents",
             "syntheticDirectReturns",
         ):
@@ -2209,6 +2241,29 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
             value = parse_int(kv.get(name))
             if value is not None:
                 setattr(stats, attribute, value)
+    elif prefix == "apr.equeue.local-wait.counters":
+        stats.apr_local_equeue_local_wait_lines += 1
+        if "localEntries" in kv and "localExits" in kv:
+            stats.apr_local_equeue_transition_metric_lines += 1
+        for name in (
+            "waits",
+            "wakeups",
+            "timeouts",
+            "localEntries",
+            "localExits",
+            "mixedPromotions",
+            "ammEventQueues",
+            "ammBufferRegistrations",
+            "ammTrackingFailures",
+            "silentUnclassifiedDeletes",
+        ):
+            stats.apr_local_equeue[name] += parse_int(kv.get(name)) or 0
+        classifiers = parse_int(kv.get("classifiers"))
+        sync = parse_int(kv.get("sync"))
+        if classifiers is not None:
+            stats.apr_local_equeue_classifiers_available = classifiers
+        if sync is not None:
+            stats.apr_local_equeue_local_sync_available = sync
 
     if "eq.wait" in prefix or prefix.startswith("eq.wait"):
         stats.equeue_waits += 1
@@ -3327,6 +3382,19 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
                 f"{priority}:{count}/{byte_count}/{average:.0f}"
             )
         print(f"  AIO prio count/bytes/avg: {', '.join(io_priority_parts)}")
+    adaptive_window = stats.adaptive_read_window
+    if adaptive_window.windows:
+        mode_parts = []
+        for mode in ("pressure", "contended", "shared", "exclusive"):
+            mode_parts.append(
+                f"{mode}={adaptive_window.staged[mode]}/"
+                f"{adaptive_window.blocked[mode]}"
+            )
+        print(
+            "  adaptive read staged/blocked: "
+            f"{', '.join(mode_parts)} hard={adaptive_window.hard_chunks}/"
+            f"{adaptive_window.hard_bytes}"
+        )
     print(f"  APR submit enter/leave: {stats.apr_submit_enters}/{stats.apr_submit_leaves}")
     print(f"  submit backpressure: {stats.apr_submit_backpressure_events}")
     if stats.apr_submit_backpressure_events:
@@ -3432,7 +3500,11 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
             for eq, count in stats.equeue_direct_by_eq.most_common(3)
         )
         print(f"  top direct equeues:  {top_direct}")
-    if stats.apr_local_equeue_counter_lines or stats.apr_local_equeue_wait_lines:
+    if (
+        stats.apr_local_equeue_counter_lines
+        or stats.apr_local_equeue_wait_lines
+        or stats.apr_local_equeue_local_wait_lines
+    ):
         local = stats.apr_local_equeue
         no_waiter_skip = (
             str(local["wakeNoWaiterSkips"])
@@ -3448,7 +3520,8 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
         print(
             "  local wake activity: "
             f"trigger={local['wakeTriggers']} armedSkip={local['wakeElisions']} "
-            f"noWaiterSkip={no_waiter_skip} stale={local['staleWakes']}"
+            f"noWaiterSkip={no_waiter_skip} stale={local['staleWakes']} "
+            f"staleRegDrop={local['staleRegistrationDrops']}"
         )
         if stats.apr_local_equeue_timeout_metric_lines:
             print(
@@ -3460,6 +3533,23 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
             )
         else:
             print("  local wait timeout:  metrics unavailable in this build")
+        if stats.apr_local_equeue_local_wait_lines:
+            local_transition = (
+                f"{local['localEntries']}/{local['localExits']}"
+                if stats.apr_local_equeue_transition_metric_lines
+                else "n/a"
+            )
+            print(
+                "  exclusive local wait: "
+                f"classifiers={stats.apr_local_equeue_classifiers_available} "
+                f"sync={stats.apr_local_equeue_local_sync_available} "
+                f"wait/wake/timeout={local['waits']}/{local['wakeups']}/{local['timeouts']} "
+                f"entry/exit={local_transition} "
+                f"mixed={local['mixedPromotions']} ammEq={local['ammEventQueues']} "
+                f"ammBuffers={local['ammBufferRegistrations']} "
+                f"ammTrackingFail={local['ammTrackingFailures']} "
+                f"silentDelete={local['silentUnclassifiedDeletes']}"
+            )
         if stats.apr_local_equeue_grace_lines:
             adaptive = ""
             if stats.apr_local_equeue_grace_adaptive:
@@ -3947,6 +4037,14 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
                 }
                 for priority in range(APR_PRIORITY_LANES)
             },
+        },
+        "adaptive_read_window": {
+            "windows": stats.adaptive_read_window.windows,
+            "window_ms": stats.adaptive_read_window.window_ms,
+            "hard_chunks": stats.adaptive_read_window.hard_chunks,
+            "hard_bytes": stats.adaptive_read_window.hard_bytes,
+            "staged": dict(stats.adaptive_read_window.staged),
+            "blocked": dict(stats.adaptive_read_window.blocked),
         },
         "amm_submit_diag": {
             "begins": stats.amm_submit_diag_begins,
@@ -4442,12 +4540,16 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
         "apr_local_equeue": {
             "counter_lines": stats.apr_local_equeue_counter_lines,
             "wait_counter_lines": stats.apr_local_equeue_wait_lines,
+            "local_wait_counter_lines": stats.apr_local_equeue_local_wait_lines,
             "grace_counter_lines": stats.apr_local_equeue_grace_lines,
             "wake_skip_metric_lines": stats.apr_local_equeue_wake_skip_metric_lines,
             "timeout_metric_lines": stats.apr_local_equeue_timeout_metric_lines,
+            "transition_metric_lines": stats.apr_local_equeue_transition_metric_lines,
             "counters": dict(stats.apr_local_equeue),
             "live_wait_intents": stats.apr_local_equeue_live_wait_intents,
             "wait_intent_peak": stats.apr_local_equeue_wait_intent_peak,
+            "classifiers_available": stats.apr_local_equeue_classifiers_available,
+            "local_sync_available": stats.apr_local_equeue_local_sync_available,
             "grace_configured_us": stats.apr_local_equeue_grace_configured_us,
             "grace_adaptive": stats.apr_local_equeue_grace_adaptive,
             "grace_min_us": stats.apr_local_equeue_grace_min_us,

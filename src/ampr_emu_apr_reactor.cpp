@@ -512,6 +512,28 @@ static_assert(!apr_read_is_single_quantum_full_file(
                   AMPR_EMU_APR_AIO_DISPATCH_QUANTUM_BYTES),
               "a partial file read must use the FD cache");
 
+static constexpr uint32_t apr_direct_read_aio_limit(uint32_t effectiveLimit,
+                                                     uint32_t baseLimit) {
+    if (effectiveLimit == 0 || baseLimit == 0) {
+        return 0;
+    }
+    // A direct full-file read owns one close-after-completion descriptor. Keep
+    // these unproven one-shot requests from filling the complete AIO window
+    // before storage latency is observable. Cached multi-quantum reads retain
+    // the other half and may still borrow the full scheduler window.
+    const uint32_t directShare = baseLimit / 2u + baseLimit % 2u;
+    return effectiveLimit < directShare ? effectiveLimit : directShare;
+}
+
+static_assert(apr_direct_read_aio_limit(64u, 32u) == 16u,
+              "direct reads must not borrow the small-read boost window");
+static_assert(apr_direct_read_aio_limit(16u, 32u) == 16u,
+              "direct reads must follow a smaller global AIO window");
+static_assert(apr_direct_read_aio_limit(8u, 32u) == 8u,
+              "emergency AIO pressure must contract direct reads");
+static_assert(apr_direct_read_aio_limit(1u, 1u) == 1u,
+              "the minimum AIO window must retain one direct read");
+
 static size_t apr_adaptive_direct_fd_cap(const AmprIndexFdPressureCaps& caps,
                                           uint32_t aioLimit,
                                           bool fdPressure) {
@@ -1189,10 +1211,15 @@ private:
     static_assert(AMPR_EMU_APR_AIO_THROTTLE_MEDIUM_INFLIGHT <= kBaseActiveReads,
                   "APR medium AIO window must not exceed base window");
     // One chain per active logical read plus one cursor and one speculative
-    // read per priority lane. Not-yet-submitted reads remain on source cursors.
+    // read per priority lane. A staged final slice is covered by its ActiveRead;
+    // an earlier unissued slice retains one of the per-lane cursor owners.
     static constexpr uint32_t kReadChainPoolCapacity =
         static_cast<uint32_t>(kMaxActiveReads) +
         static_cast<uint32_t>(kPriorityCount) * 2u + 1u;
+    // retryNotBeforeNs normally stores a timestamp. This sentinel parks an
+    // attached multi-slice chain while a retained first-submit ActiveRead owns
+    // the exact next offset and is waiting for an SDK id.
+    static constexpr uint64_t kReadChainAwaitingInitialSubmit = UINT64_MAX;
     // One normal SDK array poll can observe every due unique id owned by the
     // reactor. Deadline filtering still excludes newly submitted/background
     // requests that are not due; this limit only removes artificial splitting
@@ -1241,7 +1268,10 @@ private:
     static constexpr uint32_t kSyntheticLowerSlotCapacity = 512u;
     static constexpr uint32_t kSyntheticSubmitIdTag = 0xA5000000u;
     static constexpr uint32_t kSyntheticSubmitIdTagMask = 0xFF000000u;
-    static constexpr uint64_t kNativeCompletionTimeoutNs = 5000000000ull;
+    // Asset-streaming native work must make bounded progress. WaitOnCounter and
+    // intentionally deferred gates are not exempt: a missing checkpoint after
+    // this deadline is an unrecoverable lane failure.
+    static constexpr uint64_t kNativeCompletionTimeoutNs = 10000000000ull;
     static constexpr uint32_t kFdCacheMaintenanceBusyStride = 256u;
 #if AMPR_EMU_FD_CACHE_IDLE_CLOSE_NS != 0
     static constexpr uint64_t kFdCacheMaintenanceIntervalNs =
@@ -1352,6 +1382,20 @@ private:
         }
     };
 
+    enum class AdaptiveReadWindowMode : uint8_t {
+        Pressure = 0,
+        Contended = 1,
+        Shared = 2,
+        Exclusive = 3,
+        Count = 4,
+    };
+
+    struct AdaptiveReadWindow {
+        uint32_t chunks{};
+        uint64_t bytes{};
+        AdaptiveReadWindowMode mode{AdaptiveReadWindowMode::Pressure};
+    };
+
     struct ReadChainSlot {
         ReadChain value{};
         uint32_t nextFree{UINT32_MAX};
@@ -1412,7 +1456,6 @@ private:
         uint64_t lastSequence{};
         uint64_t submitTimeNs{};
         uint64_t lastReleaseTimeNs{};
-        uint64_t lastWatchdogTimeNs{};
         SceAprSubmitId submitId{};
     };
 
@@ -1518,7 +1561,6 @@ private:
         uint64_t eagerNativeEventFirstToken{};
         uint64_t eagerNativeCounterWaitTarget{};
         uint64_t eagerNativeEventLastReleaseNs{};
-        uint64_t eagerNativeEventLastWatchdogNs{};
         bool eagerNativeEventPlan{};
         std::atomic<bool> eagerNativeEventPreparePending{false};
         bool eagerNativeEventQueueLinked{};
@@ -1928,6 +1970,10 @@ private:
         bool hotPollQueued{false};
         bool awaitingBatchSubmit{false};
         bool awaitingResubmit{false};
+        // True after the first accepted SDK submit charged this slice against
+        // its ReadChain (sequence/range). Completion retries must not charge it
+        // again; an initially deferred submit remains false until acceptance.
+        bool submitAccounted{false};
     };
 
     struct ActiveReadRef {
@@ -2318,7 +2364,8 @@ private:
 
     void mark_active_read_deferred(ActiveRead& active) {
         if (!active_read_is_submitted(active) || submittedActiveReadCount == 0 ||
-            deferredActiveReadCount >= kMaxActiveReads) {
+            deferredActiveReadCount >= kMaxActiveReads ||
+            !active.submitAccounted) {
             AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.defer.invalid file=%s line=%d", __FILE__, __LINE__);
             std::abort();
         }
@@ -2326,6 +2373,18 @@ private:
         ++deferredActiveReadCount;
         active.aioId = static_cast<SceKernelAioSubmitId>(-1);
         active.awaitingResubmit = true;
+    }
+
+    void mark_staged_read_deferred(ActiveRead& active) {
+        if (active.aioId >= 0 || !active.awaitingBatchSubmit ||
+            active.awaitingResubmit || active.submitAccounted ||
+            deferredActiveReadCount >= kMaxActiveReads) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.staged.defer.invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        active.awaitingBatchSubmit = false;
+        active.awaitingResubmit = true;
+        ++deferredActiveReadCount;
     }
 
     ActiveReadIt erase_active_read(ActiveReadIt it) {
@@ -2475,6 +2534,11 @@ private:
 
     static constexpr uint32_t aio_small_read_limit() {
         return static_cast<uint32_t>(kSmallReadActiveReads);
+    }
+
+    static constexpr uint32_t aio_direct_read_limit(uint32_t effectiveLimit) {
+        return apr_direct_read_aio_limit(effectiveLimit,
+                                         aio_active_read_limit());
     }
 
     void ensure_aio_initialized() {
@@ -4101,6 +4165,7 @@ private:
         uint64_t laneNowNs{};
         uint32_t effectiveLimit{};
         size_t directFdCap{};
+        uint8_t laneDemandMask{};
         bool fdPressure{};
         bool initialized{};
         bool laneNowValid{};
@@ -4390,7 +4455,7 @@ private:
         context.fdPressure = fd_pressure_active(now);
         context.directFdCap = apr_adaptive_direct_fd_cap(
             ampr_index_fd_pressure_current_caps(),
-            context.effectiveLimit,
+            aio_direct_read_limit(context.effectiveLimit),
             context.fdPressure);
         context.current = true;
     }
@@ -4804,7 +4869,7 @@ private:
         --job->activeReadCount;
     }
 
-    static uint64_t read_credit_bytes(uint64_t requestBytes) {
+    static constexpr uint64_t read_credit_bytes(uint64_t requestBytes) {
         const uint64_t granule =
             static_cast<uint64_t>(AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES);
         if (requestBytes == 0) {
@@ -5349,6 +5414,102 @@ private:
 #endif
     }
 
+    static constexpr uint32_t adaptive_read_hard_chunk_limit() {
+        return static_cast<uint32_t>(
+            AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS);
+    }
+
+    static constexpr uint32_t adaptive_read_target_chunks(bool constrained,
+                                                           bool shared) {
+        const uint32_t hardLimit = adaptive_read_hard_chunk_limit();
+        if (constrained) {
+            return 1u;
+        }
+        if (shared) {
+            return hardLimit < 2u ? hardLimit : 2u;
+        }
+        return hardLimit;
+    }
+
+    bool another_priority_has_waiting_read(uint8_t priority,
+                                           uint8_t laneDemandMask) const {
+        for (size_t other = 0; other < kPriorityCount; ++other) {
+            const uint8_t otherBit = static_cast<uint8_t>(1u << other);
+            if (other != priority &&
+                (laneDemandMask & otherBit) != 0 &&
+                cursorReadWaitHints[other].valid) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    AdaptiveReadWindow adaptive_read_window(
+        uint8_t priority,
+        const AioAdmissionContext& context) const {
+        const bool pressure =
+            context.fdPressure ||
+            aioAgeThrottleLevel != AioAgeThrottleLevel::Normal ||
+            slow_aio_cooldown_active(context.laneNowNs) ||
+            context.effectiveLimit < aio_active_read_limit();
+        AdaptiveReadWindow window{};
+        bool constrained = pressure;
+        bool shared = false;
+        if (pressure) {
+            window.mode = AdaptiveReadWindowMode::Pressure;
+        } else if (another_priority_has_waiting_read(
+                       priority, context.laneDemandMask)) {
+            window.mode = AdaptiveReadWindowMode::Contended;
+            constrained = true;
+        } else {
+            uint8_t otherLaneMask = context.laneDemandMask;
+            if (priority < kPriorityCount) {
+                otherLaneMask &= static_cast<uint8_t>(~(1u << priority));
+            }
+            const uint64_t healthyAgeMs = static_cast<uint64_t>(
+                AMPR_EMU_APR_AIO_THROTTLE_RECOVER_NORMAL_MS);
+            const bool aged =
+                context.snapshot.oldestSubmittedAgeMs > healthyAgeMs;
+            shared = otherLaneMask != 0 || aged;
+            window.mode = shared
+                ? AdaptiveReadWindowMode::Shared
+                : AdaptiveReadWindowMode::Exclusive;
+        }
+
+        window.chunks = adaptive_read_target_chunks(constrained, shared);
+        const uint64_t fullChunkCredit =
+            read_credit_bytes(kSoftwareReadChunkMax);
+        window.bytes = static_cast<uint64_t>(window.chunks) * fullChunkCredit;
+        const uint64_t hardByteLimit =
+            static_cast<uint64_t>(AMPR_EMU_APR_PER_READ_ACTIVE_BYTES);
+        if (window.bytes > hardByteLimit) {
+            window.bytes = hardByteLimit;
+        }
+        return window;
+    }
+
+    void note_adaptive_read_window_staged(AdaptiveReadWindowMode mode) {
+#if AMPR_EMU_DEBUG_LOG
+        if (collect_log_stats()) {
+            ++runtimeAdaptiveReadWindowStaged[
+                static_cast<size_t>(mode)];
+        }
+#else
+        (void)mode;
+#endif
+    }
+
+    void note_adaptive_read_window_blocked(AdaptiveReadWindowMode mode) {
+#if AMPR_EMU_DEBUG_LOG
+        if (collect_log_stats()) {
+            ++runtimeAdaptiveReadWindowBlocked[
+                static_cast<size_t>(mode)];
+        }
+#else
+        (void)mode;
+#endif
+    }
+
     void reserve_staged_aio_admission(AioAdmissionContext& context,
                                       const ActiveRead& active,
                                       uint64_t stageTimeNs) {
@@ -5380,6 +5541,7 @@ private:
 
     enum class DirectReadSubmitResult : uint8_t {
         Pending,
+        Staged,
         Failed,
     };
 
@@ -5529,6 +5691,15 @@ private:
 #endif
     }
 
+    static void reserve_read_chain_sequence(JobState& job, ReadChain& chain) {
+        if (chain.seq != 0) {
+            return;
+        }
+        chain.seq = job.nextReadSeq;
+        ++job.nextReadSeq;
+        job.latestSubmittedReadSeq = chain.seq;
+    }
+
     void accept_aio_submit_item(const ActiveReadRef& item,
                                 SceKernelAioSubmitId aioId,
                                 uint64_t submitTimeNs) {
@@ -5542,23 +5713,31 @@ private:
         }
         JobPtr job = active->job;
         ReadChain* const chain = active->chain;
-        const bool resubmit = active->awaitingResubmit;
+        if (active->submitAccounted && !active->awaitingResubmit) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.accounting.state file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        const bool accountSubmit = !active->submitAccounted;
         mark_active_read_submitted(*active, aioId);
         active->submitTimeNs = submitTimeNs;
         active->retryNotBeforeNs = 0;
+        if (accountSubmit) {
+            chain->retryNotBeforeNs = 0;
+        }
         active->aioDeleteRetries = 0;
         active->aioDeleteFirstFailureNs = 0;
 #if AMPR_EMU_DEBUG_LOG
         active->pollAttempts = 0;
 #endif
 
-        if (!resubmit) {
-            if (chain->seq == 0) {
-                chain->seq = active->seq;
-                ++job->nextReadSeq;
-                job->latestSubmittedReadSeq = active->seq;
-            }
-            active->seq = chain->seq;
+        if (accountSubmit) {
+            reserve_read_chain_sequence(*job, *chain);
+        }
+        if (active->seq != chain->seq) {
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.accept.sequence file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        if (accountSubmit) {
             const uint64_t issuedLength = active->desc.length;
             if (issuedLength == 0 || issuedLength > chain->remaining) {
                 AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.accept.range file=%s line=%d", __FILE__, __LINE__);
@@ -5580,6 +5759,7 @@ private:
                                           job->prioIndex);
             note_job_queue_to_first_aio_submit(*job, submitTimeNs);
 #endif
+            active->submitAccounted = true;
         }
 #if AMPR_EMU_DEBUG_LOG
         note_accepted_aio_request(active->desc.length, job->prioIndex);
@@ -5633,18 +5813,23 @@ private:
             AMPR_KLOGF("ampr.abort reason=apr.reactor.aio.submit.reject.state file=%s line=%d", __FILE__, __LINE__);
             std::abort();
         }
-        rollback_staged_aio_admission(*admission, *active);
+        if (apr_aio_submit_sce_rc_is_deferred(submitSceRc)) {
+            mark_staged_read_deferred(*active);
+            active->retryNotBeforeNs =
+                submitTimeNs + AMPR_EMU_APR_AIO_SUBMIT_RETRY_DELAY_NS;
+            // A multi-slice chain may still be attached to a source cursor.
+            // Do not create another slice at the same offset before this first
+            // request receives an id; the retained ActiveRead owns the retry.
+            chain->retryNotBeforeNs = kReadChainAwaitingInitialSubmit;
+            return;
+        }
+
         active->awaitingBatchSubmit = false;
+        rollback_staged_aio_admission(*admission, *active);
         apr_release_aio_read_desc(active->desc);
         decrement_active_read_count(job);
         decrement_read_chain_active(chain, active->readCreditBytes);
         (void)erase_active_read(activeReads.iterator_from_slot(item.slot));
-        if (apr_aio_submit_sce_rc_is_deferred(submitSceRc)) {
-            chain->retryNotBeforeNs =
-                submitTimeNs + AMPR_EMU_APR_AIO_SUBMIT_RETRY_DELAY_NS;
-            return;
-        }
-
         detach_staged_read_chain(job, chain);
         chain->allIssued = true;
         maybe_finish_read_chain(chain);
@@ -5739,18 +5924,6 @@ private:
                     sliceDesc.errorOff};
         }
 
-        // Count and charged bytes are separate credits. Actual I/O length is
-        // unchanged. <=64 KiB requests each cost 64 KiB; 65..128 KiB cost
-        // 128 KiB, etc. A full 512 KiB request consumes the whole byte window.
-        if (chain.activeCount >=
-                static_cast<uint32_t>(AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS) ||
-            sliceCreditBytes >
-                static_cast<uint64_t>(AMPR_EMU_APR_PER_READ_ACTIVE_BYTES) ||
-            chain.activeBytes >
-                static_cast<uint64_t>(AMPR_EMU_APR_PER_READ_ACTIVE_BYTES) -
-                    sliceCreditBytes) {
-            return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
-        }
         if (!issueBudget.can_admit(sliceCreditBytes)) {
             return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
         }
@@ -5760,6 +5933,19 @@ private:
                 return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
             }
             chain.retryNotBeforeNs = 0;
+        }
+        prepare_aio_admission_context(admission, nowNs);
+        const AdaptiveReadWindow readWindow =
+            adaptive_read_window(job->prioIndex, admission);
+        // Count and charged bytes are separate adaptive credits. Actual I/O
+        // length is unchanged. Healthy exclusive bulk work may borrow up to the
+        // compile-time ceiling; pressure or a waiting priority contracts the
+        // window without canceling slices already accepted by SDK AIO.
+        if (chain.activeCount >= readWindow.chunks ||
+            sliceCreditBytes > readWindow.bytes ||
+            chain.activeBytes > readWindow.bytes - sliceCreditBytes) {
+            note_adaptive_read_window_blocked(readWindow.mode);
+            return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
         }
         if (!direct_read_admission_available(job->prioIndex,
                                              chain.ownerDesc,
@@ -5858,16 +6044,17 @@ private:
         active.aioPrio = aioPriority;
         issueBudget.consume(active.readCreditBytes);
         stage_aio_submit(active, false);
+        note_adaptive_read_window_staged(readWindow.mode);
         // Reserve this candidate in the pass-local admission snapshot before
         // later lanes are examined. Use the real lane timestamp so provisional
-        // batching cannot reset age throttling to time zero; a rejected array
-        // submit rolls the count/group credits back at flush time.
+        // batching cannot reset age throttling to time zero; a hard-rejected
+        // array submit rolls the count/group credits back at flush time.
         reserve_staged_aio_admission(admission, active, nowNs);
 
-        // Source ownership remains parked until the array submit succeeds.
-        // flush_aio_submit_round() updates the chain, and the next reactor pass
-        // commits the already accepted range to the packed source cursor.
-        return {DirectReadSubmitResult::Pending, nullptr, 0, 0};
+        // The caller may commit a complete one-slice read or a larger read's
+        // final slice immediately. An earlier slice keeps source ownership, and
+        // a deferred initial submit retains this ActiveRead for exact retry.
+        return {DirectReadSubmitResult::Staged, nullptr, 0, 0};
     }
 
     struct SoftwareRead {
@@ -5969,7 +6156,6 @@ private:
         job.eagerNativeEventFirstToken = 0;
         job.eagerNativeCounterWaitTarget = 0;
         job.eagerNativeEventLastReleaseNs = 0;
-        job.eagerNativeEventLastWatchdogNs = 0;
         job.eagerNativeEventPlan = false;
         job.eagerNativeEventQueueLinked = false;
         job.eagerNativeEventAllReleased = false;
@@ -6496,7 +6682,8 @@ private:
         const volatile uint64_t* const progress =
             eager_native_event_progress(job);
         if (!progress) {
-            return true;
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.released-work.progress-null file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
         const uint64_t target = eager_native_record_token(
             job, job.eagerNativeEventReleaseCursor - 1u);
@@ -6512,12 +6699,49 @@ private:
         const volatile uint64_t* const progress =
             eager_native_event_progress(job);
         if (!progress) {
-            return true;
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.counter-wait.progress-null file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
-        const uint64_t observed = __atomic_load_n(
+        uint64_t observed = __atomic_load_n(
             progress, __ATOMIC_ACQUIRE);
         if (!native_batch_token_reached(
                 observed, job.eagerNativeCounterWaitTarget)) {
+            const uint64_t now = time_counter_now();
+            const uint64_t ageNs = job.eagerNativeEventLastReleaseNs != 0 &&
+                                           now >= job.eagerNativeEventLastReleaseNs
+                ? now - job.eagerNativeEventLastReleaseNs
+                : 0ull;
+            if (ageNs >= kNativeCompletionTimeoutNs) {
+                observed = __atomic_load_n(progress, __ATOMIC_ACQUIRE);
+                if (native_batch_token_reached(
+                        observed, job.eagerNativeCounterWaitTarget)) {
+                    job.eagerNativeCounterWaitTarget = 0;
+                    return false;
+                }
+                SceAprResultBuffer* const resultBuffer =
+                    apr_native_event_result(job.poolSlot);
+                if (!resultBuffer) {
+                    AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.counter-wait.result-null file=%s line=%d", __FILE__, __LINE__);
+                    std::abort();
+                }
+                [[maybe_unused]] const int result = __atomic_load_n(
+                    &resultBuffer->result, __ATOMIC_ACQUIRE);
+                [[maybe_unused]] const uint64_t release = __atomic_load_n(
+                    apr_native_event_lane_release_ptr(job.prioIndex),
+                    __ATOMIC_ACQUIRE);
+                AMPR_CRITICAL_LOGF("apr.reactor.native.fifo.counter-wait.timeout job=0x%llx lane=%u submitId=0x%x target=0x%llx progress=0x%llx release=0x%llx result=0x%x errorOffset=0x%x ageMs=%llu action=abort",
+                                   (unsigned long long)job.id,
+                                   (unsigned)job.prioIndex,
+                                   job.eagerNativeEventSubmitId,
+                                   (unsigned long long)job.eagerNativeCounterWaitTarget,
+                                   (unsigned long long)observed,
+                                   (unsigned long long)release,
+                                   result,
+                                   resultBuffer->errorOffset,
+                                   (unsigned long long)(ageNs / 1000000ull));
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.counter-wait.timeout file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
+            }
             return true;
         }
         job.eagerNativeCounterWaitTarget = 0;
@@ -6796,28 +7020,39 @@ private:
             set_cursor_read_wait_hint(job->prioIndex, read.fileId);
         }
 
-        if (chain->remaining == 0) {
-            // The preceding reactor pass submitted this source-owned slice as
-            // part of an SDK multiple-submit call. Keep the chain attached
-            // until acceptance is known, then commit the source/GS cursor here.
-            chain->allIssued = true;
-            chainSlot = nullptr;
-            update_software_gs_cursor(gs, read);
-            if (advanceSource) {
-                clear_cursor_read_wait_hint(job->prioIndex);
-                advance_job_source(*job, opBytes);
-            }
-            if (outLogicalIssued) {
-                *outLogicalIssued = true;
-            }
-            maybe_finish_read_chain(chain);
-            return true;
-        }
-
         ReadIssueBudget singleRequestBudget{1u, kSoftwareReadChunkMax};
         ReadIssueBudget& budget = issueBudget ? *issueBudget : singleRequestBudget;
         const DirectReadSubmitOutcome outcome =
             submit_read_chain_slice(job, *chain, budget, admission);
+        if (outcome.result == DirectReadSubmitResult::Staged) {
+            if (chain->remaining <= kSoftwareReadChunkMax) {
+                // The final source quantum is now represented by an ActiveRead.
+                // A new one-quantum chain still needs its source-order sequence;
+                // a multi-quantum chain already owns one and may have earlier
+                // accepted slices active. In both cases the final ActiveRead
+                // owns an initial-submit retry, so the packed cursor can expose
+                // more reads without a detached command queue or rollback.
+                if (chain->activeCount == 0u ||
+                    (chain->seq == 0 && chain->activeCount != 1u)) {
+                    AMPR_KLOGF("ampr.abort reason=apr.reactor.readChain.commitStaged.invalid file=%s line=%d", __FILE__, __LINE__);
+                    std::abort();
+                }
+                reserve_read_chain_sequence(*job, *chain);
+                chain->allIssued = true;
+                chainSlot = nullptr;
+                update_software_gs_cursor(gs, read);
+                if (advanceSource) {
+                    clear_cursor_read_wait_hint(job->prioIndex);
+                    advance_job_source(*job, opBytes);
+                }
+                if (outLogicalIssued) {
+                    *outLogicalIssued = true;
+                }
+                maybe_finish_read_chain(chain);
+                return true;
+            }
+            return false;
+        }
         if (outcome.result == DirectReadSubmitResult::Pending) {
             return false;
         }
@@ -6845,6 +7080,18 @@ private:
     }
 
 #if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
+    static void cross_eop_effective_scan_cursor(const JobState& job,
+                                                uint32_t& outOffset,
+                                                uint32_t& outCommandIndex) {
+        const bool synchronize =
+            !job.crossEopScanActive ||
+            job.crossEopScanOffset < job.sourceOffset;
+        outOffset = synchronize ? job.sourceOffset : job.crossEopScanOffset;
+        outCommandIndex = synchronize
+            ? job.sourceCommandIndex
+            : job.crossEopScanCommandIndex;
+    }
+
     bool issue_reads_across_eop_job(JobPtr& job,
                                 GatherScatterState& gs,
                                 ReadIssueBudget& readIssueBudget,
@@ -6990,22 +7237,51 @@ private:
         }
 
         const uint32_t laneIndex = job->prioIndex;
+        // Passive completion fences should not consume a complete scheduler
+        // pass each. Derive a fixed parser bound from the existing read quantum:
+        // the common Read -> WriteAddress -> WriteEqueue stream can expose the
+        // next read without adding another runtime tuning knob. A newly staged
+        // read still parks its source-owned chain until the SDK array submit is
+        // accepted at the end of this pass.
+        constexpr uint32_t kScanCommandsPerPass =
+            static_cast<uint32_t>(AMPR_EMU_APR_READ_CHUNK_QUANTUM) * 4u;
+        uint32_t commandsLeft = kScanCommandsPerPass;
+        bool progressedAny = false;
         for (;;) {
-            // Preserve the old one-record-per-call speculative parser bound.
+            if (commandsLeft == 0 || readIssueBudget.requestsLeft == 0 ||
+                readIssueBudget.bytesLeft == 0) {
+                return progressedAny;
+            }
+
             // Reaching a clean end-of-job consumes no parser/read budget, so a
             // fully scanned job may expose the next FIFO job in the same lane.
             if (!cross_eop_scan_complete(*job)) {
+                uint32_t oldScanOffset = 0;
+                uint32_t oldScanCommandIndex = 0;
+                cross_eop_effective_scan_cursor(
+                    *job, oldScanOffset, oldScanCommandIndex);
                 const bool progressed = issue_reads_across_eop_job(
                     job, gs, readIssueBudget, admission);
-                if (progressed || !cross_eop_scan_complete(*job)) {
-                    return progressed;
+                if (!progressed) {
+                    // A multi-quantum read, false wait, validation boundary, or
+                    // exhausted admission parks this source-ordered scan.
+                    return progressedAny;
                 }
+                if (job->crossEopScanOffset <= oldScanOffset ||
+                    job->crossEopScanCommandIndex !=
+                        oldScanCommandIndex + 1u) {
+                    AMPR_KLOGF("ampr.abort reason=apr.reactor.crossEop.scan.progress.invalid file=%s line=%d", __FILE__, __LINE__);
+                    std::abort();
+                }
+                progressedAny = true;
+                --commandsLeft;
+                continue;
             }
 
             JobPtr const next =
                 job->priorityNext.load(std::memory_order_acquire);
             if (!next) {
-                return false;
+                return progressedAny;
             }
             if (next->prioIndex != laneIndex) {
                 AMPR_KLOGF("ampr.abort reason=apr.reactor.crossEop.priorityNext.invalid file=%s line=%d", __FILE__, __LINE__);
@@ -7067,7 +7343,6 @@ private:
         state.lastSequence = 0;
         state.submitTimeNs = 0;
         state.lastReleaseTimeNs = 0;
-        state.lastWatchdogTimeNs = 0;
         state.submitId = 0;
         state.phase = NativeBatchPhase::Filling;
     }
@@ -7161,6 +7436,50 @@ private:
                static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
     }
 
+    uint64_t sample_native_batch_progress(uint32_t laneIndex,
+                                          uint32_t bufferIndex,
+                                          NativeBatchLane& lane,
+                                          NativeBatchState& state,
+                                          AprNativeBatchSlot& slot) {
+        const uint64_t observed = __atomic_load_n(
+            apr_native_batch_progress_ptr(slot), __ATOMIC_ACQUIRE);
+        state.observedProgress = observed;
+        if (observed == 0) {
+            return observed;
+        }
+        if (state.firstSequence == 0 ||
+            observed <= kAprNativeBatchTokenBase) {
+            AMPR_CRITICAL_LOGF("apr.reactor.native.batch.snapshot.token.invalid lane=%u buffer=%u generation=%u progress=0x%llx firstSequence=%llu",
+                               laneIndex,
+                               bufferIndex,
+                               state.generation,
+                               (unsigned long long)observed,
+                               (unsigned long long)state.firstSequence);
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.snapshot.token.invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        const uint64_t completedGroupCount =
+            observed - kAprNativeBatchTokenBase;
+        if (completedGroupCount > state.nextGroup) {
+            AMPR_CRITICAL_LOGF("apr.reactor.native.batch.snapshot.ahead lane=%u buffer=%u generation=%u progress=0x%llx completedGroups=%llu releasedGroups=%u",
+                               laneIndex,
+                               bufferIndex,
+                               state.generation,
+                               (unsigned long long)observed,
+                               (unsigned long long)completedGroupCount,
+                               state.nextGroup);
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.snapshot.ahead file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
+        }
+        const uint64_t completedSequence =
+            state.firstSequence + completedGroupCount - 1u;
+        if (native_batch_sequence_reached(completedSequence,
+                                          lane.completedSequence)) {
+            lane.completedSequence = completedSequence;
+        }
+        return observed;
+    }
+
     bool native_batch_wait_pending(uint32_t laneIndex) {
         if (laneIndex >= kPriorityCount) {
             return false;
@@ -7171,6 +7490,63 @@ private:
         }
         if (!native_batch_sequence_reached(lane.completedSequence,
                                            lane.blockingWaitSequence)) {
+            if (lane.activeBuffer >= 0) {
+                const uint32_t bufferIndex =
+                    static_cast<uint32_t>(lane.activeBuffer);
+                NativeBatchState& state = lane.buffers[bufferIndex];
+                const bool waitIsActive =
+                    state.phase == NativeBatchPhase::Active &&
+                    state.firstSequence != 0 &&
+                    native_batch_sequence_reached(lane.blockingWaitSequence,
+                                                  state.firstSequence) &&
+                    native_batch_sequence_reached(state.lastSequence,
+                                                  lane.blockingWaitSequence);
+                if (waitIsActive) {
+                    const uint64_t now = time_counter_now();
+                    const uint64_t checkBase =
+                        state.lastReleaseTimeNs >= state.submitTimeNs
+                            ? state.lastReleaseTimeNs
+                            : state.submitTimeNs;
+                    const uint64_t ageNs = checkBase != 0 && now >= checkBase
+                        ? now - checkBase
+                        : 0ull;
+                    if (ageNs >= kNativeCompletionTimeoutNs) {
+                        AprNativeBatchSlot* const slot =
+                            apr_native_batch_slot(laneIndex, bufferIndex);
+                        if (!slot) {
+                            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.counter-wait.slot-null file=%s line=%d", __FILE__, __LINE__);
+                            std::abort();
+                        }
+                        (void)sample_native_batch_progress(
+                            laneIndex, bufferIndex, lane, state, *slot);
+                        if (native_batch_sequence_reached(
+                                lane.completedSequence,
+                                lane.blockingWaitSequence)) {
+                            lane.blockingWaitSequence = 0;
+                            return false;
+                        }
+                        [[maybe_unused]] const int result =
+                            native_batch_result(*slot);
+                        AMPR_CRITICAL_LOGF("apr.reactor.native.batch.counter-wait.timeout lane=%u buffer=%u generation=%u submitId=0x%x blockingSequence=%llu completedSequence=%llu progress=0x%llx release=0x%llx result=0x%x errorOffset=0x%x ageMs=%llu action=abort",
+                                           laneIndex,
+                                           bufferIndex,
+                                           state.generation,
+                                           state.submitId,
+                                           (unsigned long long)lane.blockingWaitSequence,
+                                           (unsigned long long)lane.completedSequence,
+                                           (unsigned long long)state.observedProgress,
+                                           (unsigned long long)__atomic_load_n(
+                                               apr_native_batch_release_ptr(*slot),
+                                               __ATOMIC_RELAXED),
+                                           result,
+                                           slot->result.errorOffset,
+                                           (unsigned long long)(ageNs /
+                                                                1000000ull));
+                        AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.counter-wait.timeout file=%s line=%d", __FILE__, __LINE__);
+                        std::abort();
+                    }
+                }
+            }
             return true;
         }
         lane.blockingWaitSequence = 0;
@@ -7888,7 +8264,7 @@ private:
             return true;
         }
         GatherScatterState& gs = gatherScatterStates[job->prioIndex];
-        bool continueReadBatch = false;
+        bool continueReadGrouping = false;
 #if AMPR_EMU_APR_LOCAL_EQUEUE
         bool continueWithAdjacentEqueue = false;
 #endif
@@ -7956,15 +8332,24 @@ private:
             }
 #endif
 
-            // A byte-aware read quantum may span consecutive readFile packets,
-            // but never crosses a non-read command in the same scheduler pass.
-            // This makes 8 x <=64 KiB useful without pulling waits/EOP/native
-            // side effects forward merely because read credit remains.
-            if (continueReadBatch && !cb_op_is_apr_read(op.type)) {
+            // Once consecutive reads end, the read-ahead scanner may keep
+            // filling this lane's bounded SDK batch through passive EOPs and a
+            // satisfied WaitOnAddress. The execution cursor remains parked on
+            // the boundary; publication and every other side effect stay FIFO.
+            if (continueReadGrouping && !cb_op_is_apr_read(op.type)) {
+#if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
+                if (!speculativeCommandUsed &&
+                    (software_op_is_eop_completion(op) ||
+                     op.type == OpType::WaitOnAddress)) {
+                    speculativeCommandUsed = true;
+                    progressed |= issue_reads_across_eop_lane(
+                        job, gs, readIssueBudget, admission);
+                }
+#endif
                 cache_decoded_op(*job, op, opBytes);
                 break;
             }
-            continueReadBatch = false;
+            continueReadGrouping = false;
 
             if (cb_op_is_apr_read(op.type)) {
 #if AMPR_EMU_APR_AIO_CROSS_EOP_READAHEAD
@@ -8032,7 +8417,7 @@ private:
                     readIssueBudget.requestsLeft != 0 &&
                     readIssueBudget.bytesLeft >=
                         static_cast<uint64_t>(AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES)) {
-                    continueReadBatch = true;
+                    continueReadGrouping = true;
                     continue;
                 }
                 break;
@@ -8178,6 +8563,16 @@ private:
                 }
                 advance_job_source(*job, opBytes);
                 progressed = true;
+                if (op.type == OpType::WaitOnAddress &&
+                    readIssueBudget.requestsLeft != 0 &&
+                    readIssueBudget.bytesLeft >=
+                        static_cast<uint64_t>(AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES)) {
+                    // A satisfied software wait is an eligible source-order
+                    // boundary for this lane's read batch. Continue so reads
+                    // immediately behind it can use the remaining quantum.
+                    continueReadGrouping = true;
+                    continue;
+                }
 #if AMPR_EMU_APR_EAGER_NATIVE_EQUEUE
                 if (op.type == OpType::WriteAddress &&
                     job->eagerNativeEventPlan &&
@@ -8370,12 +8765,17 @@ private:
         AioAdmissionContext admission{};
         begin_aio_submit_round();
         JobPtr laneHeads[kPriorityCount]{};
+        uint8_t laneDemandMask = 0;
         {
             AmprLockGuard lk(m);
             for (size_t lane = 0; lane < kPriorityCount; ++lane) {
                 laneHeads[lane] = activePriorityHeads[lane];
+                if (laneHeads[lane]) {
+                    laneDemandMask |= static_cast<uint8_t>(1u << lane);
+                }
             }
         }
+        admission.laneDemandMask = laneDemandMask;
 
         // A53-style front-end order: every new scheduler pass starts again at
         // the highest APR priority. A blocked lane never stops independent lower
@@ -9432,6 +9832,27 @@ private:
                   (unsigned long long)aioInitBusyCount.load(std::memory_order_relaxed),
                   (unsigned long long)aioInitFailCount.load(std::memory_order_relaxed),
                   (unsigned long long)aioSubmitEagainCount.load(std::memory_order_relaxed));
+        AMPR_LOGF("apr.reactor.counters.readWindow reason=%s pressureStaged=%llu pressureBlocked=%llu contendedStaged=%llu contendedBlocked=%llu sharedStaged=%llu sharedBlocked=%llu exclusiveStaged=%llu exclusiveBlocked=%llu hardChunks=%u hardBytes=%u counterWindowMs=%llu",
+                  reason ? reason : "unknown",
+                  (unsigned long long)runtimeAdaptiveReadWindowStaged[
+                      static_cast<size_t>(AdaptiveReadWindowMode::Pressure)],
+                  (unsigned long long)runtimeAdaptiveReadWindowBlocked[
+                      static_cast<size_t>(AdaptiveReadWindowMode::Pressure)],
+                  (unsigned long long)runtimeAdaptiveReadWindowStaged[
+                      static_cast<size_t>(AdaptiveReadWindowMode::Contended)],
+                  (unsigned long long)runtimeAdaptiveReadWindowBlocked[
+                      static_cast<size_t>(AdaptiveReadWindowMode::Contended)],
+                  (unsigned long long)runtimeAdaptiveReadWindowStaged[
+                      static_cast<size_t>(AdaptiveReadWindowMode::Shared)],
+                  (unsigned long long)runtimeAdaptiveReadWindowBlocked[
+                      static_cast<size_t>(AdaptiveReadWindowMode::Shared)],
+                  (unsigned long long)runtimeAdaptiveReadWindowStaged[
+                      static_cast<size_t>(AdaptiveReadWindowMode::Exclusive)],
+                  (unsigned long long)runtimeAdaptiveReadWindowBlocked[
+                      static_cast<size_t>(AdaptiveReadWindowMode::Exclusive)],
+                  (unsigned)AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS,
+                  (unsigned)AMPR_EMU_APR_PER_READ_ACTIVE_BYTES,
+                  (unsigned long long)counterWindowMs);
         AMPR_LOGF("apr.reactor.counters.fastpath reason=%s adjacentAddressEqueuePasses=%llu",
                   reason ? reason : "unknown",
                   (unsigned long long)runtimeAdjacentAddressEqueuePasses);
@@ -9483,6 +9904,12 @@ private:
             runtimeAioAcceptedPartialQuantum = 0;
             runtimeAioAcceptedFullQuantum = 0;
             runtimeAioAcceptedOverQuantum = 0;
+            for (size_t mode = 0;
+                 mode < static_cast<size_t>(AdaptiveReadWindowMode::Count);
+                 ++mode) {
+                runtimeAdaptiveReadWindowStaged[mode] = 0;
+                runtimeAdaptiveReadWindowBlocked[mode] = 0;
+            }
             runtimeCounterWindowStartNs = now;
             reset_latency_histogram(runtimeJobQueueToFirstReadLatency);
             reset_latency_histogram(runtimeFirstReadReadyToFirstAioLatency);
@@ -9515,7 +9942,9 @@ private:
         const bool fdPressure = fdPressureUntilNs != 0 && now < fdPressureUntilNs;
         const uint32_t effectiveLimit = aio_effective_read_limit(now);
         const size_t adaptiveDirectCap =
-            apr_adaptive_direct_fd_cap(fdCaps, effectiveLimit, fdPressure);
+            apr_adaptive_direct_fd_cap(fdCaps,
+                                       aio_direct_read_limit(effectiveLimit),
+                                       fdPressure);
         const A53ReadGroupCounts groupActive = active_read_group_counts();
         const A53ReadGroupCounts groupTargets =
             read_group_targets(effectiveLimit, groupActive);
@@ -9681,41 +10110,8 @@ private:
                 AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.snapshot.invalid file=%s line=%d", __FILE__, __LINE__);
                 std::abort();
             }
-            state.observedProgress =
-                __atomic_load_n(apr_native_batch_progress_ptr(*slot), __ATOMIC_ACQUIRE);
-            if (state.observedProgress == 0) {
-                continue;
-            }
-            if (state.firstSequence == 0 ||
-                state.observedProgress <= kAprNativeBatchTokenBase) {
-                AMPR_CRITICAL_LOGF("apr.reactor.native.batch.snapshot.token.invalid lane=%u buffer=%u generation=%u progress=0x%llx firstSequence=%llu",
-                                   laneIndex,
-                                   bufferIndex,
-                                   state.generation,
-                                   (unsigned long long)state.observedProgress,
-                                   (unsigned long long)state.firstSequence);
-                AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.snapshot.token.invalid file=%s line=%d", __FILE__, __LINE__);
-                std::abort();
-            }
-            const uint64_t completedGroupCount =
-                state.observedProgress - kAprNativeBatchTokenBase;
-            if (completedGroupCount > state.nextGroup) {
-                AMPR_CRITICAL_LOGF("apr.reactor.native.batch.snapshot.ahead lane=%u buffer=%u generation=%u progress=0x%llx completedGroups=%llu releasedGroups=%u",
-                                   laneIndex,
-                                   bufferIndex,
-                                   state.generation,
-                                   (unsigned long long)state.observedProgress,
-                                   (unsigned long long)completedGroupCount,
-                                   state.nextGroup);
-                AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.snapshot.ahead file=%s line=%d", __FILE__, __LINE__);
-                std::abort();
-            }
-            const uint64_t completedSequence =
-                state.firstSequence + completedGroupCount - 1u;
-            if (native_batch_sequence_reached(completedSequence,
-                                              lane.completedSequence)) {
-                lane.completedSequence = completedSequence;
-            }
+            (void)sample_native_batch_progress(
+                laneIndex, bufferIndex, lane, state, *slot);
         }
 
     }
@@ -9766,7 +10162,7 @@ private:
 
             const uint64_t expectedProgress =
                 apr_native_batch_token(kAprNativeBatchGroupCount - 1u);
-            const uint64_t observedProgress = state.observedProgress;
+            uint64_t observedProgress = state.observedProgress;
             if (native_batch_token_reached(observedProgress, expectedProgress)) {
                 // The final checkpoint is the last command in the fixed native
                 // buffer. Once it is visible, wait only retires the submit id;
@@ -9806,7 +10202,6 @@ private:
                 state.submitId = 0;
                 state.submitTimeNs = 0;
                 state.lastReleaseTimeNs = 0;
-                state.lastWatchdogTimeNs = 0;
                 state.phase = NativeBatchPhase::Free;
                 lane.activeBuffer = -1;
                 progressed = true;
@@ -9838,16 +10233,18 @@ private:
                 continue;
             }
 
-            if (lane.deferredReleaseSequence != 0 &&
-                lane.deferredReleaseSequence == state.lastSequence) {
-                continue;
-            }
             const uint64_t now = time_counter_now();
             const uint64_t ageNs = state.lastReleaseTimeNs != 0 &&
                                            now >= state.lastReleaseTimeNs
                 ? now - state.lastReleaseTimeNs
                 : 0ull;
             if (ageNs < kNativeCompletionTimeoutNs) {
+                continue;
+            }
+            observedProgress = sample_native_batch_progress(
+                laneIndex, bufferIndex, lane, state, *slot);
+            if (native_batch_token_reached(observedProgress,
+                                           expectedProgress)) {
                 continue;
             }
             const int result = native_batch_result(*slot);
@@ -9868,21 +10265,21 @@ private:
                 AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.fatal-without-checkpoint file=%s line=%d", __FILE__, __LINE__);
                 std::abort();
             }
-            if (state.lastWatchdogTimeNs == 0 ||
-                now - state.lastWatchdogTimeNs >= kNativeCompletionTimeoutNs) {
-                state.lastWatchdogTimeNs = now;
-                AMPR_LOGF("apr.reactor.native.batch.rollover.pending lane=%u buffer=%u generation=%u submitId=0x%x ageMs=%llu expected=0x%llx observed=0x%llx release=0x%llx status=running-or-blocked",
-                                   laneIndex,
-                                   bufferIndex,
-                                   state.generation,
-                                   state.submitId,
-                                   (unsigned long long)(ageNs / 1000000ull),
-                                   (unsigned long long)expectedProgress,
-                                   (unsigned long long)observedProgress,
-                                   (unsigned long long)__atomic_load_n(
-                                       apr_native_batch_release_ptr(*slot),
-                                       __ATOMIC_RELAXED));
-            }
+            AMPR_CRITICAL_LOGF("apr.reactor.native.batch.rollover.timeout lane=%u buffer=%u generation=%u submitId=0x%x ageMs=%llu expected=0x%llx observed=0x%llx release=0x%llx blockingSequence=%llu deferredSequence=%llu action=abort",
+                               laneIndex,
+                               bufferIndex,
+                               state.generation,
+                               state.submitId,
+                               (unsigned long long)(ageNs / 1000000ull),
+                               (unsigned long long)expectedProgress,
+                               (unsigned long long)observedProgress,
+                               (unsigned long long)__atomic_load_n(
+                                   apr_native_batch_release_ptr(*slot),
+                                   __ATOMIC_RELAXED),
+                               (unsigned long long)lane.blockingWaitSequence,
+                               (unsigned long long)lane.deferredReleaseSequence);
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.rollover.timeout file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
         return progressed;
     }
@@ -9907,7 +10304,7 @@ private:
         }
         const uint64_t target = eager_native_record_token(
             job, job.eagerNativeEventCount - 1u);
-        const uint64_t observed = __atomic_load_n(progress, __ATOMIC_ACQUIRE);
+        uint64_t observed = __atomic_load_n(progress, __ATOMIC_ACQUIRE);
         if (!native_batch_token_reached(observed, target)) {
             if (job.eagerNativeEventAllReleased) {
                 const int earlyResult = __atomic_load_n(
@@ -9949,43 +10346,32 @@ private:
                     return true;
                 }
                 if (ageNs >= kNativeCompletionTimeoutNs) {
-                    const bool counterWaitPending =
-                        job.eagerNativeCounterWaitTarget != 0 &&
-                        !native_batch_token_reached(
-                            observed, job.eagerNativeCounterWaitTarget);
-                    if (counterWaitPending) {
-                        if (job.eagerNativeEventLastWatchdogNs == 0 ||
-                            now - job.eagerNativeEventLastWatchdogNs >=
-                                kNativeCompletionTimeoutNs) {
-                            job.eagerNativeEventLastWatchdogNs = now;
-                            AMPR_LOGF("apr.reactor.native.fifo.completion.pending job=0x%llx lane=%u records=%u submitId=0x%x target=0x%llx progress=0x%llx ageMs=%llu status=counter-wait",
-                                      (unsigned long long)job.id,
-                                      (unsigned)job.prioIndex,
-                                      (unsigned)job.eagerNativeEventCount,
-                                      job.eagerNativeEventSubmitId,
-                                      (unsigned long long)target,
-                                      (unsigned long long)observed,
-                                      (unsigned long long)(ageNs / 1000000ull));
-                        }
-                        return false;
+                    observed = __atomic_load_n(progress, __ATOMIC_ACQUIRE);
+                    if (!native_batch_token_reached(observed, target)) {
+                        [[maybe_unused]] const uint64_t release =
+                            __atomic_load_n(
+                                apr_native_event_lane_release_ptr(
+                                    job.prioIndex),
+                                __ATOMIC_ACQUIRE);
+                        AMPR_CRITICAL_LOGF("apr.reactor.native.fifo.completion.timeout job=0x%llx lane=%u records=%u submitId=0x%x target=0x%llx progress=0x%llx release=0x%llx counterWaitTarget=0x%llx ageMs=%llu action=abort",
+                                           (unsigned long long)job.id,
+                                           (unsigned)job.prioIndex,
+                                           (unsigned)job.eagerNativeEventCount,
+                                           job.eagerNativeEventSubmitId,
+                                           (unsigned long long)target,
+                                           (unsigned long long)observed,
+                                           (unsigned long long)release,
+                                           (unsigned long long)job.eagerNativeCounterWaitTarget,
+                                           (unsigned long long)(ageNs /
+                                                                1000000ull));
+                        AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.completion.timeout file=%s line=%d", __FILE__, __LINE__);
+                        std::abort();
                     }
-                    [[maybe_unused]] const uint64_t release = __atomic_load_n(
-                        apr_native_event_lane_release_ptr(job.prioIndex),
-                        __ATOMIC_ACQUIRE);
-                    AMPR_CRITICAL_LOGF("apr.reactor.native.fifo.completion.timeout job=0x%llx lane=%u records=%u submitId=0x%x target=0x%llx progress=0x%llx release=0x%llx ageMs=%llu action=abort",
-                                       (unsigned long long)job.id,
-                                       (unsigned)job.prioIndex,
-                                       (unsigned)job.eagerNativeEventCount,
-                                       job.eagerNativeEventSubmitId,
-                                       (unsigned long long)target,
-                                       (unsigned long long)observed,
-                                       (unsigned long long)release,
-                                       (unsigned long long)(ageNs / 1000000ull));
-                    AMPR_KLOGF("ampr.abort reason=apr.reactor.native.fifo.completion.timeout file=%s line=%d", __FILE__, __LINE__);
-                    std::abort();
                 }
             }
-            return false;
+            if (!native_batch_token_reached(observed, target)) {
+                return false;
+            }
         }
 
         int waitRcRaw = 0;
@@ -10085,11 +10471,6 @@ private:
                     if (!targetIsActive) {
                         return false;
                     }
-                    if (job.nativeBatchReleasePending &&
-                        lane.deferredReleaseSequence ==
-                            job.nativeBatchSequence) {
-                        return false;
-                    }
                     const uint64_t now = time_counter_now();
                     const uint64_t checkBase = job.nativeSubmitTimeNs != 0 &&
                                                  job.nativeSubmitTimeNs >= state.submitTimeNs
@@ -10104,6 +10485,18 @@ private:
                         if (!slot) {
                             AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.checkpoint.slot-null file=%s line=%d", __FILE__, __LINE__);
                             std::abort();
+                        }
+                        (void)sample_native_batch_progress(
+                            job.prioIndex, bufferIndex, lane, state, *slot);
+                        if (native_batch_sequence_reached(
+                                lane.completedSequence,
+                                job.nativeBatchSequence)) {
+                            job.nativeSubmitted.store(
+                                false, std::memory_order_release);
+                            job.nativeBatchSequence = 0;
+                            job.nativeSubmitTimeNs = 0;
+                            job.nativeMicroEngine = NativeMicroEngine::None;
+                            return true;
                         }
                         const int result = native_batch_result(*slot);
                         if (result != kAprNativeBatchResultPending) {
@@ -10122,8 +10515,7 @@ private:
                             AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.checkpoint.fatal file=%s line=%d", __FILE__, __LINE__);
                             std::abort();
                         }
-                        job.nativeSubmitTimeNs = now;
-                        AMPR_LOGF("apr.reactor.native.batch.checkpoint.pending job=0x%llx lane=%u buffer=%u generation=%u targetSequence=%llu completedSequence=%llu progress=0x%llx ageMs=%llu status=running-or-blocked",
+                        AMPR_CRITICAL_LOGF("apr.reactor.native.batch.checkpoint.timeout job=0x%llx lane=%u buffer=%u generation=%u targetSequence=%llu completedSequence=%llu progress=0x%llx blockingSequence=%llu deferredSequence=%llu ageMs=%llu action=abort",
                                            (unsigned long long)job.id,
                                            job.prioIndex,
                                            bufferIndex,
@@ -10131,8 +10523,12 @@ private:
                                            (unsigned long long)job.nativeBatchSequence,
                                            (unsigned long long)lane.completedSequence,
                                            (unsigned long long)state.observedProgress,
+                                           (unsigned long long)lane.blockingWaitSequence,
+                                           (unsigned long long)lane.deferredReleaseSequence,
                                            (unsigned long long)(ageNs /
                                                                 1000000ull));
+                        AMPR_KLOGF("ampr.abort reason=apr.reactor.native.batch.checkpoint.timeout file=%s line=%d", __FILE__, __LINE__);
+                        std::abort();
                     }
                 }
                 return false;
@@ -10153,14 +10549,20 @@ private:
             AMPR_KLOGF("ampr.abort reason=apr.reactor.native.micro.apr.completion-invalid file=%s line=%d", __FILE__, __LINE__);
             std::abort();
         }
-        const uint64_t completionValue = job.nativeCompletionAddress
-            ? *job.nativeCompletionAddress
+        uint64_t completionValue = job.nativeCompletionAddress
+            ? __atomic_load_n(job.nativeCompletionAddress, __ATOMIC_ACQUIRE)
             : 0ull;
         const uint64_t now = time_counter_now();
         const uint64_t ageNs = job.nativeSubmitTimeNs != 0 &&
                                    now >= job.nativeSubmitTimeNs
             ? now - job.nativeSubmitTimeNs
             : 0ull;
+        if (completionValue == 0 &&
+            ageNs >= kNativeCompletionTimeoutNs &&
+            job.nativeCompletionAddress) {
+            completionValue = __atomic_load_n(
+                job.nativeCompletionAddress, __ATOMIC_ACQUIRE);
+        }
         const bool timedOut = completionValue == 0 &&
                               ageNs >= kNativeCompletionTimeoutNs;
         bool aprTerminalError = false;
@@ -10181,20 +10583,8 @@ private:
         if (completionValue == 0 && !timedOut && !aprTerminalError) {
             return false;
         }
-        std::atomic_thread_fence(std::memory_order_acquire);
         if (timedOut && !aprTerminalError) {
             if (aprMicro) {
-                if (job.nativeSourceType == OpType::WaitOnCounter) {
-                    job.nativeSubmitTimeNs = now;
-                    AMPR_LOGF("apr.reactor.native.micro.apr.pending job=0x%llx lane=%u submitId=0x%x ageMs=%llu sourceOffset=0x%x sourceType=%s status=counter-wait",
-                              (unsigned long long)job.id,
-                              (unsigned)job.prioIndex,
-                              job.nativeMicroSubmitId,
-                              (unsigned long long)(ageNs / 1000000ull),
-                              job.nativeSourceOffset,
-                              sce::Ampr::ampr_op_name(job.nativeSourceType));
-                    return false;
-                }
                 AMPR_CRITICAL_LOGF("apr.reactor.native.micro.apr.completion.timeout job=0x%llx lane=%u submitId=0x%x ageMs=%llu sourceOffset=0x%x sourceType=%s action=abort",
                                    (unsigned long long)job.id,
                                    (unsigned)job.prioIndex,
@@ -10218,8 +10608,7 @@ private:
                      SCE_KERNEL_ERROR_ETIMEDOUT,
                      job.nativeSourceOffset);
         } else if (!aprTerminalError && !job_failed(job) &&
-                   (!job.nativeCompletionAddress ||
-                    *job.nativeCompletionAddress != kAprNativeMicroCompletionDone)) {
+                   completionValue != kAprNativeMicroCompletionDone) {
             set_fail(job,
                      "native-completion-write",
                      SCE_KERNEL_ERROR_EIO,
@@ -10240,9 +10629,7 @@ private:
                    sce::Ampr::ampr_op_name(job.nativeSourceType),
                    job.nativeMicroEngine == NativeMicroEngine::Amm ? "amm" : "apr",
                    (void*)const_cast<uint64_t*>(job.nativeCompletionAddress),
-                   (unsigned long long)(job.nativeCompletionAddress
-                                            ? *job.nativeCompletionAddress
-                                            : 0ull),
+                   (unsigned long long)completionValue,
                    job_failed(job) ? 1u : 0u);
         job.nativeSubmitted.store(false, std::memory_order_release);
         job.nativeSubmitTimeNs = 0;
@@ -10635,6 +11022,10 @@ private:
     uint64_t runtimeAioAcceptedOverQuantum{0};
     uint64_t runtimeAioAcceptedRequestCountByPriority[kPriorityCount]{};
     uint64_t runtimeAioAcceptedBytesByPriority[kPriorityCount]{};
+    uint64_t runtimeAdaptiveReadWindowStaged[
+        static_cast<size_t>(AdaptiveReadWindowMode::Count)]{};
+    uint64_t runtimeAdaptiveReadWindowBlocked[
+        static_cast<size_t>(AdaptiveReadWindowMode::Count)]{};
     uint64_t runtimeCounterWindowStartNs{0};
     uint64_t runtimeReactorLoopLastNs{0};
     bool runtimeReactorLoopGapArmed{false};

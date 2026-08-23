@@ -133,140 +133,74 @@ extern "C" int sceKernelAprGetFileStat_emul(int fileId, SceKernelStat* st) {
     return ampr_libkernel_return_from_sce(rc);
 }
 
+// Resolver services own argument validation. Keep bridge diagnostics pointer-only
+// so rejected calls are not traversed twice or read again while reporting errors.
 extern "C" int sceKernelAprResolveFilepathsToIds_emul(const char* path[], uint32_t num, uint32_t ids[], uint32_t* errorIndex) {
-    const int countRc = sce::Ampr::Emu::validate_resolve_count(num);
-    if (countRc != 0) return ampr_libkernel_return_from_sce(countRc);
-    const int outputRc = sce::Ampr::Emu::validate_resolve_outputs(reinterpret_cast<SceAprFileId*>(ids));
-    if (outputRc != 0) return ampr_libkernel_return_from_sce(outputRc);
-    const int pathRc = sce::Ampr::Emu::validate_resolve_path_array(path, num);
-    if (pathRc != 0) return ampr_libkernel_return_from_sce(pathRc);
     AMPR_VLOGF("lk.apr.resolveIds enter paths=%p num=%u ids=%p errorIndex=%p", path, (unsigned)num, ids, errorIndex);
     const int rc = sce::Ampr::Emu::aprResolveFilepathsToIds(path, num, (SceAprFileId*)ids, errorIndex);
-    AMPR_VLOGF("lk.apr.resolveIds leave rc=0x%x firstId=%u errorIndex=%u",
-              rc, (ids && num) ? ids[0] : 0u, errorIndex ? *errorIndex : 0u);
+    AMPR_VLOGF("lk.apr.resolveIds leave rc=0x%x ids=%p errorIndex=%p", rc, ids, errorIndex);
     return ampr_libkernel_return_from_sce(rc);
 }
 
 extern "C" int sceKernelAprResolveFilepathsToIdsAndFileSizes_emul(const char* path[], uint32_t num, uint32_t ids[], size_t fileSizes[], uint32_t* errorIndex) {
-    const int countRc = sce::Ampr::Emu::validate_resolve_count(num);
-    if (countRc != 0) return ampr_libkernel_return_from_sce(countRc);
-    const int outputRc = sce::Ampr::Emu::validate_resolve_outputs(reinterpret_cast<SceAprFileId*>(ids), fileSizes);
-    if (outputRc != 0) return ampr_libkernel_return_from_sce(outputRc);
-    const int pathRc = sce::Ampr::Emu::validate_resolve_path_array(path, num);
-    if (pathRc != 0) return ampr_libkernel_return_from_sce(pathRc);
     AMPR_VLOGF("lk.apr.resolveIdsSizes enter paths=%p num=%u ids=%p sizes=%p errorIndex=%p",
               path, (unsigned)num, ids, fileSizes, errorIndex);
     int rc = sce::Ampr::Emu::aprResolveFilepathsToIdsAndFileSizes(path, num, (SceAprFileId*)ids, fileSizes, errorIndex);
-    AMPR_VLOGF("lk.apr.resolveIdsSizes leave rc=0x%x firstId=%u firstSize=0x%llx errorIndex=%u",
-              rc,
-              (ids && num) ? ids[0] : 0u,
-              (unsigned long long)((fileSizes && num) ? fileSizes[0] : 0u),
-              errorIndex ? *errorIndex : 0u);
+    AMPR_VLOGF("lk.apr.resolveIdsSizes leave rc=0x%x ids=%p sizes=%p errorIndex=%p",
+              rc, ids, fileSizes, errorIndex);
     return ampr_libkernel_return_from_sce(rc);
 }
 
 extern "C" int sceKernelAprResolveFilepathsWithPrefixToIds_emul(const char* pathPrefix, const char* path[], uint32_t num, uint32_t ids[], uint32_t* errorIndex) {
-    const int countRc = sce::Ampr::Emu::validate_resolve_count(num);
-    if (countRc != 0) return ampr_libkernel_return_from_sce(countRc);
-    const int prefixRc = sce::Ampr::Emu::validate_resolve_prefix(pathPrefix);
-    if (prefixRc != 0) return ampr_libkernel_return_from_sce(prefixRc);
-    const int outputRc = sce::Ampr::Emu::validate_resolve_outputs(reinterpret_cast<SceAprFileId*>(ids));
-    if (outputRc != 0) return ampr_libkernel_return_from_sce(outputRc);
-    const int pathRc = sce::Ampr::Emu::validate_resolve_path_array(path, num);
-    if (pathRc != 0) return ampr_libkernel_return_from_sce(pathRc);
-    AMPR_VLOGF("lk.apr.resolvePrefixIds enter prefix=%s paths=%p num=%u ids=%p errorIndex=%p",
-              pathPrefix ? pathPrefix : "(null)", path, (unsigned)num, ids, errorIndex);
+    AMPR_VLOGF("lk.apr.resolvePrefixIds enter prefix=%p paths=%p num=%u ids=%p errorIndex=%p",
+              pathPrefix, path, (unsigned)num, ids, errorIndex);
     return ampr_libkernel_return_from_sce(
         sce::Ampr::Emu::aprResolveFilepathsWithPrefixToIds(pathPrefix, path, num, (SceAprFileId*)ids, errorIndex));
 }
 
 extern "C" int sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes_emul(const char* pathPrefix, const char* path[], uint32_t num, uint32_t ids[], size_t fileSizes[], uint32_t* errorIndex) {
-    const int countRc = sce::Ampr::Emu::validate_resolve_count(num);
-    if (countRc != 0) return ampr_libkernel_return_from_sce(countRc);
-    const int prefixRc = sce::Ampr::Emu::validate_resolve_prefix(pathPrefix);
-    if (prefixRc != 0) return ampr_libkernel_return_from_sce(prefixRc);
-    const int outputRc = sce::Ampr::Emu::validate_resolve_outputs(reinterpret_cast<SceAprFileId*>(ids), fileSizes);
-    if (outputRc != 0) return ampr_libkernel_return_from_sce(outputRc);
-    const int pathRc = sce::Ampr::Emu::validate_resolve_path_array(path, num);
-    if (pathRc != 0) return ampr_libkernel_return_from_sce(pathRc);
-    AMPR_VLOGF("lk.apr.resolvePrefixIdsSizes enter prefix=%s paths=%p num=%u ids=%p sizes=%p errorIndex=%p",
-              pathPrefix ? pathPrefix : "(null)", path, (unsigned)num, ids, fileSizes, errorIndex);
+    AMPR_VLOGF("lk.apr.resolvePrefixIdsSizes enter prefix=%p paths=%p num=%u ids=%p sizes=%p errorIndex=%p",
+              pathPrefix, path, (unsigned)num, ids, fileSizes, errorIndex);
     return ampr_libkernel_return_from_sce(
         sce::Ampr::Emu::aprResolveFilepathsWithPrefixToIdsAndFileSizes(pathPrefix, path, num, (SceAprFileId*)ids, fileSizes, errorIndex));
 }
 
 extern "C" int sceKernelAprResolveFilepathsToIdsForEach_emul(const char* path[], uint32_t num, uint32_t ids[], int results[]) {
-    const int countRc = sce::Ampr::Emu::validate_resolve_count(num);
-    if (countRc != 0) return ampr_libkernel_return_from_sce_count(countRc);
-    const int outputRc = sce::Ampr::Emu::validate_resolve_outputs(reinterpret_cast<SceAprFileId*>(ids), results);
-    if (outputRc != 0) return ampr_libkernel_return_from_sce_count(outputRc);
-    const int pathRc = sce::Ampr::Emu::validate_resolve_path_array(path, num);
-    if (pathRc != 0) return ampr_libkernel_return_from_sce_count(pathRc);
     AMPR_VLOGF("lk.apr.resolveIdsEach enter paths=%p num=%u ids=%p results=%p", path, (unsigned)num, ids, results);
     const int rc = sce::Ampr::Emu::aprResolveFilepathsToIdsForEach(path, num, (SceAprFileId*)ids, results);
     const int out = ampr_libkernel_return_from_sce_count(rc);
-    AMPR_VLOGF("lk.apr.resolveIdsEach leave rc=0x%x out=%d firstId=%u firstResult=0x%x",
-              rc, out, (ids && num) ? ids[0] : 0u, (results && num) ? results[0] : 0);
+    AMPR_VLOGF("lk.apr.resolveIdsEach leave rc=0x%x out=%d ids=%p results=%p",
+              rc, out, ids, results);
     return out;
 }
 
 extern "C" int sceKernelAprResolveFilepathsToIdsAndFileSizesForEach_emul(const char* path[], uint32_t num, uint32_t ids[], size_t fileSizes[], int results[]) {
-    const int countRc = sce::Ampr::Emu::validate_resolve_count(num);
-    if (countRc != 0) return ampr_libkernel_return_from_sce_count(countRc);
-    const int outputRc = sce::Ampr::Emu::validate_resolve_outputs(reinterpret_cast<SceAprFileId*>(ids), fileSizes, results);
-    if (outputRc != 0) return ampr_libkernel_return_from_sce_count(outputRc);
-    const int pathRc = sce::Ampr::Emu::validate_resolve_path_array(path, num);
-    if (pathRc != 0) return ampr_libkernel_return_from_sce_count(pathRc);
     AMPR_VLOGF("lk.apr.resolveIdsSizesEach enter paths=%p num=%u ids=%p sizes=%p results=%p",
               path, (unsigned)num, ids, fileSizes, results);
     const int rc = sce::Ampr::Emu::aprResolveFilepathsToIdsAndFileSizesForEach(path, num, (SceAprFileId*)ids, fileSizes, results);
     const int out = ampr_libkernel_return_from_sce_count(rc);
-    AMPR_VLOGF("lk.apr.resolveIdsSizesEach leave rc=0x%x out=%d firstId=%u firstSize=0x%llx firstResult=0x%x",
-              rc,
-              out,
-              (ids && num) ? ids[0] : 0u,
-              (unsigned long long)((fileSizes && num) ? fileSizes[0] : 0u),
-              (results && num) ? results[0] : 0);
+    AMPR_VLOGF("lk.apr.resolveIdsSizesEach leave rc=0x%x out=%d ids=%p sizes=%p results=%p",
+              rc, out, ids, fileSizes, results);
     return out;
 }
 
 extern "C" int sceKernelAprResolveFilepathsWithPrefixToIdsForEach_emul(const char* pathPrefix, const char* path[], uint32_t num, uint32_t ids[], int results[]) {
-    const int countRc = sce::Ampr::Emu::validate_resolve_count(num);
-    if (countRc != 0) return ampr_libkernel_return_from_sce_count(countRc);
-    const int prefixRc = sce::Ampr::Emu::validate_resolve_prefix(pathPrefix);
-    if (prefixRc != 0) return ampr_libkernel_return_from_sce_count(prefixRc);
-    const int outputRc = sce::Ampr::Emu::validate_resolve_outputs(reinterpret_cast<SceAprFileId*>(ids), results);
-    if (outputRc != 0) return ampr_libkernel_return_from_sce_count(outputRc);
-    const int pathRc = sce::Ampr::Emu::validate_resolve_path_array(path, num);
-    if (pathRc != 0) return ampr_libkernel_return_from_sce_count(pathRc);
-    AMPR_VLOGF("lk.apr.resolvePrefixIdsEach enter prefix=%s paths=%p num=%u ids=%p results=%p",
-              pathPrefix ? pathPrefix : "(null)", path, (unsigned)num, ids, results);
+    AMPR_VLOGF("lk.apr.resolvePrefixIdsEach enter prefix=%p paths=%p num=%u ids=%p results=%p",
+              pathPrefix, path, (unsigned)num, ids, results);
     const int rc = sce::Ampr::Emu::aprResolveFilepathsWithPrefixToIdsForEach(pathPrefix, path, num, (SceAprFileId*)ids, results);
     const int out = ampr_libkernel_return_from_sce_count(rc);
-    AMPR_VLOGF("lk.apr.resolvePrefixIdsEach leave rc=0x%x out=%d firstId=%u firstResult=0x%x",
-              rc, out, (ids && num) ? ids[0] : 0u, (results && num) ? results[0] : 0);
+    AMPR_VLOGF("lk.apr.resolvePrefixIdsEach leave rc=0x%x out=%d ids=%p results=%p",
+              rc, out, ids, results);
     return out;
 }
 
 extern "C" int sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach_emul(const char* pathPrefix, const char* path[], uint32_t num, uint32_t ids[], size_t fileSizes[], int results[]) {
-    const int countRc = sce::Ampr::Emu::validate_resolve_count(num);
-    if (countRc != 0) return ampr_libkernel_return_from_sce_count(countRc);
-    const int prefixRc = sce::Ampr::Emu::validate_resolve_prefix(pathPrefix);
-    if (prefixRc != 0) return ampr_libkernel_return_from_sce_count(prefixRc);
-    const int outputRc = sce::Ampr::Emu::validate_resolve_outputs(reinterpret_cast<SceAprFileId*>(ids), fileSizes, results);
-    if (outputRc != 0) return ampr_libkernel_return_from_sce_count(outputRc);
-    const int pathRc = sce::Ampr::Emu::validate_resolve_path_array(path, num);
-    if (pathRc != 0) return ampr_libkernel_return_from_sce_count(pathRc);
-    AMPR_VLOGF("lk.apr.resolvePrefixIdsSizesEach enter prefix=%s paths=%p num=%u ids=%p sizes=%p results=%p",
-              pathPrefix ? pathPrefix : "(null)", path, (unsigned)num, ids, fileSizes, results);
+    AMPR_VLOGF("lk.apr.resolvePrefixIdsSizesEach enter prefix=%p paths=%p num=%u ids=%p sizes=%p results=%p",
+              pathPrefix, path, (unsigned)num, ids, fileSizes, results);
     const int rc = sce::Ampr::Emu::aprResolveFilepathsWithPrefixToIdsAndFileSizesForEach(pathPrefix, path, num, (SceAprFileId*)ids, fileSizes, results);
     const int out = ampr_libkernel_return_from_sce_count(rc);
-    AMPR_VLOGF("lk.apr.resolvePrefixIdsSizesEach leave rc=0x%x out=%d firstId=%u firstSize=0x%llx firstResult=0x%x",
-              rc,
-              out,
-              (ids && num) ? ids[0] : 0u,
-              (unsigned long long)((fileSizes && num) ? fileSizes[0] : 0u),
-              (results && num) ? results[0] : 0);
+    AMPR_VLOGF("lk.apr.resolvePrefixIdsSizesEach leave rc=0x%x out=%d ids=%p sizes=%p results=%p",
+              rc, out, ids, fileSizes, results);
     return out;
 }
 

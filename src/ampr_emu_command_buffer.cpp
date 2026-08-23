@@ -7,6 +7,7 @@
 #include "ampr_emu_command_buffer_types.h"
 #include "ampr_emu_command_buffer_common.h"
 #include "ampr_emu_command_buffer_apr.h"
+#include "ampr_emu_apr_equeue.h"
 #include "ampr_emu_command_packing.h"
 #include "ampr_emu_errno.h"
 #include "ampr_emu_log.h"
@@ -461,7 +462,11 @@ int CommandBuffer::writeKernelEventQueue_04_00(SceKernelEqueue eq, int32_t id, u
     op.u32b = static_cast<uint32_t>(id);
     op.u64a = data;
     op.u8a = atSop ? 1u : 0u;
-    return cb_append(&m_commandBuffer, ampr_move(op));
+    const int rc = cb_append(&m_commandBuffer, ampr_move(op));
+    if (rc == 0) {
+        apr_equeue_note_command_buffer_event(this, eq);
+    }
+    return rc;
 }
 
 int CommandBuffer::writeKernelEventQueueOnCompletion(SceKernelEqueue eq, int32_t id, uint64_t data) {
