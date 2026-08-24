@@ -1,0 +1,21 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.37301.10 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libSceAmpr", "msbuild\libSceAmpr\libSceAmpr.vcxproj", "{1C1DF483-F977-4DF2-84C7-CA97E6E9B2B2}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		ReleaseHooks|Prospero = ReleaseHooks|Prospero
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{1C1DF483-F977-4DF2-84C7-CA97E6E9B2B2}.ReleaseHooks|Prospero.ActiveCfg = ReleaseHooks|Prospero
+		{1C1DF483-F977-4DF2-84C7-CA97E6E9B2B2}.ReleaseHooks|Prospero.Build.0 = ReleaseHooks|Prospero
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {2D102B4F-B2F7-4421-9D0D-EA2B53E7F07E}
+	EndGlobalSection
+EndGlobal

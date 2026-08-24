@@ -1,0 +1,184 @@
+/*
+ * Repository Prospero PRX section/segment layout.
+ * Symbolic SCE PHDR types are adapted for upstream LLD at build time.
+ */
+
+ENTRY (0)
+
+PHDRS
+{
+    ph_text            PT_LOAD            FLAGS (0x1);
+    ph_ro              PT_LOAD            FLAGS (0x4);
+    ph_relro_load      PT_LOAD            FLAGS (0x2 | 0x4);
+    ph_relro           PT_GNU_RELRO       FLAGS (0x4);
+    ph_data            PT_LOAD            FLAGS (0x2 | 0x4);
+    ph_sce_moduleparam PT_SCE_MODULEPARAM FLAGS (0x4);
+    ph_dynamic         PT_DYNAMIC         FLAGS (0x2 | 0x4);
+    ph_tls             PT_TLS             FLAGS (0x4);
+    ph_eh_frame_hdr    PT_GNU_EH_FRAME    FLAGS (0x4);
+    ph_dynlibdata      PT_LOAD            FLAGS (0);
+    ph_sce_comment     PT_SCE_COMMENT     FLAGS (0);
+    ph_libversion      PT_SCE_LIBVERSION  FLAGS (0);
+    ph_load_note       PT_NOTE            FLAGS (0);
+    ph_note            PT_NOTE            FLAGS (0);
+}
+
+SECTIONS
+{
+    PROVIDE (__executable_start = .);
+    .sce_padding : { QUAD (0xcccccccccccccccc); QUAD (0xcccccccccccccccc); } : ph_text
+
+    .init :
+    {
+        PROVIDE (__start__Zinit = .);
+        KEEP (*(.init))
+    }
+
+    .text :
+    {
+        PROVIDE (__start__Ztext = .);
+        *(.text .text.*)
+        PROVIDE (__text_end = .);
+        PROVIDE (__stop__Ztext = .);
+    }
+    .plt : { *(.plt) }
+    .fini : { KEEP (*(.fini)) }
+    PROVIDE (etext = .);
+    PROVIDE (_etext = .);
+
+    . = ALIGN (CONSTANT (MAXPAGESIZE));
+    .rodata : { *(.rodata .rodata.*) } : ph_ro
+    .gcc_except_table : { *(.gcc_except_table) }
+    .eh_frame : { *(.eh_frame) }
+    .eh_frame_hdr : { *(.eh_frame_hdr) } : ph_ro : ph_eh_frame_hdr
+
+    . = ALIGN (CONSTANT (MAXPAGESIZE));
+    .data.rel.ro : { *(.data.rel.ro .data.rel.ro*) } : ph_relro_load : ph_relro
+    .got : { *(.got) }
+    .got.plt :
+    {
+        PROVIDE (__got_plt_start = .);
+        *(.got.plt)
+    }
+    .got.dll : { *(.got.dll .got.dll.*) }
+
+    .ctors :
+    {
+        PROVIDE (__CTOR_LIST__ = .); PROVIDE (___CTOR_LIST__ = .);
+        KEEP (*crtbegin*.o(.ctors))
+        KEEP (*(EXCLUDE_FILE (*crtend*.o) .ctors))
+        KEEP (*(SORT (.ctors.*)))
+        KEEP (*crtend*.o(.ctors))
+        PROVIDE (__CTOR_END__ = .); PROVIDE (___CTOR_END__ = .);
+    }
+    .dtors :
+    {
+        PROVIDE (__DTOR_LIST__ = .); PROVIDE (___DTOR_LIST__ = .);
+        KEEP (*crtbegin*.o(.dtors))
+        KEEP (*(EXCLUDE_FILE (*crtend*.o) .dtors))
+        KEEP (*(SORT (.dtors.*)))
+        KEEP (*crtend*.o(.dtors))
+        PROVIDE (__DTOR_END__ = .); PROVIDE (___DTOR_END__ = .);
+    }
+
+    .preinit_array :
+    {
+        PROVIDE (__start__Zpreinit_array = .);
+        *(.preinit_array)
+        PROVIDE (__stop__Zpreinit_array = .);
+    }
+    .init_array :
+    {
+        PROVIDE (__start__Zinit_array = .);
+        *(SORT (.init_array.*))
+        *(.init_array)
+        PROVIDE (__stop__Zinit_array = .);
+    }
+    .fini_array :
+    {
+        *(.fini_array)
+        *(SORT (.fini_array.*))
+    }
+
+    .sce_module_param :
+    {
+        KEEP (*(.sce_module_param))
+    } : ph_relro_load : ph_relro : ph_sce_moduleparam
+
+    . = ALIGN (32);
+    .tdata : { *(.tdata .tdata.*) } : ph_relro_load : ph_relro : ph_tls
+    .tbss  : { *(.tbss .tbss.*) } : ph_tls
+
+    . = ALIGN (CONSTANT (MAXPAGESIZE));
+    . = ALIGN (CONSTANT (MAXPAGESIZE));
+    .shader_header :
+    {
+        PROVIDE (__shader_header_start = .);
+        *(.shader_header)
+        PROVIDE (__shader_header_end = .);
+    } : ph_data
+    . = ALIGN (CONSTANT (MAXPAGESIZE));
+    .shader_text :
+    {
+        PROVIDE (__shader_text_start = .);
+        *(.shader_text)
+        PROVIDE (__shader_text_end = .);
+    }
+    . = ALIGN (CONSTANT (MAXPAGESIZE));
+    .shader_data : { *(.shader_data) }
+    .data : { *(.data .data.*) }
+
+    __llvm_prf_cnts  : { KEEP (*(__llvm_prf_cnts __llvm_prf_cnts.*)) }
+    __llvm_prf_data  : { KEEP (*(__llvm_prf_data __llvm_prf_data.*)) }
+    __llvm_prf_names : { KEEP (*(__llvm_prf_names __llvm_prf_names.*)) }
+    __llvm_prf_vals  : { KEEP (*(__llvm_prf_vals __llvm_prf_vals.*)) }
+    __llvm_prf_vnds  : { KEEP (*(__llvm_prf_vnds __llvm_prf_vnds.*)) }
+    __sancov_guards  : { KEEP (*(__sancov_guards __sancov_guards.*)) }
+
+    PROVIDE (edata = .);
+    PROVIDE (_edata = .);
+    PROVIDE (__bss_start = .);
+    .bss : { *(.bss .bss.*) *(COMMON) }
+    PROVIDE (end = .);
+    PROVIDE (_end = .);
+
+    .dynstr   : ALIGN (16) { *(.dynstr) } : ph_dynlibdata
+    .dynsym   : { *(.dynsym) }
+    .rela.plt : { . = .; *(.dyn.rela.plt) }
+    .rela.dyn : { . = .; *(.rela.dyn) }
+    .hash     : { *(.hash) }
+    .note.gnu.build-id : { *(.note.gnu.build-id) } : ph_load_note : ph_dynlibdata
+    .dynamic  :
+    {
+        PROVIDE_HIDDEN (_DYNAMIC = 0);
+        *(.dynamic)
+    } : ph_dynamic : ph_dynlibdata
+
+    .prodg_meta_data : ALIGN (16)
+    {
+        *(.prodg_meta_data)
+    } : ph_sce_comment
+    .sceversion : { *(.sceversion) } : ph_libversion
+    .note (INFO) : { *(.note .note.*) } : ph_note
+
+    /DISCARD/ : { *(.linker_cmd) } : NONE
+    .debug_info     : { *(.debug_info) }
+    .debug_line     : { *(.debug_line) }
+    .debug_abbrev   : { *(.debug_abbrev) }
+    .debug_aranges  : { *(.debug_aranges) }
+    .debug_frame    : { *(.debug_frame) }
+    .debug_loc      : { *(.debug_loc) }
+    .debug_macinfo  : { *(.debug_macinfo) }
+    .debug_pubnames : { *(.debug_pubnames) }
+    .debug_pubtypes : { *(.debug_pubtypes) }
+    .debug_ranges   : { *(.debug_ranges) }
+    .debug_str      : { *(.debug_str) }
+    .debug_types    : { *(.debug_types) }
+
+    .sce_stack_sizes : { *(.sce_stack_sizes .sce_stack_sizes.*) }
+    .stack_sizes : { *(.stack_sizes .stack_sizes.*) }
+    .sce_wrap : { *(.sce_wrap) }
+    .comment : { *(.comment) }
+    /DISCARD/ : { *(.note.GNU-stack) }
+    __llvm_covmap : { KEEP (*(__llvm_covmap)) }
+}
