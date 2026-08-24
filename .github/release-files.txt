@@ -1,0 +1,4 @@
+# Files included in the GitHub Actions release archive.
+# One path per line, relative to the repository root.
+
+out/payload-sdk/libSceAmpr.sprx

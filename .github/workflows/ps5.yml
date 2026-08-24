@@ -1,0 +1,117 @@
+name: PS5 Build and Release
+
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    outputs:
+      archive_name: ${{ steps.package.outputs.archive_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout pacbrew-repo
+        uses: actions/checkout@v4
+        with:
+          repository: ps5-payload-dev/pacbrew-repo
+          path: pacbrew-repo
+
+      - name: Set up build environment
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            autoconf \
+            automake \
+            build-essential \
+            clang-18 \
+            cmake \
+            curl \
+            git \
+            libarchive-tools \
+            libtool \
+            lld-18 \
+            makepkg \
+            meson \
+            pacman-package-manager \
+            pkg-config \
+            python3 \
+            zip
+
+      - name: Build PS5 payload SDK
+        working-directory: pacbrew-repo/sdk
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      - name: Build and verify libSceAmpr
+        run: make clean verify PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+
+      - name: Create release archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_tag="$(git describe --abbrev=6 --dirty --always --tags 2>/dev/null || echo "${GITHUB_SHA::7}")"
+          archive_name="libSceAmpr_${version_tag}.zip"
+          manifest_file=".github/release-files.txt"
+
+          mapfile -t release_files < <(grep -Ev '^[[:space:]]*(#|$)' "${manifest_file}")
+
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "Release manifest is empty: ${manifest_file}" >&2
+            exit 1
+          fi
+
+          for release_file in "${release_files[@]}"; do
+            if [ ! -f "${release_file}" ]; then
+              echo "Missing release file: ${release_file}" >&2
+              exit 1
+            fi
+          done
+
+          zip -9 "${archive_name}" "${release_files[@]}"
+          echo "archive_name=${archive_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive_name }}
+          path: ${{ steps.package.outputs.archive_name }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.archive_name }}
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/${{ needs.build.outputs.archive_name }}
