@@ -12,6 +12,7 @@
 #include "ampr_emu_errno.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <new>
 
 [[maybe_unused]] static inline const char* ampr_log_path_arg(const char* path) {
@@ -91,7 +92,10 @@ static FileState* file_state_create() {
         ampr_spin_pause_or_yield(spins);
     }
     p = g_file_state.load(std::memory_order_acquire);
-    if (!p) __builtin_trap();
+    if (!p) {
+        AMPR_KLOGF("ampr.abort reason=apr.fdcache.state-init.null file=%s line=%d", __FILE__, __LINE__);
+        std::abort();
+    }
     return p;
 }
 
@@ -558,7 +562,13 @@ class FdCloseList {
 public:
     void push_back(int fd) {
         if (count_ >= kCapacity) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=apr.fdcache.close-list.capacity-exhausted count=%zu capacity=%zu fd=%d file=%s line=%d",
+                       count_,
+                       kCapacity,
+                       fd,
+                       __FILE__,
+                       __LINE__);
+            std::abort();
         }
         fds_[count_++] = fd;
     }

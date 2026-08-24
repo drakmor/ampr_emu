@@ -9,14 +9,6 @@
 #include "ampr_debug_log.h"
 #include "ampr_emu_config.h"
 
-static inline void ampr_debug_int3_trap() {
-#if defined(__x86_64__) || defined(__i386__)
-    __asm__ volatile("int3" ::: "memory");
-#else
-    __builtin_trap();
-#endif
-}
-
 #define AMPR_KLOGF(...) sce::Ampr::Emu::kernelDebugLogf(__VA_ARGS__)
 
 static inline bool ampr_debug_log_runtime_enabled() {

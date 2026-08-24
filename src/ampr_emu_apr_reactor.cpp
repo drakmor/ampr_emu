@@ -1618,7 +1618,8 @@ private:
         slot.value.poolSlot = slotIndex;
         if (liveReadChainCount == UINT32_MAX) {
             AMPR_CRITICAL_LOGF("apr.reactor.readChain.live.overflow");
-            ampr_debug_int3_trap();
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.readChain.live.overflow file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         } else {
             ++liveReadChainCount;
 #if AMPR_EMU_DEBUG_LOG
@@ -1638,7 +1639,8 @@ private:
             AMPR_CRITICAL_LOGF("apr.reactor.readChain.release.invalid slot=%u chain=%p",
                                slotIndex,
                                chain);
-            ampr_debug_int3_trap();
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.readChain.release.invalid file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
             return;
         }
         slot.value = {};
@@ -1647,7 +1649,8 @@ private:
         readChainFreeHead = slotIndex;
         if (liveReadChainCount == 0) {
             AMPR_CRITICAL_LOGF("apr.reactor.readChain.live.underflow slot=%u", slotIndex);
-            ampr_debug_int3_trap();
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.readChain.live.underflow file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         } else {
             --liveReadChainCount;
         }
@@ -1691,7 +1694,8 @@ private:
                                job->nativeMicroSubmitId,
                                job->nativeSubmitted.load(std::memory_order_relaxed) ? 1u : 0u,
                                (unsigned)job->nativeMicroEngine);
-            ampr_debug_int3_trap();
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.job.pool.release-with-eager-native file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
         release_eager_native_event_arena(*job);
 #endif
@@ -1702,7 +1706,8 @@ private:
                                job->activeReadCount,
                                job->cursorReadChain != nullptr ? 1u : 0u,
                                hasSpeculativeRead ? 1u : 0u);
-            ampr_debug_int3_trap();
+            AMPR_KLOGF("ampr.abort reason=apr.reactor.job.pool.release-with-reads file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
         {
             AmprSpinLock lock(&jobStatePoolLock);
@@ -2103,7 +2108,8 @@ private:
                 }
             }
             if (slot == kInvalid) {
-                __builtin_trap();
+                AMPR_KLOGF("ampr.abort reason=apr.reactor.activeRead.list.capacity-exhausted file=%s line=%d", __FILE__, __LINE__);
+                std::abort();
             }
             freeCursor_ = (slot + 1u) % kMaxActiveReads;
             Slot& node = slots_[slot];

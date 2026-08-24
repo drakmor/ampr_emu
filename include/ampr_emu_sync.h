@@ -6,10 +6,13 @@
 
 #pragma once
 
+#include "ampr_emu_log.h"
+
 #include <_kernel.h>
 #include <_pthread.h>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <errno.h>
 #include <pthread.h>
@@ -84,7 +87,8 @@ public:
     AmprMutex() {
         const int rc = scePthreadMutexInit(&mutex_, nullptr, "ampr_mutex");
         if (rc != 0) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.mutex.init.fail rc=0x%x file=%s line=%d", rc, __FILE__, __LINE__);
+            std::abort();
         }
     }
 
@@ -98,7 +102,8 @@ public:
     void lock() {
         const int rc = scePthreadMutexLock(&mutex_);
         if (rc != 0) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.mutex.lock.fail rc=0x%x file=%s line=%d", rc, __FILE__, __LINE__);
+            std::abort();
         }
     }
 
@@ -110,13 +115,15 @@ public:
         if (rc == SCE_KERNEL_ERROR_EBUSY || rc == EBUSY) {
             return false;
         }
-        __builtin_trap();
+        AMPR_KLOGF("ampr.abort reason=sync.mutex.try-lock.fail rc=0x%x file=%s line=%d", rc, __FILE__, __LINE__);
+        std::abort();
     }
 
     void unlock() {
         const int rc = scePthreadMutexUnlock(&mutex_);
         if (rc != 0) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.mutex.unlock.fail rc=0x%x file=%s line=%d", rc, __FILE__, __LINE__);
+            std::abort();
         }
     }
 
@@ -175,7 +182,9 @@ public:
 
     void lock() {
         if (!mutex_ || owns_) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.unique-lock.lock.invalid mutex=%p owns=%u file=%s line=%d",
+                       mutex_, owns_ ? 1u : 0u, __FILE__, __LINE__);
+            std::abort();
         }
         mutex_->lock();
         owns_ = true;
@@ -183,7 +192,9 @@ public:
 
     void unlock() {
         if (!mutex_ || !owns_) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.unique-lock.unlock.invalid mutex=%p owns=%u file=%s line=%d",
+                       mutex_, owns_ ? 1u : 0u, __FILE__, __LINE__);
+            std::abort();
         }
         mutex_->unlock();
         owns_ = false;
@@ -199,7 +210,8 @@ public:
     AmprConditionVariable() {
         const int rc = scePthreadCondInit(&cond_, nullptr, "ampr_cond");
         if (rc != 0) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.cond.init.fail rc=0x%x file=%s line=%d", rc, __FILE__, __LINE__);
+            std::abort();
         }
     }
 
@@ -220,15 +232,18 @@ public:
 
     void wait(AmprUniqueLock& lock) {
         if (!lock.owns_lock()) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.cond.wait.lock-not-owned file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
         ScePthreadMutex* mutex = lock.mutex() ? lock.mutex()->native_handle() : nullptr;
         if (!mutex) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.cond.wait.mutex-null file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
         const int rc = scePthreadCondWait(&cond_, mutex);
         if (rc != 0) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.cond.wait.fail rc=0x%x file=%s line=%d", rc, __FILE__, __LINE__);
+            std::abort();
         }
     }
 
@@ -242,11 +257,13 @@ public:
     template <typename Rep, typename Period>
     void wait_for(AmprUniqueLock& lock, const std::chrono::duration<Rep, Period>& timeout) {
         if (!lock.owns_lock()) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.cond.timedwait.lock-not-owned file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
         ScePthreadMutex* mutex = lock.mutex() ? lock.mutex()->native_handle() : nullptr;
         if (!mutex) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.cond.timedwait.mutex-null file=%s line=%d", __FILE__, __LINE__);
+            std::abort();
         }
         const auto usecDuration = std::chrono::duration_cast<std::chrono::microseconds>(timeout);
         uint64_t usec = usecDuration.count() > 0 ? static_cast<uint64_t>(usecDuration.count()) : 0;
@@ -255,7 +272,8 @@ public:
         }
         const int rc = scePthreadCondTimedwait(&cond_, mutex, static_cast<SceKernelUseconds>(usec));
         if (rc != 0 && rc != SCE_KERNEL_ERROR_ETIMEDOUT && rc != ETIMEDOUT) {
-            __builtin_trap();
+            AMPR_KLOGF("ampr.abort reason=sync.cond.timedwait.fail rc=0x%x file=%s line=%d", rc, __FILE__, __LINE__);
+            std::abort();
         }
     }
 

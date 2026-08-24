@@ -54,12 +54,53 @@ constexpr uint16_t kRegistrationHashTombstone = UINT16_MAX;
 constexpr uint64_t kUsecondsPerSecond = 1000000ull;
 constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
 constexpr uint64_t kMaxScaledCounterFrequency = UINT64_MAX / kUsecondsPerSecond;
+constexpr int16_t kAmprEventFilter = SCE_KERNEL_EVFILT_AMPR;
 #ifdef SCE_KERNEL_EVFILT_AMPR_SYSTEM
 constexpr int16_t kAmprSystemEventFilter = SCE_KERNEL_EVFILT_AMPR_SYSTEM;
 #else
 // SDK 10.000 sys/event.h assigns EVFILT_AMPR_SYSTEM the stable ABI value -30.
 constexpr int16_t kAmprSystemEventFilter = -30;
 #endif
+static_assert(kAmprEventFilter != kAmprSystemEventFilter,
+              "AMPR registration filters must remain distinct");
+
+enum class QueueControlScope : uint8_t {
+    None,
+    Registration,
+    WholeQueue,
+};
+
+struct QueueControlState {
+    int32_t id{};
+    int16_t filter{};
+    QueueControlScope scope{};
+};
+static_assert(sizeof(QueueControlState) == 8u,
+              "APR local equeue control key packing changed");
+
+static constexpr bool registration_control_conflicts(
+    QueueControlState control,
+    int16_t filter,
+    int id) {
+    return control.scope == QueueControlScope::WholeQueue ||
+           (control.scope == QueueControlScope::Registration &&
+            control.filter == filter && control.id == id);
+}
+static_assert(!registration_control_conflicts({}, kAmprEventFilter, 1));
+static_assert(registration_control_conflicts(
+    {1, kAmprEventFilter, QueueControlScope::Registration},
+    kAmprEventFilter,
+    1));
+static_assert(!registration_control_conflicts(
+    {1, kAmprEventFilter, QueueControlScope::Registration},
+    kAmprEventFilter,
+    2));
+static_assert(!registration_control_conflicts(
+    {1, kAmprEventFilter, QueueControlScope::Registration},
+    kAmprSystemEventFilter,
+    1));
+static_assert(registration_control_conflicts(
+    {0, 0, QueueControlScope::WholeQueue}, kAmprEventFilter, 1));
 
 static_assert(kQueueCapacity != 0 && kRegistrationCapacity != 0 && kPendingCapacity != 0,
               "APR local equeue pools must not be empty");
@@ -89,9 +130,8 @@ struct PendingEvent {
     uint32_t next{};
     uint32_t registrationIndex{};
     SceKernelEvent event{};
-    uint64_t registrationGeneration{};
 };
-static_assert(sizeof(PendingEvent) == sizeof(SceKernelEvent) + 16u,
+static_assert(sizeof(PendingEvent) == sizeof(SceKernelEvent) + 8u,
               "APR local equeue pending metadata grew fixed .bss storage");
 
 struct TrackedEqueue {
@@ -151,6 +191,7 @@ struct OverlayState {
     alignas(64) std::atomic<uint8_t> wakeTriggerState[kQueueCapacity]{};
     alignas(64) std::atomic<uint64_t> localWakeEpoch[kQueueCapacity]{};
     alignas(64) std::atomic<uintptr_t> ammQueueHash[kQueueHashCapacity]{};
+    QueueControlState controls[kQueueCapacity]{};
     TrackedEqueue queues[kQueueCapacity]{};
     MirroredRegistration registrations[kRegistrationCapacity]{};
     PendingEvent pending[kPendingCapacity]{};
@@ -183,12 +224,14 @@ struct PrivateWakeRequest {
     uint32_t queueIndex{kInvalidIndex};
     uint32_t wakeId{};
     uint32_t pendingIndex{kInvalidIndex};
+    uint32_t registrationIndex{kInvalidIndex};
     uint64_t queueGeneration{};
+    uint64_t registrationGeneration{};
 };
 
 struct PrivateWakeCompletion {
     int rc{};
-    bool pendingPublished{};
+    bool publicationHandled{};
     bool replacementStillRequired{};
     uint32_t pendingCount{};
     uint32_t nativeWaitIntent{};
@@ -450,6 +493,7 @@ static void initialize_locked() {
     for (uint32_t i = 0; i < kQueueCapacity; ++i) {
         g_overlay.wakeTriggerState[i].store(0, std::memory_order_relaxed);
         g_overlay.localWakeEpoch[i].store(0, std::memory_order_relaxed);
+        g_overlay.controls[i] = {};
         g_overlay.queues[i] = {};
         g_overlay.queues[i].nextFree = i + 1u < kQueueCapacity ? i + 1u : kInvalidIndex;
     }
@@ -770,7 +814,9 @@ struct QueueControlTransaction {
     }
 };
 
-static QueueControlTransaction begin_queue_control(SceKernelEqueue eq) {
+static QueueControlTransaction begin_queue_control(SceKernelEqueue eq,
+                                                   int16_t filter,
+                                                   int id) {
     QueueControlTransaction transaction{};
     OverlayLock lock;
     if (!g_overlay.hooksAvailable.load(std::memory_order_relaxed)) {
@@ -784,6 +830,18 @@ static QueueControlTransaction begin_queue_control(SceKernelEqueue eq) {
     TrackedEqueue& queue = g_overlay.queues[transaction.queueIndex];
     transaction.queueGeneration = queue.lifetimeGeneration;
     transaction.wasExclusive = queue_is_exclusive_local_locked(queue);
+    QueueControlState& control =
+        g_overlay.controls[transaction.queueIndex];
+    if (queue.controlDepth == 0) {
+        control.id = id;
+        control.filter = filter;
+        control.scope = QueueControlScope::Registration;
+    } else {
+        // Same-queue recursive lifecycle reentry cannot be represented by one
+        // registration key, so retain conservative conflict handling until the
+        // outer transaction finishes.
+        control.scope = QueueControlScope::WholeQueue;
+    }
     ++queue.controlDepth;
     if (transaction.wasExclusive) {
         g_overlay.localWakeEpoch[transaction.queueIndex].fetch_add(
@@ -803,10 +861,30 @@ static TrackedEqueue* find_queue_control_locked(
     return &g_overlay.queues[transaction.queueIndex];
 }
 
-static void finish_queue_control_locked(TrackedEqueue& queue) {
+static void finish_queue_control_locked(uint32_t queueIndex,
+                                        TrackedEqueue& queue) {
     if (queue.controlDepth != 0) {
         --queue.controlDepth;
     }
+    if (queue.controlDepth == 0 && queueIndex < kQueueCapacity) {
+        g_overlay.controls[queueIndex] = {};
+    }
+}
+
+static bool queue_control_conflicts_with_registration_locked(
+    uint32_t queueIndex,
+    const TrackedEqueue& queue,
+    int16_t filter,
+    int id) {
+    if (queue.controlDepth == 0) {
+        return false;
+    }
+    if (queueIndex >= kQueueCapacity) {
+        return true;
+    }
+    const QueueControlState control = g_overlay.controls[queueIndex];
+    return control.scope == QueueControlScope::None ||
+           registration_control_conflicts(control, filter, id);
 }
 
 static void disable_exclusive_local_waits_for_amm_tracking_loss() {
@@ -964,6 +1042,7 @@ static uint32_t allocate_queue_locked(SceKernelEqueue eq) {
     queue.pendingTail = kInvalidIndex;
     queue.nextFree = kInvalidIndex;
     queue.lifetimeGeneration = next_generation64(g_overlay.nextLifetimeGeneration);
+    g_overlay.controls[index] = {};
     if (!insert_queue_hash_locked(eq, index)) {
         queue = {};
         queue.nextFree = g_overlay.queueFreeHead;
@@ -1115,13 +1194,21 @@ static uint32_t find_registration_locked(uint32_t queueIndex,
     return kInvalidIndex;
 }
 
+static bool purge_pending_registration_locked(TrackedEqueue& queue,
+                                               uint32_t registrationIndex);
+
 static uint32_t allocate_registration_locked(uint32_t queueIndex,
                                              TrackedEqueue& queue,
                                              int16_t filter,
                                              int32_t id,
-                                             void* udata) {
+                                             void* udata,
+                                             bool* outNotifyReactor) {
     uint32_t index = find_registration_locked(queueIndex, queue, filter, id);
     if (index < kRegistrationCapacity) {
+        if (purge_pending_registration_locked(queue, index) &&
+            outNotifyReactor) {
+            *outNotifyReactor = true;
+        }
         MirroredRegistration& registration = g_overlay.registrations[index];
         registration.udata = udata;
         registration.generation = next_generation64(g_overlay.nextRegistrationGeneration);
@@ -1162,7 +1249,8 @@ static uint32_t allocate_registration_locked(uint32_t queueIndex,
 static void remove_registration_locked(uint32_t queueIndex,
                                        TrackedEqueue& queue,
                                        int16_t filter,
-                                       int32_t id) {
+                                       int32_t id,
+                                       bool* outNotifyReactor) {
     uint32_t previous = kInvalidIndex;
     uint32_t index = queue.registrationHead;
     while (index < kRegistrationCapacity) {
@@ -1170,6 +1258,10 @@ static void remove_registration_locked(uint32_t queueIndex,
         const uint32_t next = registration.next;
         if (registration.id == id &&
             g_overlay.registrationFilters[index] == filter) {
+            if (purge_pending_registration_locked(queue, index) &&
+                outNotifyReactor) {
+                *outNotifyReactor = true;
+            }
             erase_registration_hash_locked(queueIndex, filter, id);
             if (previous < kRegistrationCapacity) {
                 g_overlay.registrations[previous].next = next;
@@ -1241,6 +1333,37 @@ static bool take_pending_backpressure_progress_locked() {
     return true;
 }
 
+static bool purge_pending_registration_locked(TrackedEqueue& queue,
+                                               uint32_t registrationIndex) {
+    uint32_t previous = kInvalidIndex;
+    uint32_t index = queue.pendingHead;
+    bool released = false;
+    while (index < kPendingCapacity) {
+        PendingEvent& pending = g_overlay.pending[index];
+        const uint32_t next = pending.next;
+        if (pending.registrationIndex == registrationIndex) {
+            if (previous < kPendingCapacity) {
+                g_overlay.pending[previous].next = next;
+            } else {
+                queue.pendingHead = next;
+            }
+            if (queue.pendingTail == index) {
+                queue.pendingTail = previous;
+            }
+            if (queue.pendingCount != 0) {
+                --queue.pendingCount;
+            }
+            release_pending_locked(index);
+            APR_EQ_COUNT(staleRegistrationDrops);
+            released = true;
+        } else {
+            previous = index;
+        }
+        index = next;
+    }
+    return released && take_pending_backpressure_progress_locked();
+}
+
 static void append_pending_locked(TrackedEqueue& queue, uint32_t index) {
     if (queue.pendingTail < kPendingCapacity) {
         g_overlay.pending[queue.pendingTail].next = index;
@@ -1251,31 +1374,25 @@ static void append_pending_locked(TrackedEqueue& queue, uint32_t index) {
     ++queue.pendingCount;
 }
 
-static bool pending_registration_is_current_locked(
+static bool wake_registration_is_current_locked(
     uint32_t queueIndex,
-    const PendingEvent& pending) {
-    const uint32_t registrationIndex = pending.registrationIndex;
+    const PrivateWakeRequest& request) {
+    const uint32_t registrationIndex = request.registrationIndex;
     return registrationIndex < kRegistrationCapacity &&
            g_overlay.registrationOwners[registrationIndex] == queueIndex + 1u &&
            g_overlay.registrations[registrationIndex].generation ==
-               pending.registrationGeneration;
+               request.registrationGeneration;
 }
 
-static int drain_pending_locked(uint32_t queueIndex,
-                                TrackedEqueue& queue,
+static int drain_pending_locked(TrackedEqueue& queue,
                                 SceKernelEvent* events,
                                 int capacity,
                                 bool* outNotifyReactor) {
     int count = 0;
     bool releasedPending = false;
-    while (queue.pendingHead < kPendingCapacity) {
+    while (queue.pendingHead < kPendingCapacity && count < capacity) {
         const uint32_t index = queue.pendingHead;
         PendingEvent& pending = g_overlay.pending[index];
-        const bool registrationCurrent =
-            pending_registration_is_current_locked(queueIndex, pending);
-        if (registrationCurrent && count >= capacity) {
-            break;
-        }
         queue.pendingHead = pending.next;
         if (queue.pendingHead >= kPendingCapacity) {
             queue.pendingTail = kInvalidIndex;
@@ -1283,11 +1400,7 @@ static int drain_pending_locked(uint32_t queueIndex,
         if (queue.pendingCount != 0) {
             --queue.pendingCount;
         }
-        if (registrationCurrent) {
-            events[count++] = pending.event;
-        } else {
-            APR_EQ_COUNT(staleRegistrationDrops);
-        }
+        events[count++] = pending.event;
         release_pending_locked(index);
         releasedPending = true;
     }
@@ -1328,6 +1441,14 @@ static BeginPrivateWakeResult begin_private_wake_locked(
     request->wakeId = queue.wakeId;
     request->pendingIndex = pendingIndex;
     request->queueGeneration = queue.lifetimeGeneration;
+    if (pendingIndex < kPendingCapacity) {
+        request->registrationIndex =
+            g_overlay.pending[pendingIndex].registrationIndex;
+        if (request->registrationIndex < kRegistrationCapacity) {
+            request->registrationGeneration =
+                g_overlay.registrations[request->registrationIndex].generation;
+        }
+    }
     return BeginPrivateWakeResult::Scheduled;
 }
 
@@ -1364,8 +1485,17 @@ static PrivateWakeCompletion execute_private_wake(
                 queue.wakeArmed = result.rc == 0;
                 if (result.rc == 0 &&
                     request.pendingIndex < kPendingCapacity) {
-                    append_pending_locked(queue, request.pendingIndex);
-                    result.pendingPublished = true;
+                    if (wake_registration_is_current_locked(
+                            request.queueIndex, request)) {
+                        append_pending_locked(queue, request.pendingIndex);
+                    } else {
+                        release_pending_locked(request.pendingIndex);
+                        APR_EQ_COUNT(staleRegistrationDrops);
+                    }
+                    // A stale late packet is deliberately consumed rather
+                    // than sent to the possibly replacement native
+                    // registration. Match the old drain-time drop semantics.
+                    result.publicationHandled = true;
                 } else if (result.rc != 0) {
                     // Documented trigger failures are permanent for this
                     // (equeue, id) pair. Keep existing FIFO nodes drainable,
@@ -1384,7 +1514,7 @@ static PrivateWakeCompletion execute_private_wake(
         }
 
         if (request.pendingIndex < kPendingCapacity &&
-            !result.pendingPublished) {
+            !result.publicationHandled) {
             release_pending_locked(request.pendingIndex);
         }
         if (request.queueIndex < kQueueCapacity) {
@@ -1541,6 +1671,7 @@ static bool release_queue_locked(uint32_t queueIndex) {
         erase_amm_queue_hash_locked(queue.eq);
     }
     erase_queue_hash_locked(queue.eq);
+    g_overlay.controls[queueIndex] = {};
     queue = {};
     queue.nextFree = g_overlay.queueFreeHead;
     g_overlay.queueFreeHead = queueIndex;
@@ -1611,7 +1742,7 @@ static NativeWaitTransition prepare_native_wait(
             if (!private_wake_in_flight_locked(queue)) {
                 result.syntheticCount =
                     drain_pending_locked(
-                        queueIndex, queue, events, num, &result.notifyReactor);
+                        queue, events, num, &result.notifyReactor);
                 if (result.syntheticCount == 0) {
                     ++queue.nativeWaitIntent;
                     note_wait_intent_added_locked();
@@ -1717,7 +1848,8 @@ static int forward_ampr_registration_add(SceKernelEqueue eq,
     }
 
     ControlLock control;
-    const QueueControlTransaction transaction = begin_queue_control(eq);
+    const QueueControlTransaction transaction =
+        begin_queue_control(eq, filter, id);
     if (transaction.wakeLocalWaiter) {
         notify_local_waiters();
     }
@@ -1746,6 +1878,7 @@ static int forward_ampr_registration_add(SceKernelEqueue eq,
     }
 
     uint64_t committedGeneration = 0;
+    bool notifyReactor = false;
     {
         OverlayLock lock;
         TrackedEqueue* const queuePtr =
@@ -1763,7 +1896,8 @@ static int forward_ampr_registration_add(SceKernelEqueue eq,
                            queue,
                            filter,
                            id,
-                           udata) >=
+                           udata,
+                           &notifyReactor) >=
                        kRegistrationCapacity) {
                 forcedMixed = mark_queue_mixed_locked(
                     transaction.queueIndex, queue);
@@ -1773,12 +1907,15 @@ static int forward_ampr_registration_add(SceKernelEqueue eq,
                 committedGeneration = transaction.queueGeneration;
             }
         }
-        finish_queue_control_locked(queue);
+        finish_queue_control_locked(transaction.queueIndex, queue);
         const bool isExclusive = queue_is_exclusive_local_locked(queue);
         classificationChanged = !transaction.wasExclusive && isExclusive;
         if (classificationChanged) {
             APR_EQ_COUNT(localEntries);
         }
+    }
+    if (notifyReactor) {
+        apr_reactor_notify_external_progress();
     }
     if (forcedMixed.changed) {
         notify_local_waiters();
@@ -1816,12 +1953,14 @@ static int forward_ampr_registration_delete(SceKernelEqueue eq,
     }
 
     ControlLock control;
-    const QueueControlTransaction transaction = begin_queue_control(eq);
+    const QueueControlTransaction transaction =
+        begin_queue_control(eq, filter, id);
     if (transaction.wakeLocalWaiter) {
         notify_local_waiters();
     }
 
     bool classificationChanged = false;
+    bool notifyReactor = false;
     const int rc = call();
     if (!transaction) {
         return rc;
@@ -1833,12 +1972,16 @@ static int forward_ampr_registration_delete(SceKernelEqueue eq,
                 find_queue_control_locked(transaction)) {
             if (rc == 0) {
                 remove_registration_locked(
-                    transaction.queueIndex, *queue, filter, id);
+                    transaction.queueIndex,
+                    *queue,
+                    filter,
+                    id,
+                    &notifyReactor);
                 queue->amprSourceSeen =
                     queue->registrationHead < kRegistrationCapacity;
                 APR_EQ_COUNT(deleteRegistrations);
             }
-            finish_queue_control_locked(*queue);
+            finish_queue_control_locked(transaction.queueIndex, *queue);
             classificationChanged =
                 rc == 0 && transaction.wasExclusive &&
                 !queue->amprSourceSeen && !queue->mixedSourceSeen &&
@@ -1847,6 +1990,9 @@ static int forward_ampr_registration_delete(SceKernelEqueue eq,
                 APR_EQ_COUNT(localExits);
             }
         }
+    }
+    if (notifyReactor) {
+        apr_reactor_notify_external_progress();
     }
     if (classificationChanged) {
         AMPR_TLOGF("apr.equeue.classification.change eq=%p from=apr-local to=apr-candidate reason=%s",
@@ -1892,7 +2038,11 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
                 return AprEqueuePublishResult::NativeFallback;
             }
             TrackedEqueue& queue = g_overlay.queues[queueIndex];
-            if (queue.controlDepth != 0) {
+            if (queue_control_conflicts_with_registration_locked(
+                    queueIndex,
+                    queue,
+                    kAmprEventFilter,
+                    id)) {
                 controlPromotion = mark_queue_mixed_locked(queueIndex, queue);
                 controlFallback = true;
                 APR_EQ_COUNT(fallbackRegistration);
@@ -1929,7 +2079,6 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
                 pending.event.fflags = 0;
                 pending.event.data = static_cast<intptr_t>(data);
                 pending.event.udata = registration.udata;
-                pending.registrationGeneration = registration.generation;
                 registrationUdata = registration.udata;
                 registrationGeneration = registration.generation;
 
@@ -1981,7 +2130,7 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
                         ? "apr-local"
                         : "apr-candidate",
                     "mixed",
-                    "ampr-control-in-flight");
+                    "ampr-registration-control-conflict");
             }
             return AprEqueuePublishResult::NativeFallback;
         }
@@ -1992,7 +2141,7 @@ AprEqueuePublishResult apr_equeue_try_publish(SceKernelEqueue eq,
         if (executeWake) {
             const PrivateWakeCompletion completion =
                 execute_private_wake(wakeRequest);
-            if (!completion.pendingPublished) {
+            if (!completion.publicationHandled) {
                 APR_EQ_COUNT(fallbackWake);
                 [[maybe_unused]] const int wakeRc =
                     completion.rc != 0 ? completion.rc
@@ -2488,6 +2637,8 @@ extern "C" int sceKernelDeleteEqueue_emul(SceKernelEqueue eq) {
                             queue.lifetimeGeneration;
                         transaction.wasExclusive =
                             queue_is_exclusive_local_locked(queue);
+                        g_overlay.controls[queueIndex].scope =
+                            QueueControlScope::WholeQueue;
                         ++queue.controlDepth;
                         if (transaction.wasExclusive) {
                             g_overlay.localWakeEpoch[queueIndex].fetch_add(
@@ -2537,7 +2688,8 @@ extern "C" int sceKernelDeleteEqueue_emul(SceKernelEqueue eq) {
                                 transaction.queueIndex);
                             notifyLocal = true;
                         } else {
-                            finish_queue_control_locked(*queue);
+                            finish_queue_control_locked(
+                                transaction.queueIndex, *queue);
                         }
                     }
                 }
@@ -2627,7 +2779,7 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
                     *out = 0;
                     const int synthetic =
                         drain_pending_locked(
-                            queueIndex, queue, events, num, &notifyReactor);
+                            queue, events, num, &notifyReactor);
                     if (synthetic != 0) {
                         *out = synthetic;
                         APR_EQ_COUNT(syntheticDirectReturns);
@@ -2832,7 +2984,6 @@ extern "C" int sceKernelWaitEqueue_emul(SceKernelEqueue eq,
                             queue.wakeArmed = false;
                         }
                         syntheticCount = drain_pending_locked(
-                            trackedQueueIndex,
                             queue,
                             events + realCount,
                             num - realCount,
