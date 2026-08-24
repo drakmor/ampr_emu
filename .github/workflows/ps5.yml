@@ -60,6 +60,12 @@ jobs:
           makepkg -c -f
           sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
 
+      - name: Build PS5 libc++ headers
+        working-directory: pacbrew-repo/libcxx
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
       - name: Build and verify libSceAmpr
         run: make clean verify PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 
