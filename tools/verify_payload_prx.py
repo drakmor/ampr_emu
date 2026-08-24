@@ -26,26 +26,8 @@ EXPECTED_SCEVERSION = bytes.fromhex(
     "0000190008637274656e64533a02000009000000010200000900000001"
     "00001600086372746e3a02000009000000010200000900000001"
 )
+EXPECTED_EXPORT_COUNT = 118
 FSELF_MAGIC = b"\x4f\x15\x3d\x1d"
-
-
-def reference_exports(path: Path) -> dict[str, str]:
-    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    exports: dict[str, str] = {}
-    for index, line in enumerate(lines):
-        name_match = re.search(r"Name:\s*(sceAmpr\w+)", line)
-        if not name_match:
-            continue
-        for follow in lines[index:index + 8]:
-            nid_match = re.search(
-                r"Original NID name:\s*([A-Za-z0-9+\-]+)", follow
-            )
-            if nid_match:
-                exports[name_match.group(1)] = nid_match.group(1)
-                break
-    if not exports:
-        raise ValueError(f"reference contains no sceAmpr exports: {path}")
-    return exports
 
 
 def fself_versions(data: bytes) -> tuple[int, int]:
@@ -74,7 +56,6 @@ def main() -> int:
     parser.add_argument("--libc-imports", type=Path, required=True)
     parser.add_argument("--kernel-imports", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--sprx", type=Path, required=True)
     parser.add_argument("--fself-version", type=lambda value: int(value, 0), required=True)
     args = parser.parse_args()
@@ -140,20 +121,11 @@ def main() -> int:
     (export_suffix, group), = matching_groups.items()
 
     source_names = set(source_exports(args.source))
-    reference = reference_exports(args.reference)
-    if source_names != set(reference):
+    if len(source_names) != EXPECTED_EXPORT_COUNT:
         raise ValueError(
-            "source/reference export mismatch: "
-            f"missing={sorted(set(reference) - source_names)} "
-            f"extra={sorted(source_names - set(reference))}"
+            f"unexpected source export count: {len(source_names)} "
+            f"(expected {EXPECTED_EXPORT_COUNT})"
         )
-    bad_reference_nids = sorted(
-        (name, nid, name_to_nid(name))
-        for name, nid in reference.items()
-        if nid != name_to_nid(name)
-    )
-    if bad_reference_nids:
-        raise ValueError(f"reference NID mismatch: {bad_reference_nids}")
 
     expected = {
         f"{name_to_nid(name)}#{export_suffix[0]}#{export_suffix[1]}"

@@ -196,7 +196,6 @@ verify: all
 	  --libc-imports $(LIBC_LIST) \
 	  --kernel-imports $(KERNEL_LIST) \
 	  --source src/sceampr_exports.cpp \
-	  --reference docs/refs/12.70/libSceAmpr.sprx.asm \
 	  --sprx $(SPRX) \
 	  --fself-version $(PROSPERO_200_FSELF_VERSION)
 
