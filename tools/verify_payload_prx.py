@@ -9,7 +9,6 @@ import struct
 from pathlib import Path
 
 from generate_payload_exports import METADATA_SYMBOLS, name_to_nid, source_exports
-from ampr_export_reference_audit import reference_exports
 from prx_hash_fix import Elf64LE, buckets_to_symbol_map, elf_hash
 
 
@@ -28,6 +27,25 @@ EXPECTED_SCEVERSION = bytes.fromhex(
     "00001600086372746e3a02000009000000010200000900000001"
 )
 FSELF_MAGIC = b"\x4f\x15\x3d\x1d"
+
+
+def reference_exports(path: Path) -> dict[str, str]:
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    exports: dict[str, str] = {}
+    for index, line in enumerate(lines):
+        name_match = re.search(r"Name:\s*(sceAmpr\w+)", line)
+        if not name_match:
+            continue
+        for follow in lines[index:index + 8]:
+            nid_match = re.search(
+                r"Original NID name:\s*([A-Za-z0-9+\-]+)", follow
+            )
+            if nid_match:
+                exports[name_match.group(1)] = nid_match.group(1)
+                break
+    if not exports:
+        raise ValueError(f"reference contains no sceAmpr exports: {path}")
+    return exports
 
 
 def fself_versions(data: bytes) -> tuple[int, int]:
