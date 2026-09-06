@@ -7302,8 +7302,12 @@ private:
         active.request.buf = active.desc.buffer;
         active.request.result = &active.result;
         active.request.fd = active.desc.fd;
+#if AMPR_EMU_PACK_ENABLE
         active.nativeCapacityCharged =
             !ampr_pack_is_virtual_fd(active.request.fd);
+#else
+        active.nativeCapacityCharged = true;
+#endif
 
 #if AMPR_EMU_DEBUG_LOG && AMPR_EMU_DEBUG_LOG_TRACE
         log_aio_buffer_memory_detail("apr.reactor.aio.bufVa",

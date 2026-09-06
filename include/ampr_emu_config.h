@@ -865,7 +865,9 @@
 #endif
 
 #ifndef AMPR_EMU_PACK_ENABLE
-#define AMPR_EMU_PACK_ENABLE 1
+// Build profiles that include the packed runtime enable it explicitly. Keep
+// standalone/legacy compile graphs that omit its translation units pack-free.
+#define AMPR_EMU_PACK_ENABLE 0
 #endif
 
 #ifndef AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE

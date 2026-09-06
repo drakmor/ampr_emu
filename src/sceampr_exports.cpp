@@ -34,10 +34,12 @@ int module_start(size_t args, const void* argp) {
 int module_stop(size_t args, const void* argp) {
     (void)args;
     (void)argp;
+#if AMPR_EMU_PACK_ENABLE
     const int packRc = ampr_pack_shutdown();
     if (packRc != 0) {
         return -1;
     }
+#endif
     const int reactorRc = apr_reactor_shutdown();
     if (reactorRc != 0) {
         return -1;

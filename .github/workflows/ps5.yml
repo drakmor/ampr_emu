@@ -10,31 +10,38 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - name: Checkout project
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Checkout pacbrew-repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ps5-payload-dev/pacbrew-repo
+          ref: 19718edd6fd5e9447f38b7fb59ebbacc136b5421
           path: pacbrew-repo
+          persist-credentials: false
 
       - name: Set up build environment
         run: |
-          sudo apt update
-          sudo apt install -y \
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
             autoconf \
             automake \
             build-essential \
@@ -50,45 +57,75 @@ jobs:
             pacman-package-manager \
             pkg-config \
             python3
+          python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+
+      - name: Pin PS5 payload SDK v0.42
+        working-directory: pacbrew-repo/sdk
+        run: |
+          sed -i \
+            's|git+https://github.com/ps5-payload-dev/sdk.git|git+https://github.com/ps5-payload-dev/sdk.git#commit=4eb701204fc3f8d31e84cf8ca272974e2be9c867|' \
+            PKGBUILD
+          grep -Fq '#commit=4eb701204fc3f8d31e84cf8ca272974e2be9c867' PKGBUILD
 
       - name: Build PS5 payload SDK
         working-directory: pacbrew-repo/sdk
         run: |
           makepkg -c -f
-          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+          shopt -s nullglob
+          packages=(./ps5-payload-sdk-*.pkg.tar.*)
+          (( ${#packages[@]} == 1 )) || {
+            printf 'expected one payload SDK package, found %d\n' "${#packages[@]}" >&2
+            exit 1
+          }
+          sudo pacman --noconfirm -U "${packages[0]}"
 
       - name: Build PS5 libc++ headers
         working-directory: pacbrew-repo/libcxx
         run: |
           makepkg -c -f
-          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+          shopt -s nullglob
+          packages=(./ps5-payload-libcxx-*.pkg.tar.*)
+          (( ${#packages[@]} == 1 )) || {
+            printf 'expected one payload libc++ package, found %d\n' "${#packages[@]}" >&2
+            exit 1
+          }
+          sudo pacman --noconfirm -U "${packages[0]}"
 
-      - name: Build and verify libSceAmpr
-        run: make clean verify PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+      - name: Build and verify runtime variants
+        run: |
+          make clean-runtime-variants PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          make runtime-variants PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 
-      - name: Upload SPRX artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload runtime variants
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: libSceAmpr.sprx
-          path: out/payload-sdk/libSceAmpr.sprx
+          name: libSceAmpr-runtime-variants
+          path: |
+            out/payload-sdk-variants/*.prx
+            out/payload-sdk-variants/*.sprx
           if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
 
   release:
     needs: build
     permissions:
+      actions: read
       contents: write
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: libSceAmpr.sprx
+          name: libSceAmpr-runtime-variants
           path: dist
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: dist/libSceAmpr.sprx
+          files: dist/*.sprx
+          fail_on_unmatched_files: true
