@@ -48,7 +48,7 @@ void fd_cache_release_watermark_headroom(size_t reserve, const char* reason) {
     if (budget == 0) {
         return;
     }
-    const size_t observed = stats.open + ampr_index_fd_direct_open_count();
+    const size_t observed = stats.open + ampr_index_fd_uncached_open_count();
     const size_t projected = observed + reserve;
     const size_t high = fd_cache_watermark_value(budget, kFdCacheWatermarkHighPercent);
     if (projected < high) {

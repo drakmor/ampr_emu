@@ -7,46 +7,169 @@
 #include "ampr_debug_log.h"
 #include "ampr_emu_kernel_lookup.h"
 #include "ampr_emu_command_log.h"
+#include "ampr_emu_sync.h"
 #include "ampr_libkernel_hook.h"
 
 #include <cstdarg>
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <_kernel.h>
 
 namespace sce::Ampr::Emu {
 
+using KernelDebugOutTextFn = int (*)(int, const char*);
+static std::atomic<KernelDebugOutTextFn> g_kernelDebugOutText{nullptr};
+
+void setKernelDebugOutput(void* address) {
+    g_kernelDebugOutText.store(
+        reinterpret_cast<KernelDebugOutTextFn>(address),
+        std::memory_order_release);
+}
+
 void kernelDebugLogf(const char* fmt, ...) {
+    const int savedErrno = errno;
     if (!fmt || !*fmt) {
+        errno = savedErrno;
         return;
     }
 
-    char body[896]{};
+    KernelDebugOutTextFn const debugOut =
+        g_kernelDebugOutText.load(std::memory_order_acquire);
+    if (!debugOut) {
+        errno = savedErrno;
+        return;
+    }
+
+    char line[512]{};
+    static constexpr char kPrefix[] = "[AMPR_EMU] ";
+    static constexpr size_t kPrefixLength = sizeof(kPrefix) - 1u;
+    std::memcpy(line, kPrefix, kPrefixLength);
     va_list args;
     va_start(args, fmt);
-    const int bodyLen = vsnprintf(body, sizeof(body), fmt, args);
+    const int bodyLen = vsnprintf(line + kPrefixLength,
+                                  sizeof(line) - kPrefixLength - 1u,
+                                  fmt,
+                                  args);
     va_end(args);
     if (bodyLen <= 0) {
+        errno = savedErrno;
         return;
     }
-    body[sizeof(body) - 1u] = '\0';
 
-    char line[1024]{};
-    const int lineLen = snprintf(line, sizeof(line), "[AMPR_EMU] %s\n", body);
-    if (lineLen <= 0) {
-        return;
-    }
-    line[sizeof(line) - 1u] = '\0';
+    const size_t formattedLength = static_cast<size_t>(bodyLen);
+    const size_t bodyCapacity = sizeof(line) - kPrefixLength - 2u;
+    const size_t usedBody = formattedLength < bodyCapacity
+                                ? formattedLength
+                                : bodyCapacity;
+    const size_t lineLength = kPrefixLength + usedBody;
+    line[lineLength] = '\n';
+    line[lineLength + 1u] = '\0';
+    (void)debugOut(AMPR_EMU_DEBUG_LOG_KERNEL_OUT_CHANNEL, line);
+    errno = savedErrno;
+}
 
-    using KernelDebugOutTextFn = int (*)(int, const char*);
-    void* address = nullptr;
-    const int dlsymRc = sceKernelDlsym(static_cast<SceKernelModule>(0x2001),
-                                       "sceKernelDebugOutText",
-                                       &address);
-    if (dlsymRc == 0 && address) {
-        auto* const debugOut = reinterpret_cast<KernelDebugOutTextFn>(address);
-        (void)debugOut(AMPR_EMU_DEBUG_LOG_KERNEL_OUT_CHANNEL, line);
+#if AMPR_EMU_DEBUG_LOG
+static const char* kernelIoErrorText(int errorNumber) {
+    switch (errorNumber) {
+        case EACCES: return "Permission denied";
+        case EAGAIN: return "Resource temporarily unavailable";
+        case EBADF: return "Bad file descriptor";
+        case EBUSY: return "Device or resource busy";
+        case EEXIST: return "File exists";
+        case EFAULT: return "Bad address";
+        case EINTR: return "Interrupted system call";
+        case EINVAL: return "Invalid argument";
+        case EIO: return "Input/output error";
+        case EISDIR: return "Is a directory";
+        case EMFILE: return "Too many open files";
+        case ENAMETOOLONG: return "File name too long";
+        case ENFILE: return "Too many open files in system";
+        case ENOENT: return "No such file or directory";
+        case ENOMEM: return "Cannot allocate memory";
+        case ENOSPC: return "No space left on device";
+        case ENOTDIR: return "Not a directory";
+        case ENOTEMPTY: return "Directory not empty";
+        case ENOTSUP: return "Operation not supported";
+        case EPERM: return "Operation not permitted";
+        case EROFS: return "Read-only file system";
+        default: return "Unknown error";
     }
 }
+
+void kernelIoErrorLog(const char* functionName,
+                      const char* outputName,
+                      int outputIndex,
+                      long long code,
+                      int errorNumber,
+                      const char* contextName,
+                      const char* contextValue,
+                      const char* context2Name,
+                      const char* context2Value) {
+    const int savedErrno = errno;
+    const char* const errorText = kernelIoErrorText(errorNumber);
+    KernelDebugOutTextFn const debugOut =
+        g_kernelDebugOutText.load(std::memory_order_acquire);
+    if (!debugOut) {
+        errno = savedErrno;
+        return;
+    }
+
+    char line[512]{};
+    const bool hasContext = contextName && contextValue;
+    const bool hasContext2 = hasContext && context2Name && context2Value;
+    const int length = hasContext2
+        ? snprintf(
+              line,
+              sizeof(line),
+              "[AMPR_EMU] io.hook.error function=%s output=%s index=%d code=%lld codeHex=0x%llx errno=%d text=%s %.16s=%.160s %.16s=%.160s\n",
+              functionName ? functionName : "(unknown)",
+              outputName ? outputName : "return",
+              outputIndex,
+              code,
+              static_cast<unsigned long long>(code),
+              errorNumber,
+              errorText,
+              contextName,
+              contextValue,
+              context2Name,
+              context2Value)
+        : hasContext
+              ? snprintf(
+                    line,
+                    sizeof(line),
+                    "[AMPR_EMU] io.hook.error function=%s output=%s index=%d code=%lld codeHex=0x%llx errno=%d text=%s %.16s=%.256s\n",
+                    functionName ? functionName : "(unknown)",
+                    outputName ? outputName : "return",
+                    outputIndex,
+                    code,
+                    static_cast<unsigned long long>(code),
+                    errorNumber,
+                    errorText,
+                    contextName,
+                    contextValue)
+              : snprintf(
+              line,
+              sizeof(line),
+              "[AMPR_EMU] io.hook.error function=%s output=%s index=%d code=%lld codeHex=0x%llx errno=%d text=%s\n",
+              functionName ? functionName : "(unknown)",
+              outputName ? outputName : "return",
+              outputIndex,
+              code,
+              static_cast<unsigned long long>(code),
+              errorNumber,
+              errorText);
+    if (length > 0) {
+        if (static_cast<size_t>(length) >= sizeof(line)) {
+            line[sizeof(line) - 2u] = '\n';
+            line[sizeof(line) - 1u] = '\0';
+        }
+        (void)debugOut(AMPR_EMU_DEBUG_LOG_KERNEL_OUT_CHANNEL, line);
+    }
+    errno = savedErrno;
+}
+#endif
 
 } // namespace sce::Ampr::Emu
 
@@ -180,8 +303,59 @@ inline void debugLogUnlockLifecycle(AmprDebugLogState& state) {
 }
 
 inline uint32_t debugLogThreadTag() {
+#if AMPR_PAYLOAD_SDK_BUILD
+    const uintptr_t thread = reinterpret_cast<uintptr_t>(scePthreadSelf());
+    return static_cast<uint32_t>(thread ^ (thread >> 32u));
+#else
     static thread_local uint32_t tag = debugLogState().nextThreadTag.fetch_add(1u, std::memory_order_relaxed);
     return tag;
+#endif
+}
+
+#if AMPR_PAYLOAD_SDK_BUILD
+constexpr size_t kDebugLogRecursionSlotCount = 64u;
+std::atomic<uintptr_t> g_debugLogRecursionOwners[kDebugLogRecursionSlotCount]{};
+
+struct DebugLogRecursionToken {
+    size_t slot{kDebugLogRecursionSlotCount};
+};
+
+inline bool debugLogEnter(DebugLogRecursionToken* token) {
+    uintptr_t owner = reinterpret_cast<uintptr_t>(scePthreadSelf());
+    owner = owner != 0 ? owner : 1u;
+    const size_t first = static_cast<size_t>((owner >> 4u) &
+                                             (kDebugLogRecursionSlotCount - 1u));
+    for (size_t probe = 0; probe < kDebugLogRecursionSlotCount; ++probe) {
+        const size_t slot = (first + probe) & (kDebugLogRecursionSlotCount - 1u);
+        uintptr_t observed = g_debugLogRecursionOwners[slot].load(
+            std::memory_order_acquire);
+        if (observed == owner) {
+            return false;
+        }
+        if (observed == 0 &&
+            g_debugLogRecursionOwners[slot].compare_exchange_strong(
+                observed, owner, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            token->slot = slot;
+            return true;
+        }
+    }
+    return false;
+}
+
+inline void debugLogLeave(const DebugLogRecursionToken& token) {
+    if (token.slot < kDebugLogRecursionSlotCount) {
+        g_debugLogRecursionOwners[token.slot].store(0, std::memory_order_release);
+    }
+}
+#endif
+
+inline bool debugLogUtcTime(const time_t* raw, struct tm* utc) {
+#if AMPR_PAYLOAD_SDK_BUILD
+    return gmtime_r(raw, utc) != nullptr;
+#else
+    return gmtime_s(raw, utc) != nullptr;
+#endif
 }
 
 inline void debugLogFormatEventTime(char* out, size_t outSize) {
@@ -199,7 +373,7 @@ inline void debugLogFormatEventTime(char* out, size_t outSize) {
     const time_t raw = static_cast<time_t>(now.tv_sec);
     struct tm utc {};
     char date[32] {};
-    if (!gmtime_s(&raw, &utc) || strftime(date, sizeof(date), "%Y-%m-%dT%H:%M:%S", &utc) == 0) {
+    if (!debugLogUtcTime(&raw, &utc) || strftime(date, sizeof(date), "%Y-%m-%dT%H:%M:%S", &utc) == 0) {
         snprintf(out, outSize, "unavailable");
         return;
     }
@@ -208,12 +382,14 @@ inline void debugLogFormatEventTime(char* out, size_t outSize) {
 }
 
 inline int debugLogKernelOpen(const char* path, int flags, SceKernelMode mode) {
-    if (!amprLibkernelHooksInstalled()) {
-        return -1;
-    }
     using Fn = int (*)(const char*, int, SceKernelMode);
-    Fn fn = ampr_fixed_kernel_slot<Fn>(kAmprLibkernelHook_sceKernelOpen);
-    return fn(path, flags, mode);
+    if (Fn fn = ampr_fixed_kernel_slot<Fn>(kAmprLibkernelHook_open)) {
+        return fn(path, flags, mode);
+    }
+    if (Fn fn = ampr_dynamic_kernel_func_or_null<Fn>("open")) {
+        return fn(path, flags, mode);
+    }
+    return -1;
 }
 
 inline ssize_t debugLogKernelWrite(int fd, const void* data, size_t len) {
@@ -225,7 +401,14 @@ inline int debugLogKernelFsync(int fd) {
 }
 
 inline int debugLogKernelClose(int fd) {
-    return sceKernelClose(fd);
+    using Fn = int (*)(int);
+#if AMPR_EMU_PACK_ENABLE && (AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE || AMPR_EMU_PACK_PROCESS_OPEN_ENABLE)
+    if (Fn fn = ampr_fixed_kernel_slot<Fn>(kAmprLibkernelHook_close)) {
+        return fn(fd);
+    }
+#endif
+    if (Fn fn = ampr_dynamic_kernel_func_or_null<Fn>("close")) return fn(fd);
+    return -1;
 }
 
 inline int debugLogKernelUsleep(SceKernelUseconds usec) {
@@ -605,7 +788,7 @@ inline void debugLogQueueStartupInfoLocked(AmprDebugLogState& state, uint32_t th
     const time_t timeBombRaw = static_cast<time_t>(AMPR_EMU_TIME_LIMIT_UNIX_SECONDS);
     struct tm timeBombUtc {};
     char timeBombDate[32] = "(unavailable)";
-    if (gmtime_s(&timeBombRaw, &timeBombUtc)) {
+    if (debugLogUtcTime(&timeBombRaw, &timeBombUtc)) {
         (void)strftime(timeBombDate, sizeof(timeBombDate), "%Y-%m-%dT%H:%M:%SZ", &timeBombUtc);
     }
 
@@ -742,10 +925,13 @@ inline bool debugLogEnqueueBody(const char* body,
 #endif
 }
 
-void shutdownDebugLog() {
+int shutdownDebugLog() {
+    static AmprMutex stopMutex;
+    AmprLockGuard stopGuard(stopMutex);
     // Stop/drain the auxiliary command journal while the main text logger is
     // still alive so its writer summary and diagnostics can be queued safely.
-    shutdownCommandLog();
+    const int commandRc = shutdownCommandLog();
+    if (commandRc != 0) return commandRc;
 
     auto& state = debugLogState();
     while (!debugLogTryLockLifecycle(state)) {
@@ -761,46 +947,81 @@ void shutdownDebugLog() {
     const bool joinWriter = state.writerStarted.load(std::memory_order_acquire) &&
                             state.writerJoinable;
     const ScePthread writer = state.writer;
-    state.writerJoinable = false;
     debugLogUnlockLifecycle(state);
 
     if (joinWriter) {
-        (void)scePthreadJoin(writer, nullptr);
+        const int rc = scePthreadJoin(writer, nullptr);
+        if (rc != 0) return rc;
+        while (!debugLogTryLockLifecycle(state)) {
+            (void)debugLogKernelUsleep(200ll);
+        }
+        state.writerJoinable = false;
+        debugLogUnlockLifecycle(state);
     } else {
         debugLogCloseForWriter(state);
     }
     debugLogDeleteWriterWakeSema(state);
+    return 0;
 }
 
 void debugLogLine(const char* rawLine) {
+#if AMPR_PAYLOAD_SDK_BUILD
+    DebugLogRecursionToken recursionToken{};
+#else
     static thread_local bool inLogger = false;
+#endif
     if (!rawLine || !*rawLine || !getDebugLogEnabled()) {
         return;
     }
+#if AMPR_PAYLOAD_SDK_BUILD
+    if (!debugLogEnter(&recursionToken)) {
+        return;
+    }
+#else
     if (inLogger) {
         return;
     }
     inLogger = true;
+#endif
     debugLogKernelOutLine(rawLine, false);
     uint64_t sequence = 0;
     bool critical = false;
     const bool queued = debugLogEnqueueBody(rawLine, false, &sequence, &critical);
+#if AMPR_PAYLOAD_SDK_BUILD
+    debugLogLeave(recursionToken);
+#else
     inLogger = false;
+#endif
     if (queued) {
         debugLogWaitForCriticalFlush(sequence, critical);
     }
 }
 
 static void debugLogV(bool criticalEntry, const char* fmt, va_list args) {
+#if AMPR_PAYLOAD_SDK_BUILD
+    DebugLogRecursionToken recursionToken{};
+#else
     static thread_local bool inLogger = false;
+#endif
+#if AMPR_PAYLOAD_SDK_BUILD
+    if (!fmt || !*fmt || !getDebugLogEnabled() ||
+        !debugLogEnter(&recursionToken)) {
+#else
     if (!fmt || !*fmt || !getDebugLogEnabled() || inLogger) {
+#endif
         return;
     }
+#if !AMPR_PAYLOAD_SDK_BUILD
     inLogger = true;
+#endif
     char line[kAmprDebugLogLineCapacity];
     const int written = vsnprintf(line, sizeof(line), fmt, args);
     if (written <= 0) {
+#if AMPR_PAYLOAD_SDK_BUILD
+        debugLogLeave(recursionToken);
+#else
         inLogger = false;
+#endif
         return;
     }
     line[sizeof(line) - 1u] = '\0';
@@ -809,7 +1030,11 @@ static void debugLogV(bool criticalEntry, const char* fmt, va_list args) {
     bool queuedCritical = false;
     const bool queued = debugLogEnqueueBody(
         line, criticalEntry, &sequence, &queuedCritical);
+#if AMPR_PAYLOAD_SDK_BUILD
+    debugLogLeave(recursionToken);
+#else
     inLogger = false;
+#endif
     if (queued) {
         debugLogWaitForCriticalFlush(sequence, queuedCritical);
     }

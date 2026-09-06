@@ -5,6 +5,7 @@
  */
 
 #include "ampr_emu_amm.h"
+#include "ampr_emu_index.h"
 #include "ampr_emu_kernel_amm.h"
 #include "ampr_emu_kernel_lookup.h"
 #include "ampr_emu_kernel_memory.h"
@@ -42,7 +43,7 @@ using AmmWriteModifyProtectWithGpuMaskIdCommandFn = int (*)(void*, uint64_t, uin
 using AmmWriteModifyMtypeProtectCommandFn = int (*)(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t*);
 using AmmWriteModifyMtypeProtectWithGpuMaskIdCommandFn = int (*)(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t*);
 
-static constexpr int kAmmSubmitRetryRc = -2147352541;
+using sce::Ampr::Emu::kAmmSubmitRetryRc;
 static constexpr unsigned int kAmmSubmitRetrySleepUsec = 0xC8u;
 static constexpr unsigned int kAmmSubmitMaxPriority = 2u;
 
@@ -924,6 +925,13 @@ int ammGetVirtualAddressRangesLeaf(uint64_t* vaStart,
               (void*)(uintptr_t)*vaEnd,
               (void*)(uintptr_t)*multimapVaStart,
               (void*)(uintptr_t)*multimapVaEnd);
+
+    // This service is part of title AMPR initialization and is not entered
+    // through a libkernel process hook. Finish the immutable AMPRIDX3 plus pack
+    // manifest publication before the title can issue its first packed-only
+    // process open. Process hooks remain allocation-free and never wait or
+    // start file I/O themselves.
+    (void)ampr_index_ensure_ready_safe();
     return 0;
 }
 
@@ -1054,6 +1062,14 @@ int ammSubmitCommandBufferAndGetResultLeaf(uint64_t bufferBase,
                            id ? *id : 0u);
     }
     return rc;
+}
+
+int ammTrySubmitCommandBufferLeaf(uint64_t bufferBase,
+                                 uint32_t currentOffset,
+                                 uint32_t prio) {
+    const int validateRc = amm_validate_submit_args(bufferBase, prio);
+    if (validateRc != 0) return validateRc;
+    return kRealCallIndirectBuffer(prio, bufferBase, currentOffset);
 }
 
 int ammSubmitCommandBufferLeaf(uint64_t bufferBase,

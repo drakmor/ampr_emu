@@ -95,6 +95,8 @@ int32_t sceKernelMtypeprotect(const void *address, size_t size, int type,
 int32_t sceKernelAvailableDirectMemorySize(off_t start, off_t end,
                                             size_t alignment, off_t *outStart,
                                             size_t *outSize);
+int32_t sceKernelGetPageTableStats(int *cpuTotal, int *cpuAvailable,
+                                   int *gpuTotal, int *gpuAvailable);
 int32_t sceKernelMemoryPoolBatch(const SceKernelMemoryPoolBatchEntry *entries,
                                  int count, int *completed, int flags);
 int32_t sceKernelMemoryPoolCommit(void *address, size_t length, int type,

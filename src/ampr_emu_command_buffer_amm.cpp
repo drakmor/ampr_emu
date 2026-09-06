@@ -29,7 +29,8 @@ static int cb_append_amm_kernel_record(SceAmprCommandBuffer* cb,
 
     uint64_t bytes64 = 0;
     uint32_t bytes = 0;
-    const int measureRc = Emu::ammCommandSizeToInt(measure(&bytes64), bytes64, &bytes);
+    const int writerMeasureRc = measure(&bytes64);
+    const int measureRc = Emu::ammCommandSizeToInt(writerMeasureRc, bytes64, &bytes);
     if (measureRc < 0) {
         return measureRc;
     }

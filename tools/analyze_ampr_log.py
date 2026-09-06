@@ -362,7 +362,9 @@ class ReactorBatchAggregate:
     failed_calls: int = 0
     singleton_calls: int = 0
     max_items: int = 0
+    max_window_p95_items: int = 0
     capacity: int = 0
+    combined_limit: int = 0
     rounds: int = 0
     round_items: int = 0
     full_rounds: int = 0
@@ -502,6 +504,60 @@ class MapEvent:
     reason: Optional[str] = None
     job: Optional[int] = None
     body: str = ""
+
+
+@dataclass
+class PackIoTelemetry:
+    line: int
+    seq: int
+    reason: str
+    workers: int
+    physical_samples: int
+    physical_ops: int
+    physical_bytes: int
+    physical_read_ahead_ops: int
+    physical_read_ahead_bytes: int
+    physical_usec: int
+    physical_max_usec: int
+    physical_slow_1ms: int
+    physical_slow_5ms: int
+    physical_slow_20ms: int
+    physical_le_64k: int
+    physical_le_512k: int
+    physical_gt_512k: int
+    physical_in_flight: int
+    physical_in_flight_peak: int
+    backing_aio_submit_batches: int
+    backing_aio_submit_requests: int
+    backing_aio_submit_eagain: int
+    backing_aio_submit_failures: int
+    backing_aio_poll_failures: int
+    backing_aio_delete_failures: int
+    pipeline_capacity: int
+    pipeline_active: int
+    pipeline_active_peak: int
+    pipeline_runnable: int
+    pipeline_running: int
+    pipeline_io_queued: int
+    pipeline_io_submitted: int
+    pipeline_cache_wait: int
+    pipeline_fd_wait: int
+    pipeline_io_yields: int
+    pipeline_cache_yields: int
+    pipeline_fd_yields: int
+    worker_jobs: int
+    worker_usec: int
+    worker_max_usec: int
+    workers_busy: int
+    workers_busy_peak: int
+    queue_wait_usec: int
+    queue_wait_max_usec: int
+    queue_wait_slow_1ms: int
+    queue_wait_slow_5ms: int
+    queue_wait_slow_20ms: int
+    queue_depth_latency: int
+    queue_depth_balanced: int
+    queue_depth_bulk: int
 
 
 @dataclass
@@ -662,6 +718,10 @@ class LogStats:
     admission_priority_latency: Dict[int, Dict[str, WindowLatencyAggregate]] = field(
         default_factory=dict
     )
+    completion_priority_latency: Dict[int, WindowLatencyAggregate] = field(
+        default_factory=dict
+    )
+    aio_latency_escape_accepted: int = 0
     aio_batch_metrics: ReactorBatchAggregate = field(default_factory=ReactorBatchAggregate)
     aio_io_metrics: ReactorIoAggregate = field(default_factory=ReactorIoAggregate)
     adaptive_read_window: AdaptiveReadWindowAggregate = field(
@@ -669,6 +729,11 @@ class LogStats:
     )
     fd_statuses: List[FdStatus] = field(default_factory=list)
     heap_statuses: List[HeapStatus] = field(default_factory=list)
+    pack_io_telemetry_lines: int = 0
+    pack_io_telemetry: Optional[PackIoTelemetry] = None
+    pack_metrics: Optional[Dict[str, object]] = None
+    pack_latency: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    pack_profile: Dict[str, object] = field(default_factory=dict)
     index_runtime_build_started: Optional[Tuple[int, int, str]] = None
     index_built: Optional[Tuple[int, int, str]] = None
     index_saved: Optional[Tuple[int, int, str]] = None
@@ -717,6 +782,18 @@ def parse_int(value: Optional[str]) -> Optional[int]:
         return int(value, 0)
     except ValueError:
         return None
+
+
+def parse_int_triplet(value: Optional[str]) -> Tuple[int, int, int]:
+    if not value:
+        return (0, 0, 0)
+    parts = value.rstrip(",").split("/")
+    if len(parts) != 3:
+        return (0, 0, 0)
+    parsed = [parse_int(part) for part in parts]
+    if any(part is None for part in parsed):
+        return (0, 0, 0)
+    return (parsed[0] or 0, parsed[1] or 0, parsed[2] or 0)
 
 
 def add_window_latency(
@@ -1216,6 +1293,89 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
     stats.last_seq = seq
 
     kv = parse_kv(body)
+    if prefix in ("apr.pack.profile.request", "apr.pack.profile.effective"):
+        stats.pack_profile[prefix.rsplit(".", 1)[1]] = {
+            key: parse_int(value) for key, value in kv.items()
+        }
+    elif prefix == "apr.pack.metrics":
+        fields = ("loaded", "decodedTarget", "physicalTarget", "decodedAllocated",
+                  "physicalAllocated", "requestedWorkers", "workers", "reserve",
+                  "completed", "failed", "delivered", "physical", "stored",
+                  "cacheHit", "cacheMiss", "cacheEviction", "pageHit", "pageMiss",
+                  "pageEviction", "inline")
+        stats.pack_metrics = {key: parse_int(kv.get(key)) for key in fields}
+        stats.pack_metrics.update(line=line_no, seq=seq, reason=kv.get("reason", ""))
+        stats.pack_latency.clear()
+    elif prefix == "apr.pack.latency":
+        kind = kv.get("kind", "")
+        if kind in ("logical", "latency_class", "physical", "queue", "worker"):
+            sample = {key: parse_int(kv.get(key))
+                      for key in ("samples", "p50", "p95", "p99", "overflow")}
+            for key in ("p50", "p95", "p99"):
+                if not sample["samples"] or sample[key] == (1 << 64) - 1:
+                    sample[key] = None
+            stats.pack_latency[kind] = sample
+    if prefix == "apr.pack.io.telemetry":
+        queue_depth = parse_int_triplet(kv.get("qDepth") or kv.get("queueDepth"))
+        stats.pack_io_telemetry_lines += 1
+        stats.pack_io_telemetry = PackIoTelemetry(
+            line=line_no,
+            seq=seq,
+            reason=kv.get("reason", ""),
+            workers=parse_int(kv.get("workers")) or 0,
+            physical_samples=parse_int(kv.get("pSamples") or kv.get("physicalSamples")) or 0,
+            physical_ops=parse_int(kv.get("pOps") or kv.get("physicalOps")) or 0,
+            physical_bytes=parse_int(kv.get("pBytes") or kv.get("physicalBytes")) or 0,
+            physical_read_ahead_ops=parse_int(
+                kv.get("pRaOps") or kv.get("physicalReadAheadOps")
+            ) or 0,
+            physical_read_ahead_bytes=parse_int(
+                kv.get("pRaBytes") or kv.get("physicalReadAheadBytes")
+            ) or 0,
+            physical_usec=parse_int(kv.get("pUsec") or kv.get("physicalUsec")) or 0,
+            physical_max_usec=parse_int(kv.get("pMax") or kv.get("physicalMaxUsec")) or 0,
+            physical_slow_1ms=parse_int(kv.get("pSlow1") or kv.get("physicalSlow1ms")) or 0,
+            physical_slow_5ms=parse_int(kv.get("pSlow5") or kv.get("physicalSlow5ms")) or 0,
+            physical_slow_20ms=parse_int(kv.get("pSlow20") or kv.get("physicalSlow20ms")) or 0,
+            physical_le_64k=parse_int(kv.get("pLe64") or kv.get("physicalLe64K")) or 0,
+            physical_le_512k=parse_int(kv.get("pLe512") or kv.get("physicalLe512K")) or 0,
+            physical_gt_512k=parse_int(kv.get("pGt512") or kv.get("physicalGt512K")) or 0,
+            physical_in_flight=parse_int(kv.get("pActive") or kv.get("physicalInFlight")) or 0,
+            physical_in_flight_peak=parse_int(
+                kv.get("pPeak") or kv.get("physicalInFlightPeak")
+            ) or 0,
+            backing_aio_submit_batches=parse_int(kv.get("aioBatches")) or 0,
+            backing_aio_submit_requests=parse_int(kv.get("aioRequests")) or 0,
+            backing_aio_submit_eagain=parse_int(kv.get("aioEagain")) or 0,
+            backing_aio_submit_failures=parse_int(kv.get("aioSubmitFail")) or 0,
+            backing_aio_poll_failures=parse_int(kv.get("aioPollFail")) or 0,
+            backing_aio_delete_failures=parse_int(kv.get("aioDeleteFail")) or 0,
+            pipeline_capacity=parse_int(kv.get("pipeCap")) or 0,
+            pipeline_active=parse_int(kv.get("pipeActive")) or 0,
+            pipeline_active_peak=parse_int(kv.get("pipePeak")) or 0,
+            pipeline_runnable=parse_int(kv.get("pipeRunnable")) or 0,
+            pipeline_running=parse_int(kv.get("pipeRunning")) or 0,
+            pipeline_io_queued=parse_int(kv.get("pipeIoQueued")) or 0,
+            pipeline_io_submitted=parse_int(kv.get("pipeIoSubmitted")) or 0,
+            pipeline_cache_wait=parse_int(kv.get("pipeCacheWait")) or 0,
+            pipeline_fd_wait=parse_int(kv.get("pipeFdWait")) or 0,
+            pipeline_io_yields=parse_int(kv.get("pipeIoYields")) or 0,
+            pipeline_cache_yields=parse_int(kv.get("pipeCacheYields")) or 0,
+            pipeline_fd_yields=parse_int(kv.get("pipeFdYields")) or 0,
+            worker_jobs=parse_int(kv.get("wJobs") or kv.get("workerJobs")) or 0,
+            worker_usec=parse_int(kv.get("wUsec") or kv.get("workerUsec")) or 0,
+            worker_max_usec=parse_int(kv.get("wMax") or kv.get("workerMaxUsec")) or 0,
+            workers_busy=parse_int(kv.get("wBusy") or kv.get("workersBusy")) or 0,
+            workers_busy_peak=parse_int(kv.get("wPeak") or kv.get("workersBusyPeak")) or 0,
+            queue_wait_usec=parse_int(kv.get("qUsec") or kv.get("queueWaitUsec")) or 0,
+            queue_wait_max_usec=parse_int(kv.get("qMax") or kv.get("queueWaitMaxUsec")) or 0,
+            queue_wait_slow_1ms=parse_int(kv.get("qSlow1") or kv.get("queueWaitSlow1ms")) or 0,
+            queue_wait_slow_5ms=parse_int(kv.get("qSlow5") or kv.get("queueWaitSlow5ms")) or 0,
+            queue_wait_slow_20ms=parse_int(kv.get("qSlow20") or kv.get("queueWaitSlow20ms")) or 0,
+            queue_depth_latency=queue_depth[0],
+            queue_depth_balanced=queue_depth[1],
+            queue_depth_bulk=queue_depth[2],
+        )
     read_chains = parse_int(kv.get("readChains"))
     if "activeLanes" in kv:
         stats.saw_active_lanes_field = True
@@ -1850,6 +2010,14 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
             )
             stats.saw_cursor_direct_read_metrics |= stem == "readReadyAio"
 
+    elif prefix == "apr.reactor.counters.completion.prio":
+        priority = parse_int(kv.get("aprPrio"))
+        if priority is not None and 0 <= priority < APR_PRIORITY_LANES:
+            aggregate = stats.completion_priority_latency.setdefault(
+                priority, WindowLatencyAggregate()
+            )
+            add_window_latency(aggregate, kv, "aioComplete")
+
     elif prefix == "apr.reactor.counters.batch":
         batch = stats.aio_batch_metrics
         batch.windows += 1
@@ -1860,7 +2028,15 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
         batch.failed_calls += parse_int(kv.get("aioBatchFailedCalls")) or 0
         batch.singleton_calls += parse_int(kv.get("aioBatchSingletonCalls")) or 0
         batch.max_items = max(batch.max_items, parse_int(kv.get("aioBatchMaxItems")) or 0)
+        batch.max_window_p95_items = max(
+            batch.max_window_p95_items,
+            parse_int(kv.get("aioBatchP95Items")) or 0,
+        )
         batch.capacity += parse_int(kv.get("aioBatchCapacity")) or 0
+        batch.combined_limit = max(
+            batch.combined_limit,
+            parse_int(kv.get("combinedLimit")) or 0,
+        )
         batch.rounds += parse_int(kv.get("aioBatchRounds")) or 0
         batch.round_items += parse_int(kv.get("aioBatchRoundItems")) or 0
         batch.full_rounds += parse_int(kv.get("aioBatchFullRounds")) or 0
@@ -1873,6 +2049,14 @@ def analyze_line(stats: LogStats, line_no: int, seq: int, thread: str, body: str
             stats.aio_batch_metrics.apr_priority_items[priority] += (
                 parse_int(kv.get(f"apr{priority}Items")) or 0
             )
+
+    elif prefix in (
+        "apr.reactor.counters.admission.escape",
+        "apr.reactor.counters.runtime",
+    ):
+        stats.aio_latency_escape_accepted += (
+            parse_int(kv.get("aioLatencyEscapeAccepted")) or 0
+        )
 
     elif prefix == "apr.reactor.counters.io":
         io = stats.aio_io_metrics
@@ -3098,6 +3282,160 @@ def build_findings(stats: LogStats) -> List[str]:
     return findings
 
 
+def pack_metrics_analysis(stats: LogStats) -> Optional[Dict[str, object]]:
+    if stats.pack_metrics is None:
+        return None
+    result = dict(stats.pack_metrics)
+    def ratio(numerator: str, denominator: str) -> Optional[float]:
+        a, b = result.get(numerator), result.get(denominator)
+        return a / b if a is not None and b else None
+    def hit_rate(hit: str, miss: str) -> Optional[float]:
+        a, b = result.get(hit), result.get(miss)
+        return a / (a + b) if a is not None and b is not None and a + b else None
+    result.update(
+        physical_per_delivered_byte=ratio("physical", "delivered"),
+        physical_per_stored_byte=ratio("physical", "stored"),
+        decoded_lookup_hit_rate=hit_rate("cacheHit", "cacheMiss"),
+        physical_lookup_hit_rate=hit_rate("pageHit", "pageMiss"),
+        latency_upper_bound_usec=stats.pack_latency,
+        latency_snapshot_complete=len(stats.pack_latency) == 5,
+        profile=stats.pack_profile,
+    )
+    return result
+
+
+def pack_io_analysis(sample: PackIoTelemetry) -> Dict[str, object]:
+    physical_average = (
+        sample.physical_usec / sample.physical_samples
+        if sample.physical_samples
+        else 0.0
+    )
+    worker_average = (
+        sample.worker_usec / sample.worker_jobs if sample.worker_jobs else 0.0
+    )
+    queue_average = (
+        sample.queue_wait_usec / sample.worker_jobs if sample.worker_jobs else 0.0
+    )
+    worker_saturated = (
+        sample.workers > 0 and sample.workers_busy_peak >= sample.workers
+    )
+    queue_backlogged = (
+        sample.queue_wait_max_usec >= 5000
+        or sample.queue_wait_slow_5ms > 0
+        or sample.queue_depth_latency > 0
+        or sample.queue_depth_balanced > 0
+        or sample.queue_depth_bulk > 0
+    )
+    pipeline_enabled = sample.pipeline_capacity > 0
+    pipeline_saturated = (
+        pipeline_enabled
+        and sample.pipeline_active_peak >= sample.pipeline_capacity
+    )
+    native_capacity_pressure = sample.backing_aio_submit_eagain > 0
+    native_lifecycle_failures = (
+        sample.backing_aio_submit_failures
+        + sample.backing_aio_poll_failures
+        + sample.backing_aio_delete_failures
+    )
+    cache_contention = sample.pipeline_cache_yields > 0
+    fd_contention = sample.pipeline_fd_yields > 0
+    if not pipeline_enabled:
+        bottleneck = "legacy-pre-pipeline"
+    elif native_lifecycle_failures:
+        bottleneck = "native-aio-errors"
+    elif native_capacity_pressure and queue_backlogged:
+        bottleneck = "native-aio-capacity"
+    elif pipeline_saturated and queue_backlogged:
+        bottleneck = "pipeline-context-capacity"
+    elif worker_saturated and queue_backlogged:
+        bottleneck = "decode-workers"
+    elif cache_contention and queue_backlogged:
+        bottleneck = "cache-loading"
+    else:
+        bottleneck = "none-observed"
+    return {
+        "line": sample.line,
+        "seq": sample.seq,
+        "reason": sample.reason,
+        "telemetry_lines": 0,
+        "workers": sample.workers,
+        "physical": {
+            "samples": sample.physical_samples,
+            "successful_ops": sample.physical_ops,
+            "bytes": sample.physical_bytes,
+            "read_ahead_ops": sample.physical_read_ahead_ops,
+            "read_ahead_bytes": sample.physical_read_ahead_bytes,
+            "total_usec": sample.physical_usec,
+            "average_usec": physical_average,
+            "max_usec": sample.physical_max_usec,
+            "slow_1ms": sample.physical_slow_1ms,
+            "slow_5ms": sample.physical_slow_5ms,
+            "slow_20ms": sample.physical_slow_20ms,
+            "size_buckets": {
+                "le_64k": sample.physical_le_64k,
+                "gt_64k_le_512k": sample.physical_le_512k,
+                "gt_512k": sample.physical_gt_512k,
+            },
+            "in_flight": sample.physical_in_flight,
+            "in_flight_peak": sample.physical_in_flight_peak,
+        },
+        "native_aio": {
+            "submit_batches": sample.backing_aio_submit_batches,
+            "submit_requests": sample.backing_aio_submit_requests,
+            "submit_eagain": sample.backing_aio_submit_eagain,
+            "submit_failures": sample.backing_aio_submit_failures,
+            "poll_failures": sample.backing_aio_poll_failures,
+            "delete_failures": sample.backing_aio_delete_failures,
+        },
+        "pipeline": {
+            "capacity": sample.pipeline_capacity,
+            "active": sample.pipeline_active,
+            "active_peak": sample.pipeline_active_peak,
+            "runnable": sample.pipeline_runnable,
+            "running": sample.pipeline_running,
+            "io_queued": sample.pipeline_io_queued,
+            "io_submitted": sample.pipeline_io_submitted,
+            "cache_wait": sample.pipeline_cache_wait,
+            "fd_wait": sample.pipeline_fd_wait,
+            "io_yields": sample.pipeline_io_yields,
+            "cache_yields": sample.pipeline_cache_yields,
+            "fd_yields": sample.pipeline_fd_yields,
+        },
+        "worker": {
+            "jobs": sample.worker_jobs,
+            "total_usec": sample.worker_usec,
+            "average_usec": worker_average,
+            "max_usec": sample.worker_max_usec,
+            "busy": sample.workers_busy,
+            "busy_peak": sample.workers_busy_peak,
+        },
+        "queue": {
+            "total_wait_usec": sample.queue_wait_usec,
+            "average_wait_usec": queue_average,
+            "max_wait_usec": sample.queue_wait_max_usec,
+            "slow_1ms": sample.queue_wait_slow_1ms,
+            "slow_5ms": sample.queue_wait_slow_5ms,
+            "slow_20ms": sample.queue_wait_slow_20ms,
+            "depth": {
+                "latency": sample.queue_depth_latency,
+                "balanced": sample.queue_depth_balanced,
+                "bulk": sample.queue_depth_bulk,
+            },
+        },
+        "assessment": {
+            "pipeline_enabled": pipeline_enabled,
+            "pipeline_saturated": pipeline_saturated,
+            "native_capacity_pressure": native_capacity_pressure,
+            "native_lifecycle_failures": native_lifecycle_failures,
+            "worker_saturated": worker_saturated,
+            "queue_backlogged": queue_backlogged,
+            "cache_contention": cache_contention,
+            "fd_contention": fd_contention,
+            "bottleneck": bottleneck,
+        },
+    }
+
+
 def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
     active_label = reactor_active_label(stats)
     print(f"AMPR log analysis: {stats.path}")
@@ -3162,6 +3500,97 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
         if len(stats.heap_statuses) > 1:
             tags = ", ".join(f"{item.tag}@{item.seq}" for item in stats.heap_statuses[-5:])
             print(f"  recent tags:         {tags}")
+        print("")
+
+    metrics = pack_metrics_analysis(stats)
+    if metrics is not None:
+        print("PACK METRICS (latest cumulative snapshot)")
+        print(f"  delivered/physical:  {metrics['delivered']}/{metrics['physical']} bytes; failures={metrics['failed']}")
+        print(f"  allocated caches:    decoded={metrics['decodedAllocated']} physical={metrics['physicalAllocated']} bytes")
+        print(f"  lookup hit rates:    decoded={metrics['decoded_lookup_hit_rate']} physical={metrics['physical_lookup_hit_rate']}")
+        for kind, sample in stats.pack_latency.items():
+            print(f"  {kind}: samples={sample['samples']} p50/p95/p99 upper usec={sample['p50']}/{sample['p95']}/{sample['p99']}")
+        if not metrics["latency_snapshot_complete"]:
+            print("  incomplete latency snapshot (missing/truncated records)")
+        print("")
+    if stats.pack_io_telemetry is not None:
+        pack_io = pack_io_analysis(stats.pack_io_telemetry)
+        pack_io["telemetry_lines"] = stats.pack_io_telemetry_lines
+        physical = pack_io["physical"]
+        native_aio = pack_io["native_aio"]
+        pipeline = pack_io["pipeline"]
+        worker = pack_io["worker"]
+        queue = pack_io["queue"]
+        assessment = pack_io["assessment"]
+        print("Pack backing I/O")
+        print(
+            f"  latest line/seq:     {pack_io['line']}/{pack_io['seq']} "
+            f"reason={pack_io['reason']} samples={stats.pack_io_telemetry_lines}"
+        )
+        print(
+            "  physical reads:      "
+            f"{physical['samples']} samples/{physical['successful_ops']} ok, "
+            f"0x{physical['bytes']:x} bytes"
+        )
+        print(
+            "  physical read-ahead: "
+            f"{physical['read_ahead_ops']} ops, "
+            f"0x{physical['read_ahead_bytes']:x} bytes"
+        )
+        print(
+            "  physical avg/max:    "
+            f"{physical['average_usec']:.1f}/{physical['max_usec']} us; "
+            f"slow 1/5/20ms={physical['slow_1ms']}/"
+            f"{physical['slow_5ms']}/{physical['slow_20ms']}"
+        )
+        print(
+            "  physical sizes:      "
+            f"<=64K={physical['size_buckets']['le_64k']} "
+            f"<=512K={physical['size_buckets']['gt_64k_le_512k']} "
+            f">512K={physical['size_buckets']['gt_512k']}"
+        )
+        print(
+            "  concurrency:         "
+            f"physical={physical['in_flight']}/{physical['in_flight_peak']} "
+            f"workers={worker['busy']}/{worker['busy_peak']}/{pack_io['workers']}"
+        )
+        print(
+            "  native AIO:          "
+            f"batches/requests={native_aio['submit_batches']}/"
+            f"{native_aio['submit_requests']} EAGAIN={native_aio['submit_eagain']} "
+            f"fail submit/poll/delete={native_aio['submit_failures']}/"
+            f"{native_aio['poll_failures']}/{native_aio['delete_failures']}"
+        )
+        print(
+            "  pipeline:            "
+            f"active/peak/cap={pipeline['active']}/{pipeline['active_peak']}/"
+            f"{pipeline['capacity']} runnable/running={pipeline['runnable']}/"
+            f"{pipeline['running']} io queued/submitted="
+            f"{pipeline['io_queued']}/{pipeline['io_submitted']} "
+            f"cacheWait={pipeline['cache_wait']} yields io/cache="
+            f"{pipeline['io_yields']}/{pipeline['cache_yields']}"
+        )
+        print(
+            "  worker avg/max:      "
+            f"{worker['average_usec']:.1f}/{worker['max_usec']} us "
+            f"over {worker['jobs']} continuations"
+        )
+        print(
+            "  queue avg/max:       "
+            f"{queue['average_wait_usec']:.1f}/{queue['max_wait_usec']} us; "
+            f"slow 1/5/20ms={queue['slow_1ms']}/{queue['slow_5ms']}/"
+            f"{queue['slow_20ms']} depth={queue['depth']['latency']}/"
+            f"{queue['depth']['balanced']}/{queue['depth']['bulk']}"
+        )
+        print(
+            "  bottleneck signal:   "
+            f"{assessment['bottleneck']} "
+            f"(pipelineSat={int(assessment['pipeline_saturated'])}, "
+            f"nativePressure={int(assessment['native_capacity_pressure'])}, "
+            f"workerSat={int(assessment['worker_saturated'])}, "
+            f"cacheContention={int(assessment['cache_contention'])}, "
+            f"backlog={int(assessment['queue_backlogged'])})"
+        )
         print("")
 
     if stats.amm_submit_diag_begins or stats.amm_buffers:
@@ -3315,6 +3744,21 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
                     f"{label}=n{aggregate.count}/avg{average:.1f}/max{aggregate.max_us}us"
                 )
             print(f"    APR {priority}: {', '.join(parts)}")
+    if stats.completion_priority_latency:
+        print("  AIO completion by APR priority:")
+        for priority in sorted(stats.completion_priority_latency):
+            aggregate = stats.completion_priority_latency[priority]
+            average = aggregate.total_us / aggregate.count if aggregate.count else 0.0
+            print(
+                f"    APR {priority}: count={aggregate.count} avg={average:.1f}us "
+                f"max={aggregate.max_us}us maxWindowP95/P99="
+                f"{aggregate.max_window_p95_us}/{aggregate.max_window_p99_us}us"
+            )
+    if stats.aio_latency_escape_accepted:
+        print(
+            "  latency escape accepts: "
+            f"{stats.aio_latency_escape_accepted}"
+        )
     batch = stats.aio_batch_metrics
     if batch.windows:
         average_items = batch.items / batch.calls if batch.calls else 0.0
@@ -3334,13 +3778,17 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
             "  AIO batch efficiency: "
             f"avg={average_items:.2f} fill={fill_pct:.1f}% "
             f"singletons={batch.singleton_calls} ({singleton_pct:.1f}%) "
-            f"savedCalls={saved_calls} ({reduction_pct:.1f}%) accepted={accepted_pct:.1f}%"
+            f"p95={batch.max_window_p95_items} max={batch.max_items} "
+            f"limit={batch.combined_limit} savedCalls={saved_calls} "
+            f"({reduction_pct:.1f}%) accepted={accepted_pct:.1f}%"
         )
-        print(
-            "  AIO batch rounds:    "
-            f"{batch.rounds} items={batch.round_items} avg={average_round_items:.2f} "
-            f"full={batch.full_rounds} ({full_round_pct:.1f}%)"
-        )
+        if batch.rounds:
+            print(
+                "  AIO batch rounds:    "
+                f"{batch.rounds} items={batch.round_items} "
+                f"avg={average_round_items:.2f} full={batch.full_rounds} "
+                f"({full_round_pct:.1f}%)"
+            )
         priority_parts = []
         for name in ("high", "mid", "low"):
             calls = batch.priority_calls[name]
@@ -3348,11 +3796,12 @@ def print_report(stats: LogStats, top: int, tail_limit: int) -> None:
             average = items / calls if calls else 0.0
             priority_parts.append(f"{name}={calls}/{items}/{average:.2f}")
         print(f"  batch prio call/item/avg: {', '.join(priority_parts)}")
-        apr_parts = [
-            f"{priority}:{batch.apr_priority_items[priority]}"
-            for priority in range(APR_PRIORITY_LANES)
-        ]
-        print(f"  batch APR priority items: {', '.join(apr_parts)}")
+        if batch.apr_priority_items:
+            apr_parts = [
+                f"{priority}:{batch.apr_priority_items[priority]}"
+                for priority in range(APR_PRIORITY_LANES)
+            ]
+            print(f"  batch APR priority items: {', '.join(apr_parts)}")
     io = stats.aio_io_metrics
     if io.windows:
         average_bytes = io.accepted_bytes / io.accepted_count if io.accepted_count else 0.0
@@ -3881,6 +4330,13 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
     waited = waited_jobs(stats)
     waited_delays = waited_submit_delay_jobs(stats)
     jobs_observed = observed_jobs(stats)
+    pack_io = (
+        pack_io_analysis(stats.pack_io_telemetry)
+        if stats.pack_io_telemetry is not None
+        else None
+    )
+    if pack_io is not None:
+        pack_io["telemetry_lines"] = stats.pack_io_telemetry_lines
     return {
         "path": stats.path,
         "session_start_line": stats.session_start_line,
@@ -3897,6 +4353,8 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
             {"line": line, "seq": seq, "thread": thread}
             for line, seq, thread in stats.empty_body_lines
         ],
+        "pack_io": pack_io,
+        "pack_metrics": pack_metrics_analysis(stats),
         "reactor_admission_latency": {
             "job_queue_first_read": window_latency_to_json(
                 stats.job_queue_first_read_latency
@@ -3930,6 +4388,13 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
                 for priority, stages in sorted(stats.admission_priority_latency.items())
             },
         },
+        "aio_completion_latency_by_apr_priority": {
+            str(priority): window_latency_to_json(aggregate)
+            for priority, aggregate in sorted(
+                stats.completion_priority_latency.items()
+            )
+        },
+        "aio_latency_escape_accepted": stats.aio_latency_escape_accepted,
         "aio_batch_metrics": {
             "windows": stats.aio_batch_metrics.windows,
             "window_ms": stats.aio_batch_metrics.window_ms,
@@ -3939,7 +4404,9 @@ def stats_to_json(stats: LogStats, top: int) -> Dict[str, object]:
             "failed_calls": stats.aio_batch_metrics.failed_calls,
             "singleton_calls": stats.aio_batch_metrics.singleton_calls,
             "max_items": stats.aio_batch_metrics.max_items,
+            "max_window_p95_items": stats.aio_batch_metrics.max_window_p95_items,
             "capacity": stats.aio_batch_metrics.capacity,
+            "combined_limit": stats.aio_batch_metrics.combined_limit,
             "rounds": stats.aio_batch_metrics.rounds,
             "round_items": stats.aio_batch_metrics.round_items,
             "full_rounds": stats.aio_batch_metrics.full_rounds,

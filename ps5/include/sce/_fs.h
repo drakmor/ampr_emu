@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <sys/dirent.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include "_types.h"
 
 #define SCE_KERNEL_NAME_MAX 255
@@ -21,13 +22,23 @@
 
 typedef struct stat SceKernelStat;
 typedef mode_t SceKernelMode;
+typedef struct iovec SceKernelIovec;
+
+#ifndef SCE_KERNEL_IOV_MAX
+#define SCE_KERNEL_IOV_MAX 1024
+#endif
 
 #define SCE_KERNEL_AIO_PRIORITY_LOW 1
 #define SCE_KERNEL_AIO_PRIORITY_MID 2
 #define SCE_KERNEL_AIO_PRIORITY_HIGH 3
 #define SCE_KERNEL_AIO_STATE_NOTIFIED 0x10000
+#define SCE_KERNEL_AIO_STATE_SUBMITTED 1
+#define SCE_KERNEL_AIO_STATE_PROCESSING 2
 #define SCE_KERNEL_AIO_STATE_COMPLETED 3
 #define SCE_KERNEL_AIO_STATE_ABORTED 4
+
+#define SCE_KERNEL_AIO_WAIT_AND 0x01
+#define SCE_KERNEL_AIO_WAIT_OR 0x02
 #define SCE_KERNEL_AIO_SCHED_WINDOW_MAX 128
 #define SCE_KERNEL_AIO_DELAYED_COUNT_MAX 128
 #define SCE_KERNEL_AIO_DISABLE_SPLIT 0
@@ -79,15 +90,25 @@ int sceKernelRename(const char *from, const char *to);
 int sceKernelStat(const char *path, SceKernelStat *stat);
 int sceKernelFstat(int fd, SceKernelStat *stat);
 int sceKernelGetdents(int fd, char *buffer, int size);
+int sceKernelGetdirentries(int fd, char *buffer, int size, long *basep);
+ssize_t sceKernelRead(int fd, void *buffer, size_t size);
+ssize_t sceKernelReadv(int fd, const SceKernelIovec *iov, int iovcnt);
 ssize_t sceKernelPread(int fd, void *buffer, size_t size, off_t offset);
+ssize_t sceKernelPreadv(int fd, const SceKernelIovec *iov, int iovcnt,
+                        off_t offset);
 
 int sceKernelAioDeleteRequests(SceKernelAioSubmitId ids[], int count,
                                int results[]);
+int sceKernelAioDeleteRequest(SceKernelAioSubmitId id, int *result);
 int sceKernelAioInitializeImpl(void *param, int size);
 #define sceKernelAioInitialize(param) \
     sceKernelAioInitializeImpl((void *)(param), sizeof(SceKernelAioParam))
 int sceKernelAioPollRequests(SceKernelAioSubmitId ids[], int count,
                              int states[]);
+int sceKernelAioPollRequest(SceKernelAioSubmitId id, int *state);
+int sceKernelAioSubmitReadCommands(SceKernelAioRWRequest requests[],
+                                    int count, int priority,
+                                    SceKernelAioSubmitId *id);
 int sceKernelAioSubmitReadCommandsMultiple(SceKernelAioRWRequest requests[],
                                             int count, int priority,
                                             SceKernelAioSubmitId ids[]);

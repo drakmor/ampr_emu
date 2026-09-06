@@ -15,9 +15,12 @@
 #include "hde64.h"
 
 #include <_kernel.h>
+#include <fcntl.h>
 #include <kernel/equeue.h>
 #include <sys/dmem.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cstdarg>
@@ -123,6 +126,10 @@ static_assert(kHookMemoryPoolBatchCopyPageCount <= 64u,
 struct InlineDetour {
     void* target{};
     void* replacement{};
+    // For ordinary functions this is an executable trampoline owned by this
+    // module. For a leading relative tail jump it is the resolved destination
+    // inside libkernel, so the original path never executes a copied syscall
+    // instruction from application/PRX memory.
     void* trampoline{};
     size_t stolenLen{};
     uint8_t original[kMaxStolenBytes]{};
@@ -163,6 +170,7 @@ enum HookFailReason : uint8_t {
     kHookFailTrampolineOverflow = 7,
     kHookFailTrampolineProtect = 8,
     kHookFailInternalRelative = 9,
+    kHookFailSyscallRelocation = 10,
 };
 
 bool install_inline_detour(void** originalSlot,
@@ -192,11 +200,11 @@ HookSpec g_hooks[] = {
      * mirror only native AMPR registrations and merge APR-local packets at wait;
      * AMM command buffers and native AMM event delivery remain untouched.
      */
-    {"sceKernelOpen", reinterpret_cast<void*>(&sceKernelOpen_emul), kHookMandatory, {}},
-    {"sceKernelStat", reinterpret_cast<void*>(&sceKernelStat_emul), kHookMandatory, {}},
+    {"open", reinterpret_cast<void*>(&posix_open_emul), kHookMandatory, {}},
+    {"stat", reinterpret_cast<void*>(&posix_stat_emul), kHookMandatory, {}},
     {"sceKernelCheckReachability", reinterpret_cast<void*>(&sceKernelCheckReachability_emul), kHookMandatory, {}},
-    {"sceKernelUnlink", reinterpret_cast<void*>(&sceKernelUnlink_emul), kHookMandatory, {}},
-    {"sceKernelRename", reinterpret_cast<void*>(&sceKernelRename_emul), kHookMandatory, {}},
+    {"unlink", reinterpret_cast<void*>(&posix_unlink_emul), kHookMandatory, {}},
+    {"rename", reinterpret_cast<void*>(&posix_rename_emul), kHookMandatory, {}},
     {"sceKernelMprotect", reinterpret_cast<void*>(&sceKernelMprotect_emul), kHookMandatory, {}},
     {"sceKernelMtypeprotect", reinterpret_cast<void*>(&sceKernelMtypeprotect_emul), kHookMandatory, {}},
     {"sceKernelMapFlexibleMemory", reinterpret_cast<void*>(&sceKernelMapFlexibleMemory_emul), kHookMandatory, {}},
@@ -260,6 +268,37 @@ HookSpec g_hooks[] = {
     {"sceKernelAddAmprSystemEvent", reinterpret_cast<void*>(&sceKernelAddAmprSystemEvent_emul), kHookOptional, {}},
     {"sceKernelDeleteAmprSystemEvent", reinterpret_cast<void*>(&sceKernelDeleteAmprSystemEvent_emul), kHookOptional, {}},
 #endif
+#if AMPR_EMU_PACK_ENABLE && (AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE || AMPR_EMU_PACK_PROCESS_OPEN_ENABLE)
+    {"sceKernelClose", reinterpret_cast<void*>(&sceKernelClose_emul), kHookMandatory, {}},
+    // sceKernelClose bypasses the public close thunk on current libkernel,
+    // therefore both entry points are required for virtual descriptors.
+    {"close", reinterpret_cast<void*>(&posix_close_emul), kHookMandatory, {}},
+    {"fstat", reinterpret_cast<void*>(&posix_fstat_emul), kHookMandatory, {}},
+    // Needed by synthetic directories and by process-visible packed FDs.
+    {"lseek", reinterpret_cast<void*>(&posix_lseek_emul), kHookMandatory, {}},
+#endif
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+    {"getdents", reinterpret_cast<void*>(&posix_getdents_emul), kHookMandatory, {}},
+    {"getdirentries", reinterpret_cast<void*>(&posix_getdirentries_emul), kHookMandatory, {}},
+#endif
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_INTERCEPT_PROCESS_SYNC_READS
+    {"pread", reinterpret_cast<void*>(&posix_pread_emul), kHookOptional, {}},
+    {"preadv", reinterpret_cast<void*>(&posix_preadv_emul), kHookOptional, {}},
+    {"read", reinterpret_cast<void*>(&posix_read_emul), kHookOptional, {}},
+    {"readv", reinterpret_cast<void*>(&posix_readv_emul), kHookOptional, {}},
+#endif
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_INTERCEPT_PROCESS_AIO
+    {"sceKernelAioSubmitReadCommands", reinterpret_cast<void*>(&sceKernelAioSubmitReadCommands_emul), kHookOptional, {}},
+    {"sceKernelAioSubmitReadCommandsMultiple", reinterpret_cast<void*>(&sceKernelAioSubmitReadCommandsMultiple_emul), kHookOptional, {}},
+    {"sceKernelAioPollRequest", reinterpret_cast<void*>(&sceKernelAioPollRequest_emul), kHookOptional, {}},
+    {"sceKernelAioPollRequests", reinterpret_cast<void*>(&sceKernelAioPollRequests_emul), kHookOptional, {}},
+    {"sceKernelAioWaitRequest", reinterpret_cast<void*>(&sceKernelAioWaitRequest_emul), kHookOptional, {}},
+    {"sceKernelAioWaitRequests", reinterpret_cast<void*>(&sceKernelAioWaitRequests_emul), kHookOptional, {}},
+    {"sceKernelAioCancelRequest", reinterpret_cast<void*>(&sceKernelAioCancelRequest_emul), kHookOptional, {}},
+    {"sceKernelAioCancelRequests", reinterpret_cast<void*>(&sceKernelAioCancelRequests_emul), kHookOptional, {}},
+    {"sceKernelAioDeleteRequest", reinterpret_cast<void*>(&sceKernelAioDeleteRequest_emul), kHookOptional, {}},
+    {"sceKernelAioDeleteRequests", reinterpret_cast<void*>(&sceKernelAioDeleteRequests_emul), kHookOptional, {}},
+#endif
 };
 
 #if AMPR_EMU_APR_LOCAL_EQUEUE
@@ -295,7 +334,16 @@ constexpr size_t kModuleLoadObserverHookCount = 0;
 
 constexpr size_t kHookCount = sizeof(g_hooks) / sizeof(g_hooks[0]);
 static_assert(kHookCount == kAmprLibkernelHook_Count, "AmprLibkernelHookId must match g_hooks order");
-static_assert(kHookCount <= 64, "hook capability mask is uint64_t-indexed by HookSpec order");
+static_assert(kHookCount <= 128, "hook capability mask is 128-bit indexed by HookSpec order");
+using HookCapabilityMask = unsigned __int128;
+
+static constexpr uint64_t hook_mask_low(HookCapabilityMask value) {
+    return static_cast<uint64_t>(value);
+}
+static constexpr uint64_t hook_mask_high(HookCapabilityMask value) {
+    return static_cast<uint64_t>(value >> 64u);
+}
+
 constexpr size_t kMaxTrampolinePages =
     (kHookCount + kExternalEqueueHookCount +
      kModuleLoadObserverHookCount +
@@ -349,21 +397,21 @@ int g_hookFailedCount = 0;
 int g_hookMandatoryInstalledCount = 0;
 int g_hookMandatoryMissingCount = 0;
 int g_hookMandatoryFailedCount = 0;
-uint64_t g_hookCapabilityMask = 0;
-uint64_t g_hookMandatoryMask = 0;
-uint64_t g_hookOptionalMask = 0;
-uint64_t g_hookMandatoryCapabilityMask = 0;
+HookCapabilityMask g_hookCapabilityMask = 0;
+HookCapabilityMask g_hookMandatoryMask = 0;
+HookCapabilityMask g_hookOptionalMask = 0;
+HookCapabilityMask g_hookMandatoryCapabilityMask = 0;
 #if AMPR_EMU_LIBKERNEL_HOOK_DIAGNOSTICS
 size_t g_hookLogCount = 0;
 HookLogRecord g_hookLogRecords[kHookCount]{};
 #endif
 
 #define AMPR_LIBKERNEL_SDK_FALLBACKS \
-    reinterpret_cast<void*>(&::sceKernelOpen), \
-    reinterpret_cast<void*>(&::sceKernelStat), \
+    nullptr, \
+    nullptr, \
     reinterpret_cast<void*>(&::sceKernelCheckReachability), \
-    reinterpret_cast<void*>(&::sceKernelUnlink), \
-    reinterpret_cast<void*>(&::sceKernelRename), \
+    nullptr, \
+    nullptr, \
     reinterpret_cast<void*>(&::sceKernelMprotect), \
     reinterpret_cast<void*>(&::sceKernelMtypeprotect), \
     reinterpret_cast<void*>(&::sceKernelMapFlexibleMemory), \
@@ -409,7 +457,8 @@ HookLogRecord g_hookLogRecords[kHookCount]{};
     reinterpret_cast<void*>(&::sceKernelWriteModifyMtypeProtectCommand), \
     reinterpret_cast<void*>(&::sceKernelWriteModifyMtypeProtectWithGpuMaskIdCommand), \
     nullptr \
-    AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS
+    AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS \
+    AMPR_LIBKERNEL_PACK_FS_SDK_FALLBACKS
 
 #if AMPR_EMU_APR_LOCAL_EQUEUE
 #define AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS \
@@ -431,6 +480,52 @@ HookLogRecord g_hookLogRecords[kHookCount]{};
 #define AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS
 #endif
 
+#if AMPR_EMU_PACK_ENABLE && (AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE || AMPR_EMU_PACK_PROCESS_OPEN_ENABLE)
+#define AMPR_LIBKERNEL_PACK_FD_SDK_FALLBACKS \
+    , nullptr \
+    , nullptr \
+    , nullptr \
+    , nullptr
+#else
+#define AMPR_LIBKERNEL_PACK_FD_SDK_FALLBACKS
+#endif
+
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+#define AMPR_LIBKERNEL_PACK_DIRECTORY_SDK_FALLBACKS \
+    , nullptr \
+    , nullptr
+#else
+#define AMPR_LIBKERNEL_PACK_DIRECTORY_SDK_FALLBACKS
+#endif
+
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_INTERCEPT_PROCESS_SYNC_READS
+#define AMPR_LIBKERNEL_PACK_PROCESS_SYNC_READ_SDK_FALLBACKS \
+    , nullptr \
+    , nullptr \
+    , nullptr \
+    , nullptr
+#else
+#define AMPR_LIBKERNEL_PACK_PROCESS_SYNC_READ_SDK_FALLBACKS
+#endif
+
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_INTERCEPT_PROCESS_AIO
+#define AMPR_LIBKERNEL_PACK_PROCESS_AIO_SDK_FALLBACKS \
+    , nullptr \
+    , nullptr \
+    , nullptr \
+    , nullptr \
+    , nullptr \
+    , nullptr
+#else
+#define AMPR_LIBKERNEL_PACK_PROCESS_AIO_SDK_FALLBACKS
+#endif
+
+#define AMPR_LIBKERNEL_PACK_FS_SDK_FALLBACKS \
+    AMPR_LIBKERNEL_PACK_FD_SDK_FALLBACKS \
+    AMPR_LIBKERNEL_PACK_DIRECTORY_SDK_FALLBACKS \
+    AMPR_LIBKERNEL_PACK_PROCESS_SYNC_READ_SDK_FALLBACKS \
+    AMPR_LIBKERNEL_PACK_PROCESS_AIO_SDK_FALLBACKS
+
 void* const g_amprSdkLibkernelFallbackById[kAmprLibkernelHook_Count]{
     AMPR_LIBKERNEL_SDK_FALLBACKS,
 };
@@ -448,6 +543,11 @@ AMPR_LIBKERNEL_HOOK_EXPORT void*
 }
 #undef AMPR_LIBKERNEL_SDK_FALLBACKS
 #undef AMPR_LIBKERNEL_EQUEUE_SDK_FALLBACKS
+#undef AMPR_LIBKERNEL_PACK_FS_SDK_FALLBACKS
+#undef AMPR_LIBKERNEL_PACK_FD_SDK_FALLBACKS
+#undef AMPR_LIBKERNEL_PACK_PROCESS_SYNC_READ_SDK_FALLBACKS
+#undef AMPR_LIBKERNEL_PACK_PROCESS_AIO_SDK_FALLBACKS
+#undef AMPR_LIBKERNEL_PACK_DIRECTORY_SDK_FALLBACKS
 alignas(SCE_KERNEL_PAGE_SIZE) uint8_t g_trampolineStorage[kMaxTrampolinePages][kTrampolinePageSize]{};
 uint32_t g_trampolinePageUsed[kMaxTrampolinePages]{};
 int g_trampolinePageProt[kMaxTrampolinePages]{};
@@ -560,21 +660,21 @@ void store_original_slot(void** slot, void* value) {
     }
 }
 
-uint64_t hook_mask_bit(size_t index) {
-    return uint64_t{1} << index;
+HookCapabilityMask hook_mask_bit(size_t index) {
+    return HookCapabilityMask{1} << index;
 }
 
 void refresh_hook_runtime_state_from_detours() {
     int installed = 0;
     int mandatoryInstalled = 0;
-    uint64_t capabilityMask = 0;
-    uint64_t mandatoryMask = 0;
-    uint64_t optionalMask = 0;
-    uint64_t mandatoryCapabilityMask = 0;
+    HookCapabilityMask capabilityMask = 0;
+    HookCapabilityMask mandatoryMask = 0;
+    HookCapabilityMask optionalMask = 0;
+    HookCapabilityMask mandatoryCapabilityMask = 0;
 
     for (size_t index = 0; index < kHookCount; ++index) {
         HookSpec& hook = g_hooks[index];
-        const uint64_t bit = hook_mask_bit(index);
+        const HookCapabilityMask bit = hook_mask_bit(index);
         if (hook.mandatory) {
             mandatoryMask |= bit;
         } else {
@@ -798,6 +898,7 @@ void store_u64_le(void* dst, uint64_t value) {
         case kHookFailTrampolineOverflow: return "trampoline-overflow";
         case kHookFailTrampolineProtect: return "trampoline-protect";
         case kHookFailInternalRelative: return "internal-relative";
+        case kHookFailSyscallRelocation: return "syscall-relocation";
         default: return "unknown";
     }
 }
@@ -810,6 +911,25 @@ void write_abs_jump(uint8_t* dst, void* target) {
     dst[4] = 0x00;
     dst[5] = 0x00;
     store_u64_le(dst + 6, reinterpret_cast<uint64_t>(target));
+}
+
+bool rel_jump_fits(const uint8_t* dst, const void* target) {
+    constexpr size_t kRelJumpSize = 5;
+    const int64_t displacement =
+        static_cast<int64_t>(reinterpret_cast<uintptr_t>(target)) -
+        static_cast<int64_t>(reinterpret_cast<uintptr_t>(dst) + kRelJumpSize);
+    return displacement >= INT32_MIN && displacement <= INT32_MAX;
+}
+
+bool write_rel_jump(uint8_t* dst, void* target) {
+    constexpr size_t kRelJumpSize = 5;
+    if (!rel_jump_fits(dst, target)) return false;
+    const int64_t displacement =
+        static_cast<int64_t>(reinterpret_cast<uintptr_t>(target)) -
+        static_cast<int64_t>(reinterpret_cast<uintptr_t>(dst) + kRelJumpSize);
+    dst[0] = 0xE9;
+    store_i32_le(dst + 1, static_cast<int32_t>(displacement));
+    return true;
 }
 
 uintptr_t page_floor(uintptr_t value) {
@@ -1387,6 +1507,13 @@ bool relocate_instruction(uint8_t* dst,
                           bool& terminal,
                           uintptr_t& internalRelTarget,
                           HookFailReason& reason) {
+    // Prospero only permits syscall execution from libkernel text. Never copy
+    // a syscall instruction into the PRX trampoline. Instructions after the
+    // stolen prefix execute at their original libkernel addresses and are safe.
+    if (hs.opcode == 0x0f && hs.opcode2 == 0x05) {
+        reason = kHookFailSyscallRelocation;
+        return false;
+    }
     if (hs.flags & F_RELATIVE) {
         return relocate_relative_instruction(dst, dstLen, dstCap, src, srcBase, srcIp, hs, terminal, internalRelTarget, reason);
     }
@@ -1449,6 +1576,62 @@ enum class FixedWrapperDetourResult : uint8_t {
     kInstalled,
     kFailed,
 };
+
+FixedWrapperDetourResult try_install_libkernel_syscall_wrapper_detour(
+    InlineDetour& detour,
+    uint8_t* src,
+    void* replacement,
+    uint8_t* trampoline,
+    void** originalSlot,
+    HookFailReason& reason) {
+    constexpr size_t kRelJumpSize = 5;
+    constexpr size_t kSyscallOffset = 10;
+    // Current Prospero libkernel direct syscall wrappers use:
+    //   mov rax, imm32      (7 bytes)
+    //   mov r10, rcx        (3 bytes)
+    //   syscall             (2 bytes, must remain in libkernel text)
+    const bool matched =
+        src && replacement && trampoline &&
+        src[0] == 0x48 && src[1] == 0xC7 && src[2] == 0xC0 &&
+        src[7] == 0x49 && src[8] == 0x89 && src[9] == 0xCA &&
+        src[10] == 0x0F && src[11] == 0x05;
+    if (!matched) return FixedWrapperDetourResult::kNotMatched;
+    if (!rel_jump_fits(src, replacement)) {
+        reason = kHookFailRipRelativeRange;
+        return FixedWrapperDetourResult::kFailed;
+    }
+
+    size_t trampolineLen = 0;
+    if (!append_bytes(trampoline, trampolineLen, kTrampolineSize,
+                      src, kSyscallOffset) ||
+        !append_abs_jump(trampoline, trampolineLen, kTrampolineSize,
+                         reinterpret_cast<uintptr_t>(src + kSyscallOffset))) {
+        reason = kHookFailTrampolineOverflow;
+        return FixedWrapperDetourResult::kFailed;
+    }
+
+    copy_bytes(detour.original, src, kRelJumpSize);
+    __builtin___clear_cache(reinterpret_cast<char*>(trampoline),
+                            reinterpret_cast<char*>(trampoline + trampolineLen));
+    if (!make_trampoline_executable(trampoline)) {
+        reason = kHookFailTrampolineProtect;
+        return FixedWrapperDetourResult::kFailed;
+    }
+
+    // Publish the original bridge before patching the entry. The range was
+    // checked while the original bytes were still intact, so this write cannot
+    // fail unless the addresses themselves changed.
+    store_original_slot(originalSlot, trampoline);
+    (void)write_rel_jump(src, replacement);
+    __builtin___clear_cache(reinterpret_cast<char*>(src),
+                            reinterpret_cast<char*>(src + kRelJumpSize));
+    detour.target = src;
+    detour.replacement = replacement;
+    detour.trampoline = trampoline;
+    detour.stolenLen = kRelJumpSize;
+    detour.installed = true;
+    return FixedWrapperDetourResult::kInstalled;
+}
 
 FixedWrapperDetourResult try_install_loader_status_wrapper_detour(InlineDetour& detour,
                                                                   uint8_t* src,
@@ -1555,6 +1738,22 @@ bool install_inline_detour(void** originalSlot,
         return false;
     };
 
+    switch (try_install_libkernel_syscall_wrapper_detour(
+                detour,
+                src,
+                replacement,
+                trampoline,
+                originalSlot,
+                reason)) {
+        case FixedWrapperDetourResult::kInstalled:
+            restore_code_protection(target, kMaxStolenBytes);
+            return true;
+        case FixedWrapperDetourResult::kFailed:
+            return fail_after_target_mprotect();
+        case FixedWrapperDetourResult::kNotMatched:
+            break;
+    }
+
     switch (try_install_loader_status_wrapper_detour(
                 detour,
                 src,
@@ -1575,6 +1774,7 @@ bool install_inline_detour(void** originalSlot,
     size_t trampolineLen = 0;
     bool terminal = false;
     uintptr_t internalRelTarget = 0;
+    uintptr_t libkernelTailTarget = 0;
     const uintptr_t srcBase = reinterpret_cast<uintptr_t>(src);
     while (stolen < kJumpSize && stolen < kMaxStolenBytes) {
         hde64s hs{};
@@ -1584,6 +1784,14 @@ bool install_inline_detour(void** originalSlot,
             return fail_after_target_mprotect();
         }
         if (!terminal) {
+            if (stolen == 0 && hs.meta == HDE64_META_REL_JMP) {
+                uintptr_t targetIp = 0;
+                if (hde64_relative_target(src, srcBase, &hs, &targetIp) &&
+                    (targetIp < srcBase ||
+                     targetIp >= srcBase + kMaxStolenBytes)) {
+                    libkernelTailTarget = targetIp;
+                }
+            }
             const uintptr_t dstIp = reinterpret_cast<uintptr_t>(trampoline + trampolineLen);
             if (!relocate_instruction(trampoline,
                                       trampolineLen,
@@ -1608,6 +1816,32 @@ bool install_inline_detour(void** originalSlot,
     if (internalRelTarget != 0 && internalRelTarget < reinterpret_cast<uintptr_t>(src + stolen)) {
         reason = kHookFailInternalRelative;
         return fail_after_target_mprotect();
+    }
+
+    if (libkernelTailTarget != 0) {
+        // The exported POSIX entry points in libkernel are commonly short
+        // tail thunks into private syscall wrappers. Publish that destination
+        // as the callable original rather than an application-memory gateway.
+        // Thus both the syscall opcode and the entire original implementation
+        // remain in libkernel text.
+        copy_bytes(detour.original, target, stolen);
+        release_trampoline(trampoline);
+        trampoline = nullptr;
+        void* originalEntry = reinterpret_cast<void*>(libkernelTailTarget);
+        store_original_slot(originalSlot, originalEntry);
+        write_abs_jump(src, replacement);
+        if (stolen > kJumpSize) {
+            set_bytes(src + kJumpSize, 0x90, stolen - kJumpSize);
+        }
+        __builtin___clear_cache(reinterpret_cast<char*>(src),
+                                reinterpret_cast<char*>(src + stolen));
+        detour.target = target;
+        detour.replacement = replacement;
+        detour.trampoline = originalEntry;
+        detour.stolenLen = stolen;
+        detour.installed = true;
+        restore_code_protection(target, kMaxStolenBytes);
+        return true;
     }
     if (!terminal && !append_abs_jump(trampoline, trampolineLen, kTrampolineSize, reinterpret_cast<uintptr_t>(src + stolen))) {
         reason = kHookFailTrampolineOverflow;
@@ -1797,6 +2031,8 @@ void emit_module_identity_system_log(SceKernelModule libkernel) {
     if (!debugOut) {
         return;
     }
+    sce::Ampr::Emu::setKernelDebugOutput(
+        reinterpret_cast<void*>(debugOut));
 
     char line[256]{};
     const int length = std::snprintf(line,
@@ -1829,7 +2065,7 @@ void emit_module_identity_system_log(SceKernelModule libkernel) {
 extern "C" int sceKernelMprotect_emul(const void* addr, size_t len, int prot) {
     const AdjustedAmprWriteProt protAdjust = make_adjusted_ampr_write_prot(prot);
     if (protAdjust.changed()) {
-        hook_log_criticalf("mprotect.ampr_write_cpu_rw addr=%p len=%zu prot=0x%x adjusted=0x%x",
+        hook_logf("mprotect.ampr_write_cpu_rw addr=%p len=%zu prot=0x%x adjusted=0x%x",
                            addr,
                            len,
                            protAdjust.original,
@@ -1841,7 +2077,7 @@ extern "C" int sceKernelMprotect_emul(const void* addr, size_t len, int prot) {
 extern "C" int sceKernelMtypeprotect_emul(const void* addr, size_t size, int type, int prot) {
     const AdjustedAmprWriteProt protAdjust = make_adjusted_ampr_write_prot(prot);
     if (protAdjust.changed()) {
-        hook_log_criticalf("mtypeprotect.ampr_write_cpu_rw addr=%p len=%zu type=0x%x prot=0x%x adjusted=0x%x",
+        hook_logf("mtypeprotect.ampr_write_cpu_rw addr=%p len=%zu type=0x%x prot=0x%x adjusted=0x%x",
                            addr,
                            size,
                            type,
@@ -1854,7 +2090,7 @@ extern "C" int sceKernelMtypeprotect_emul(const void* addr, size_t size, int typ
 extern "C" int sceKernelMapFlexibleMemory_emul(void** addrInOut, size_t len, int prot, int flags) {
     const AdjustedAmprWriteProt protAdjust = make_adjusted_ampr_write_prot(prot);
     if (protAdjust.changed()) {
-        hook_log_criticalf("mapFlexible.ampr_write_cpu_rw addr=%p len=%zu prot=0x%x adjusted=0x%x flags=0x%x",
+        hook_logf("mapFlexible.ampr_write_cpu_rw addr=%p len=%zu prot=0x%x adjusted=0x%x flags=0x%x",
                            addrInOut ? *addrInOut : nullptr,
                            len,
                            protAdjust.original,
@@ -1872,7 +2108,7 @@ extern "C" int sceKernelMapDirectMemory_emul(void** addr,
                                              size_t maxPageSize) {
     const AdjustedAmprWriteProt protAdjust = make_adjusted_ampr_write_prot(prot);
     if (protAdjust.changed()) {
-        hook_log_criticalf("mapDirect.ampr_write_cpu_rw addr=%p len=%zu prot=0x%x adjusted=0x%x flags=0x%x dmem=0x%llx maxPage=0x%llx",
+        hook_logf("mapDirect.ampr_write_cpu_rw addr=%p len=%zu prot=0x%x adjusted=0x%x flags=0x%x dmem=0x%llx maxPage=0x%llx",
                            addr ? *addr : nullptr,
                            len,
                            protAdjust.original,
@@ -1893,7 +2129,7 @@ extern "C" int sceKernelMapDirectMemory2_emul(void** addr,
                                               size_t maxPageSize) {
     const AdjustedAmprWriteProt protAdjust = make_adjusted_ampr_write_prot(prot);
     if (protAdjust.changed()) {
-        hook_log_criticalf("mapDirect2.ampr_write_cpu_rw addr=%p len=%zu type=0x%x prot=0x%x adjusted=0x%x flags=0x%x dmem=0x%llx maxPage=0x%llx",
+        hook_logf("mapDirect2.ampr_write_cpu_rw addr=%p len=%zu type=0x%x prot=0x%x adjusted=0x%x flags=0x%x dmem=0x%llx maxPage=0x%llx",
                            addr ? *addr : nullptr,
                            len,
                            type,
@@ -1930,7 +2166,7 @@ static int adjust_batch_map_entries_for_ampr_write(SceKernelBatchMapEntry* entri
         }
         entry.protection = static_cast<char>(adjustedProt);
         ++adjustedCount;
-        hook_log_criticalf("%s.ampr_write_cpu_rw index=%d addr=%p len=%zu op=%d type=0x%x prot=0x%x adjusted=0x%x",
+        hook_logf("%s.ampr_write_cpu_rw index=%d addr=%p len=%zu op=%d type=0x%x prot=0x%x adjusted=0x%x",
                            apiName,
                            index,
                            entry.start,
@@ -1956,7 +2192,7 @@ extern "C" int sceKernelBatchMap2_emul(SceKernelBatchMapEntry* entries, int numb
 extern "C" int sceKernelJitMapSharedMemory_emul(int fd, int prot, void** startOut) {
     const AdjustedAmprWriteProt protAdjust = make_adjusted_ampr_write_prot(prot);
     if (protAdjust.changed()) {
-        hook_log_criticalf("jitMapShared.ampr_write_cpu_rw fd=%d addr=%p prot=0x%x adjusted=0x%x",
+        hook_logf("jitMapShared.ampr_write_cpu_rw fd=%d addr=%p prot=0x%x adjusted=0x%x",
                            fd,
                            startOut ? *startOut : nullptr,
                            protAdjust.original,
@@ -1997,7 +2233,7 @@ static void log_memory_pool_batch_adjustment(const SceKernelMemoryPoolBatchEntry
                                              int type,
                                              uint8_t prot,
                                              uint8_t adjustedProt) {
-    hook_log_criticalf("memoryPoolBatch.ampr_write_cpu_rw index=%d addr=%p len=%zu op=%u type=0x%x prot=0x%x adjusted=0x%x flags=0x%x",
+    hook_logf("memoryPoolBatch.ampr_write_cpu_rw index=%d addr=%p len=%zu op=%u type=0x%x prot=0x%x adjusted=0x%x flags=0x%x",
                        index,
                        addr,
                        len,
@@ -2204,13 +2440,13 @@ static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
     int mandatoryInstalled = 0;
     int mandatoryMissing = 0;
     int mandatoryFailed = 0;
-    uint64_t capabilityMask = 0;
-    uint64_t mandatoryMask = 0;
-    uint64_t optionalMask = 0;
-    uint64_t mandatoryCapabilityMask = 0;
+    HookCapabilityMask capabilityMask = 0;
+    HookCapabilityMask mandatoryMask = 0;
+    HookCapabilityMask optionalMask = 0;
+    HookCapabilityMask mandatoryCapabilityMask = 0;
     for (size_t hookIndex = 0; hookIndex < kHookCount; ++hookIndex) {
         HookSpec& hook = g_hooks[hookIndex];
-        const uint64_t hookBit = hook_mask_bit(hookIndex);
+        const HookCapabilityMask hookBit = hook_mask_bit(hookIndex);
         if (hook.mandatory) {
             mandatoryMask |= hookBit;
         } else {
@@ -2287,17 +2523,21 @@ static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
     g_hookOptionalMask = optionalMask;
     g_hookMandatoryCapabilityMask = mandatoryCapabilityMask;
 
-    hook_logf("install status=summary installed=%d missing=%d failed=%d mandatoryInstalled=%d mandatoryMissing=%d mandatoryFailed=%d capability=0x%llx mandatoryMask=0x%llx optionalMask=0x%llx mandatoryCapability=0x%llx total=%zu",
+    hook_logf("install status=summary installed=%d missing=%d failed=%d mandatoryInstalled=%d mandatoryMissing=%d mandatoryFailed=%d capability=0x%llx%016llx mandatoryMask=0x%llx%016llx optionalMask=0x%llx%016llx mandatoryCapability=0x%llx%016llx total=%zu",
               installed,
               missing,
               failed,
               mandatoryInstalled,
               mandatoryMissing,
               mandatoryFailed,
-              static_cast<unsigned long long>(capabilityMask),
-              static_cast<unsigned long long>(mandatoryMask),
-              static_cast<unsigned long long>(optionalMask),
-              static_cast<unsigned long long>(mandatoryCapabilityMask),
+              static_cast<unsigned long long>(hook_mask_high(capabilityMask)),
+              static_cast<unsigned long long>(hook_mask_low(capabilityMask)),
+              static_cast<unsigned long long>(hook_mask_high(mandatoryMask)),
+              static_cast<unsigned long long>(hook_mask_low(mandatoryMask)),
+              static_cast<unsigned long long>(hook_mask_high(optionalMask)),
+              static_cast<unsigned long long>(hook_mask_low(optionalMask)),
+              static_cast<unsigned long long>(hook_mask_high(mandatoryCapabilityMask)),
+              static_cast<unsigned long long>(hook_mask_low(mandatoryCapabilityMask)),
               kHookCount);
 
     if (installed == 0) {
@@ -2318,12 +2558,13 @@ static int ampr_install_libkernel_hooks_for_module(int libkernelHandle) {
         // pointer and capability bit. Never advertise a fallback for a detour
         // that is still physically patched into libkernel.
         refresh_hook_runtime_state_from_detours();
-        hook_logf("install status=failed reason=mandatory-hook-unavailable mandatoryMissing=%d mandatoryFailed=%d rollbackOk=%u residual=%d capability=0x%llx",
+        hook_logf("install status=failed reason=mandatory-hook-unavailable mandatoryMissing=%d mandatoryFailed=%d rollbackOk=%u residual=%d capability=0x%llx%016llx",
                   mandatoryMissing,
                   mandatoryFailed,
                   rollbackOk ? 1u : 0u,
                   g_hookInstalledCount,
-                  static_cast<unsigned long long>(g_hookCapabilityMask));
+                  static_cast<unsigned long long>(hook_mask_high(g_hookCapabilityMask)),
+                  static_cast<unsigned long long>(hook_mask_low(g_hookCapabilityMask)));
         g_hookInstallResult = -1;
         return -1;
     }
@@ -2419,16 +2660,53 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprUninstallLibkernelHooks(void) {
     // This keeps partial restore failures callable through their trampoline
     // instead of publishing an SDK fallback behind a still-active detour.
     refresh_hook_runtime_state_from_detours();
-    hook_logf("uninstall status=summary removed=%d failed=%d residual=%d capability=0x%llx",
+    hook_logf("uninstall status=summary removed=%d failed=%d residual=%d capability=0x%llx%016llx",
               removed,
               failed,
               g_hookInstalledCount,
-              static_cast<unsigned long long>(g_hookCapabilityMask));
+              static_cast<unsigned long long>(hook_mask_high(g_hookCapabilityMask)),
+              static_cast<unsigned long long>(hook_mask_low(g_hookCapabilityMask)));
     return ok ? 0 : -1;
 }
 
 extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprLibkernelHooksInstalled(void) {
     return hooks_installed() ? 1 : 0;
+}
+
+extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprPackProcessOpenHooksReady(void) {
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_PROCESS_OPEN_ENABLE
+    bool ready = g_hooks[kAmprLibkernelHook_sceKernelClose].detour.installed &&
+                 g_hooks[kAmprLibkernelHook_close].detour.installed &&
+                 g_hooks[kAmprLibkernelHook_fstat].detour.installed &&
+                 g_hooks[kAmprLibkernelHook_lseek].detour.installed;
+#if AMPR_EMU_PACK_INTERCEPT_PROCESS_AIO
+    ready = ready &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioSubmitReadCommands].detour.installed &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioSubmitReadCommandsMultiple].detour.installed &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioPollRequest].detour.installed &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioPollRequests].detour.installed &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioWaitRequest].detour.installed &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioWaitRequests].detour.installed &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioCancelRequest].detour.installed &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioCancelRequests].detour.installed &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioDeleteRequest].detour.installed &&
+            g_hooks[kAmprLibkernelHook_sceKernelAioDeleteRequests].detour.installed;
+#endif
+#if AMPR_EMU_PACK_INTERCEPT_PROCESS_SYNC_READS
+    ready = ready &&
+            g_hooks[kAmprLibkernelHook_pread].detour.installed &&
+            g_hooks[kAmprLibkernelHook_preadv].detour.installed &&
+            g_hooks[kAmprLibkernelHook_read].detour.installed &&
+            g_hooks[kAmprLibkernelHook_readv].detour.installed;
+#endif
+    return ready ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprPackProcessReadHooksReady(void) {
+    return amprPackProcessOpenHooksReady();
 }
 
 #if AMPR_EMU_LIBKERNEL_HOOK_DIAGNOSTICS
@@ -2441,7 +2719,7 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprFormatLibkernelHookStatus(char* ou
     const int flushed = g_hookLogFlushed.load(std::memory_order_acquire) ? 1 : 0;
     return std::snprintf(out,
                          static_cast<size_t>(outSize),
-                         "libkernel.hook.startup attempted=%d installed=%d flushed=%d rc=0x%x installedCount=%d missing=%d failed=%d mandatoryInstalled=%d mandatoryMissing=%d mandatoryFailed=%d capability=0x%llx mandatoryMask=0x%llx optionalMask=0x%llx mandatoryCapability=0x%llx total=%zu",
+                         "libkernel.hook.startup attempted=%d installed=%d flushed=%d rc=0x%x installedCount=%d missing=%d failed=%d mandatoryInstalled=%d mandatoryMissing=%d mandatoryFailed=%d capability=0x%llx%016llx mandatoryMask=0x%llx%016llx optionalMask=0x%llx%016llx mandatoryCapability=0x%llx%016llx total=%zu",
                          attempted,
                          installed,
                          flushed,
@@ -2452,10 +2730,14 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT int amprFormatLibkernelHookStatus(char* ou
                          g_hookMandatoryInstalledCount,
                          g_hookMandatoryMissingCount,
                          g_hookMandatoryFailedCount,
-                         static_cast<unsigned long long>(g_hookCapabilityMask),
-                         static_cast<unsigned long long>(g_hookMandatoryMask),
-                         static_cast<unsigned long long>(g_hookOptionalMask),
-                         static_cast<unsigned long long>(g_hookMandatoryCapabilityMask),
+                         static_cast<unsigned long long>(hook_mask_high(g_hookCapabilityMask)),
+                         static_cast<unsigned long long>(hook_mask_low(g_hookCapabilityMask)),
+                         static_cast<unsigned long long>(hook_mask_high(g_hookMandatoryMask)),
+                         static_cast<unsigned long long>(hook_mask_low(g_hookMandatoryMask)),
+                         static_cast<unsigned long long>(hook_mask_high(g_hookOptionalMask)),
+                         static_cast<unsigned long long>(hook_mask_low(g_hookOptionalMask)),
+                         static_cast<unsigned long long>(hook_mask_high(g_hookMandatoryCapabilityMask)),
+                         static_cast<unsigned long long>(hook_mask_low(g_hookMandatoryCapabilityMask)),
                          kHookCount);
 }
 
@@ -2469,7 +2751,7 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT void amprFlushLibkernelHookLog(void) {
     if (flushStartup) {
     if (g_hookInstallResult != 0 || g_hookFailedCount != 0 || g_hookMandatoryMissingCount != 0 ||
         g_hookMandatoryFailedCount != 0) {
-        sce::Ampr::Emu::debugLogCriticalf("libkernel.hook.deferred.summary rc=0x%x installed=%d missing=%d failed=%d mandatoryInstalled=%d mandatoryMissing=%d mandatoryFailed=%d capability=0x%llx mandatoryMask=0x%llx optionalMask=0x%llx mandatoryCapability=0x%llx total=%zu",
+        sce::Ampr::Emu::debugLogCriticalf("libkernel.hook.deferred.summary rc=0x%x installed=%d missing=%d failed=%d mandatoryInstalled=%d mandatoryMissing=%d mandatoryFailed=%d capability=0x%llx%016llx mandatoryMask=0x%llx%016llx optionalMask=0x%llx%016llx mandatoryCapability=0x%llx%016llx total=%zu",
                                           g_hookInstallResult,
                                           g_hookInstalledCount,
                                           g_hookMissingCount,
@@ -2477,13 +2759,17 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT void amprFlushLibkernelHookLog(void) {
                                           g_hookMandatoryInstalledCount,
                                           g_hookMandatoryMissingCount,
                                           g_hookMandatoryFailedCount,
-                                          static_cast<unsigned long long>(g_hookCapabilityMask),
-                                          static_cast<unsigned long long>(g_hookMandatoryMask),
-                                          static_cast<unsigned long long>(g_hookOptionalMask),
-                                          static_cast<unsigned long long>(g_hookMandatoryCapabilityMask),
+                                          static_cast<unsigned long long>(hook_mask_high(g_hookCapabilityMask)),
+                                          static_cast<unsigned long long>(hook_mask_low(g_hookCapabilityMask)),
+                                          static_cast<unsigned long long>(hook_mask_high(g_hookMandatoryMask)),
+                                          static_cast<unsigned long long>(hook_mask_low(g_hookMandatoryMask)),
+                                          static_cast<unsigned long long>(hook_mask_high(g_hookOptionalMask)),
+                                          static_cast<unsigned long long>(hook_mask_low(g_hookOptionalMask)),
+                                          static_cast<unsigned long long>(hook_mask_high(g_hookMandatoryCapabilityMask)),
+                                          static_cast<unsigned long long>(hook_mask_low(g_hookMandatoryCapabilityMask)),
                                           kHookCount);
     } else {
-        sce::Ampr::Emu::debugLogf("libkernel.hook.deferred.summary rc=0x%x installed=%d missing=%d failed=%d mandatoryInstalled=%d mandatoryMissing=%d mandatoryFailed=%d capability=0x%llx mandatoryMask=0x%llx optionalMask=0x%llx mandatoryCapability=0x%llx total=%zu",
+        sce::Ampr::Emu::debugLogf("libkernel.hook.deferred.summary rc=0x%x installed=%d missing=%d failed=%d mandatoryInstalled=%d mandatoryMissing=%d mandatoryFailed=%d capability=0x%llx%016llx mandatoryMask=0x%llx%016llx optionalMask=0x%llx%016llx mandatoryCapability=0x%llx%016llx total=%zu",
                                   g_hookInstallResult,
                                   g_hookInstalledCount,
                                   g_hookMissingCount,
@@ -2491,10 +2777,14 @@ extern "C" AMPR_LIBKERNEL_HOOK_EXPORT void amprFlushLibkernelHookLog(void) {
                                   g_hookMandatoryInstalledCount,
                                   g_hookMandatoryMissingCount,
                                   g_hookMandatoryFailedCount,
-                                  static_cast<unsigned long long>(g_hookCapabilityMask),
-                                  static_cast<unsigned long long>(g_hookMandatoryMask),
-                                  static_cast<unsigned long long>(g_hookOptionalMask),
-                                  static_cast<unsigned long long>(g_hookMandatoryCapabilityMask),
+                                  static_cast<unsigned long long>(hook_mask_high(g_hookCapabilityMask)),
+                                  static_cast<unsigned long long>(hook_mask_low(g_hookCapabilityMask)),
+                                  static_cast<unsigned long long>(hook_mask_high(g_hookMandatoryMask)),
+                                  static_cast<unsigned long long>(hook_mask_low(g_hookMandatoryMask)),
+                                  static_cast<unsigned long long>(hook_mask_high(g_hookOptionalMask)),
+                                  static_cast<unsigned long long>(hook_mask_low(g_hookOptionalMask)),
+                                  static_cast<unsigned long long>(hook_mask_high(g_hookMandatoryCapabilityMask)),
+                                  static_cast<unsigned long long>(hook_mask_low(g_hookMandatoryCapabilityMask)),
                                   kHookCount);
     }
 

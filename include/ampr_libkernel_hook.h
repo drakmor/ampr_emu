@@ -15,11 +15,11 @@ extern "C" {
 #endif
 
 typedef enum AmprLibkernelHookId {
-    kAmprLibkernelHook_sceKernelOpen = 0,
-    kAmprLibkernelHook_sceKernelStat,
+    kAmprLibkernelHook_open = 0,
+    kAmprLibkernelHook_stat,
     kAmprLibkernelHook_sceKernelCheckReachability,
-    kAmprLibkernelHook_sceKernelUnlink,
-    kAmprLibkernelHook_sceKernelRename,
+    kAmprLibkernelHook_unlink,
+    kAmprLibkernelHook_rename,
     kAmprLibkernelHook_sceKernelMprotect,
     kAmprLibkernelHook_sceKernelMtypeprotect,
     kAmprLibkernelHook_sceKernelMapFlexibleMemory,
@@ -81,14 +81,42 @@ typedef enum AmprLibkernelHookId {
     kAmprLibkernelHook_sceKernelAddAmprSystemEvent,
     kAmprLibkernelHook_sceKernelDeleteAmprSystemEvent,
 #endif
+#if AMPR_EMU_PACK_ENABLE && (AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE || AMPR_EMU_PACK_PROCESS_OPEN_ENABLE)
+    kAmprLibkernelHook_sceKernelClose,
+    kAmprLibkernelHook_close,
+    kAmprLibkernelHook_fstat,
+    kAmprLibkernelHook_lseek,
+#endif
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+    kAmprLibkernelHook_getdents,
+    kAmprLibkernelHook_getdirentries,
+#endif
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_INTERCEPT_PROCESS_SYNC_READS
+    kAmprLibkernelHook_pread,
+    kAmprLibkernelHook_preadv,
+    kAmprLibkernelHook_read,
+    kAmprLibkernelHook_readv,
+#endif
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_INTERCEPT_PROCESS_AIO
+    kAmprLibkernelHook_sceKernelAioSubmitReadCommands,
+    kAmprLibkernelHook_sceKernelAioSubmitReadCommandsMultiple,
+    kAmprLibkernelHook_sceKernelAioPollRequest,
+    kAmprLibkernelHook_sceKernelAioPollRequests,
+    kAmprLibkernelHook_sceKernelAioWaitRequest,
+    kAmprLibkernelHook_sceKernelAioWaitRequests,
+    kAmprLibkernelHook_sceKernelAioCancelRequest,
+    kAmprLibkernelHook_sceKernelAioCancelRequests,
+    kAmprLibkernelHook_sceKernelAioDeleteRequest,
+    kAmprLibkernelHook_sceKernelAioDeleteRequests,
+#endif
     kAmprLibkernelHook_Count
 } AmprLibkernelHookId;
 
 #if AMPR_EMU_APR_LOCAL_EQUEUE
 /*
  * Event producers exported by loaded system libraries other than libkernel.
- * They use separate detour/original storage because the libkernel capability
- * mask already occupies all 64 bits.
+ * They use separate detour/original storage because they are refreshed on a
+ * different module-loading path than the core libkernel hook set.
  */
 typedef enum AmprExternalEqueueHookId {
     kAmprExternalEqueueHook_sceAgcDriverAddEqEvent = 0,
@@ -111,6 +139,10 @@ typedef enum AmprExternalEqueueHookId {
 AMPR_LIBKERNEL_HOOK_EXPORT int amprInstallLibkernelHooks(void);
 AMPR_LIBKERNEL_HOOK_EXPORT int amprUninstallLibkernelHooks(void);
 AMPR_LIBKERNEL_HOOK_EXPORT int amprLibkernelHooksInstalled(void);
+// Returns non-zero only when every process-wide read hook required for safely
+// returning packed virtual FDs to arbitrary title code is installed.
+AMPR_LIBKERNEL_HOOK_EXPORT int amprPackProcessOpenHooksReady(void);
+AMPR_LIBKERNEL_HOOK_EXPORT int amprPackProcessReadHooksReady(void);
 
 #if AMPR_EMU_LIBKERNEL_HOOK_DIAGNOSTICS
 AMPR_LIBKERNEL_HOOK_EXPORT void amprFlushLibkernelHookLog(void);

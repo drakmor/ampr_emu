@@ -41,7 +41,8 @@ inline int ammMeasureSizeToInt(int rc, uint64_t bytes64) {
 template <typename MeasureFn>
 inline int measureAmmKernelRecord(MeasureFn measure) {
     uint64_t bytes64 = 0;
-    return ammMeasureSizeToInt(measure(&bytes64), bytes64);
+    const int rc = measure(&bytes64);
+    return ammMeasureSizeToInt(rc, bytes64);
 }
 
 uint32_t ammKernelProt(uint32_t prot);
@@ -161,6 +162,11 @@ int ammGiveDirectMemory(off_t searchStart,
                         size_t align,
                         int usage,
                         off_t* dmemOffset);
+inline constexpr int kAmmSubmitRetryRc = -2147352541;
+// Internal reactor leaf: exactly one native attempt, no retry sleep.
+int ammTrySubmitCommandBufferLeaf(uint64_t bufferBase,
+                                 uint32_t currentOffset,
+                                 uint32_t prio);
 int ammSubmitCommandBufferLeaf(uint64_t bufferBase,
                                uint32_t currentOffset,
                                uint32_t prio,

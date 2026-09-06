@@ -43,11 +43,11 @@ struct AmprCommandLogSubmitInfo {
 #if AMPR_EMU_COMMAND_LOG
 void startCommandLog();
 void commandLogSubmit(const AmprCommandLogSubmitInfo& info);
-void shutdownCommandLog();
+int shutdownCommandLog();
 #else
 inline void startCommandLog() {}
 inline void commandLogSubmit(const AmprCommandLogSubmitInfo&) {}
-inline void shutdownCommandLog() {}
+inline int shutdownCommandLog() { return 0; }
 #endif
 
 } // namespace sce::Ampr::Emu

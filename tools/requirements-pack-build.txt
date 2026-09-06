@@ -1,0 +1,2 @@
+-r requirements-pack.txt
+pyinstaller>=6.10,<7

@@ -13,10 +13,12 @@
 namespace sce::Ampr::Emu {
 
 inline constexpr uint64_t protWithCpuRwForAmprWrite(uint64_t prot) {
-    if ((prot & SCE_KERNEL_PROT_AMPR_WRITE) == 0 ||
-        (prot & SCE_KERNEL_PROT_CPU_RW) != 0) {
+    if ((prot & SCE_KERNEL_PROT_AMPR_WRITE) == 0) {
         return prot;
     }
+    // AMPR write destinations are treated as writable unconditionally. Keep
+    // publishing CPU_RW in the effective mapping, but never query or test the
+    // incoming CPU write bit as an admission condition.
     return (prot & ~static_cast<uint64_t>(SCE_KERNEL_PROT_CPU_READ)) |
            SCE_KERNEL_PROT_CPU_RW;
 }

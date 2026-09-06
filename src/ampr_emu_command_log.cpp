@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include <_fs.h>
 #include <_kernel.h>
 #include <fcntl.h>
 #include <time.h>
@@ -192,13 +193,25 @@ void commandLogRingCopyOut(size_t offset, void* data, size_t bytes) {
 }
 
 int commandLogOpenOriginal(const char* path, int flags, SceKernelMode mode) {
-    if (amprLibkernelHooksInstalled()) {
-        using Fn = int (*)(const char*, int, SceKernelMode);
-        if (Fn fn = ampr_fixed_kernel_slot<Fn>(kAmprLibkernelHook_sceKernelOpen)) {
-            return fn(path, flags, mode);
-        }
+    using Fn = int (*)(const char*, int, SceKernelMode);
+    if (Fn fn = ampr_fixed_kernel_slot<Fn>(kAmprLibkernelHook_open)) {
+        return fn(path, flags, mode);
     }
-    return sceKernelOpen(path, flags, mode);
+    if (Fn fn = ampr_dynamic_kernel_func_or_null<Fn>("open")) {
+        return fn(path, flags, mode);
+    }
+    return -1;
+}
+
+int commandLogCloseOriginal(int fd) {
+    using Fn = int (*)(int);
+#if AMPR_EMU_PACK_ENABLE && (AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE || AMPR_EMU_PACK_PROCESS_OPEN_ENABLE)
+    if (Fn fn = ampr_fixed_kernel_slot<Fn>(kAmprLibkernelHook_close)) {
+        return fn(fd);
+    }
+#endif
+    if (Fn fn = ampr_dynamic_kernel_func_or_null<Fn>("close")) return fn(fd);
+    return -1;
 }
 
 int commandLogOpenForWriter(CommandLogState& state) {
@@ -232,7 +245,7 @@ void commandLogCloseForWriter(CommandLogState& state) {
 #if AMPR_EMU_COMMAND_LOG_FSYNC_ON_SHUTDOWN
         (void)sceKernelFsync(fd);
 #endif
-        (void)sceKernelClose(fd);
+        (void)commandLogCloseOriginal(fd);
     }
 }
 
@@ -617,7 +630,9 @@ void commandLogSubmit(const AmprCommandLogSubmitInfo& info) {
     }
 }
 
-void shutdownCommandLog() {
+int shutdownCommandLog() {
+    static AmprMutex stopMutex;
+    AmprLockGuard stopGuard(stopMutex);
     CommandLogState& state = commandLogState();
     state.shutdownRequested.store(true, std::memory_order_release);
     state.writerStop.store(true, std::memory_order_release);
@@ -629,13 +644,16 @@ void shutdownCommandLog() {
         joinWriter = state.writerStarted.load(std::memory_order_acquire) &&
                      state.writerJoinable;
         writer = state.writer;
-        state.writerJoinable = false;
     }
     state.cv.notify_all();
 
     if (joinWriter) {
-        (void)scePthreadJoin(writer, nullptr);
+        const int rc = scePthreadJoin(writer, nullptr);
+        if (rc != 0) return rc;
+        AmprLockGuard guard(state.mutex);
+        state.writerJoinable = false;
     }
+    return 0;
 }
 
 } // namespace sce::Ampr::Emu

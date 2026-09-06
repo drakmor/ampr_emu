@@ -4,9 +4,15 @@
     <ExpectedProsperoSdkDir>C:\SCE\Prospero SDKs\2.000</ExpectedProsperoSdkDir>
     <AmprProsperoSdkDir>$(ExpectedProsperoSdkDir)</AmprProsperoSdkDir>
     <AmprExtraPreprocessorDefinitions Condition="'$(AmprExtraPreprocessorDefinitions)'==''"></AmprExtraPreprocessorDefinitions>
-    <AmprOutDir>$(SolutionDir)out\$(Platform)_$(Configuration)\</AmprOutDir>
+    <AmprBuildFlavor Condition="'$(AmprBuildFlavor)'=='' and ('$(Configuration)'=='DebugHooksLooseStdio' or '$(Configuration)'=='ReleaseHooksLooseStdio')">LooseStdio</AmprBuildFlavor>
+    <AmprBuildFlavor Condition="'$(AmprBuildFlavor)'=='' and ('$(Configuration)'=='DebugHooksPackedStdio' or '$(Configuration)'=='ReleaseHooksPackedStdio')">PackedStdio</AmprBuildFlavor>
+    <AmprBuildFlavor Condition="'$(AmprBuildFlavor)'==''">Default</AmprBuildFlavor>
+    <AmprDebugBuild Condition="'$(AmprDebugBuild)'=='' and ('$(Configuration)'=='DebugHooksLooseStdio' or '$(Configuration)'=='DebugHooksPackedStdio')">1</AmprDebugBuild>
+    <AmprDebugBuild Condition="'$(AmprDebugBuild)'=='' and ('$(Configuration)'=='ReleaseHooksLooseStdio' or '$(Configuration)'=='ReleaseHooksPackedStdio')">0</AmprDebugBuild>
+    <AmprBuildFlavorSuffix Condition="'$(AmprBuildFlavor)'!='Default' and '$(Configuration)'=='ReleaseHooks'">_$(AmprBuildFlavor)</AmprBuildFlavorSuffix>
+    <AmprOutDir>$(SolutionDir)out\$(Platform)_$(Configuration)$(AmprBuildFlavorSuffix)\</AmprOutDir>
     <OutDir>$(AmprOutDir)</OutDir>
-    <IntDir>$(SolutionDir)out\obj\$(MSBuildProjectName)\$(Platform)_$(Configuration)\</IntDir>
+    <IntDir>$(SolutionDir)out\obj\$(MSBuildProjectName)\$(Platform)_$(Configuration)$(AmprBuildFlavorSuffix)\</IntDir>
   </PropertyGroup>
 
   <Target Name="ValidateProsperoSdk" BeforeTargets="PrepareForBuild">
@@ -14,6 +20,8 @@
            Text="This repository is pinned to ProsperoSdkVersion 2.000. Set ProsperoSdkVersion in the project Globals before Microsoft.Cpp.Default.props so the VS Prospero integration does not select another installed SDK." />
     <Error Condition="!Exists('$(AmprProsperoSdkDir)')"
            Text="Install the canonical Prospero SDK at $(ExpectedProsperoSdkDir) before building this repository." />
+    <Error Condition="'$(AmprBuildFlavor)'!='Default' and '$(AmprBuildFlavor)'!='LooseStdio' and '$(AmprBuildFlavor)'!='PackedStdio'"
+           Text="Unsupported AmprBuildFlavor '$(AmprBuildFlavor)'. Use Default, LooseStdio, or PackedStdio." />
   </Target>
 
   <ItemDefinitionGroup>
@@ -27,10 +35,11 @@
     </ClCompile>
   </ItemDefinitionGroup>
 
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseHooks|Prospero'">
+  <ItemDefinitionGroup Condition="'$(Platform)'=='Prospero' and ('$(Configuration)'=='ReleaseHooks' or '$(Configuration)'=='DebugHooksLooseStdio' or '$(Configuration)'=='DebugHooksPackedStdio' or '$(Configuration)'=='ReleaseHooksLooseStdio' or '$(Configuration)'=='ReleaseHooksPackedStdio')">
     <ClCompile>
       <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <OptimizationLevel>Level2</OptimizationLevel>
     </ClCompile>
   </ItemDefinitionGroup>
+
 </Project>

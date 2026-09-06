@@ -19,6 +19,9 @@
     return path ? path : "(null)";
 }
 namespace {
+static_assert(AMPR_EMU_FD_CACHE_PROTECTED_PERCENT <= 100u,
+              "FD-cache protected SLRU percentage must be <= 100");
+
 static void fd_cache_invariant_violation(const char* reason,
                                          size_t value = 0,
                                          size_t expected = 0) {
@@ -34,6 +37,11 @@ static void fd_cache_invariant_violation(const char* reason,
 struct FileState {
     AmprMutex m;
     static constexpr uint32_t kInvalidRuntimeIndex = UINT32_MAX;
+    enum class Segment : uint8_t {
+        Probationary = 0,
+        Protected = 1,
+        Count = 2,
+    };
     struct RuntimeFile {
         uint32_t id{0};
         int fd{-1};
@@ -45,7 +53,9 @@ struct FileState {
         uint32_t hashNextPlusOne{0};
         uint32_t freeNext{kInvalidRuntimeIndex};
         uint32_t closedNext{kInvalidRuntimeIndex};
+        Segment segment{Segment::Probationary};
         bool active{false};
+        bool physicalFd{false};
         bool onUnpinnedOpenList{false};
         bool onClosedList{false};
     };
@@ -60,8 +70,19 @@ struct FileState {
     size_t pinnedOpenCount{0};
     size_t openPinCount{0};
     size_t evictableOpenCount{0};
-    uint32_t unpinnedOpenHead{kInvalidRuntimeIndex};
-    uint32_t unpinnedOpenTail{kInvalidRuntimeIndex};
+    size_t physicalOpenCount{0};
+    size_t physicalPinnedOpenCount{0};
+    size_t physicalOpenPinCount{0};
+    size_t physicalEvictableOpenCount{0};
+    uint32_t segmentHead[static_cast<size_t>(Segment::Count)]{
+        kInvalidRuntimeIndex, kInvalidRuntimeIndex};
+    uint32_t segmentTail[static_cast<size_t>(Segment::Count)]{
+        kInvalidRuntimeIndex, kInvalidRuntimeIndex};
+    size_t segmentCount[static_cast<size_t>(Segment::Count)]{};
+    uint64_t slruPromotions{};
+    uint64_t slruDemotions{};
+    uint64_t slruProbationaryEvictions{};
+    uint64_t slruProtectedEvictions{};
     uint32_t freeHead{kInvalidRuntimeIndex};
     uint32_t closedHead{kInvalidRuntimeIndex};
     size_t freeCount{0};
@@ -159,11 +180,21 @@ static void fd_runtime_lists_ensure_locked(FileState& fs) {
     fs.closedHead = FileState::kInvalidRuntimeIndex;
     fs.freeCount = 0;
     fs.closedCount = 0;
+    for (size_t segment = 0;
+         segment < static_cast<size_t>(FileState::Segment::Count);
+         ++segment) {
+        fs.segmentHead[segment] = FileState::kInvalidRuntimeIndex;
+        fs.segmentTail[segment] = FileState::kInvalidRuntimeIndex;
+        fs.segmentCount[segment] = 0;
+    }
     for (uint32_t i = 0; i < FileState::kRuntimeCapacity; ++i) {
         FileState::RuntimeFile& entry = fs.runtime[i];
         entry.freeNext = FileState::kInvalidRuntimeIndex;
         entry.closedNext = FileState::kInvalidRuntimeIndex;
         entry.onClosedList = false;
+        entry.onUnpinnedOpenList = false;
+        entry.lruPrev = FileState::kInvalidRuntimeIndex;
+        entry.lruNext = FileState::kInvalidRuntimeIndex;
         if (!entry.active) {
             entry.freeNext = fs.freeHead;
             fs.freeHead = i;
@@ -240,6 +271,10 @@ static void fd_runtime_hash_link_locked(FileState& fs, FileState::RuntimeFile& e
     fs.runtimeHashHeads[bucket] = index + 1u;
 }
 
+static constexpr size_t fd_runtime_segment_index(FileState::Segment segment) {
+    return static_cast<size_t>(segment);
+}
+
 static void fd_runtime_lru_unlink_locked(FileState& fs, FileState::RuntimeFile& entry) {
     if (!entry.onUnpinnedOpenList) {
         entry.lruPrev = FileState::kInvalidRuntimeIndex;
@@ -247,15 +282,21 @@ static void fd_runtime_lru_unlink_locked(FileState& fs, FileState::RuntimeFile& 
         return;
     }
     const uint32_t index = fd_runtime_index_locked(fs, &entry);
+    const size_t segment = fd_runtime_segment_index(entry.segment);
     if (entry.lruPrev != FileState::kInvalidRuntimeIndex) {
         fs.runtime[entry.lruPrev].lruNext = entry.lruNext;
-    } else if (fs.unpinnedOpenHead == index) {
-        fs.unpinnedOpenHead = entry.lruNext;
+    } else if (fs.segmentHead[segment] == index) {
+        fs.segmentHead[segment] = entry.lruNext;
     }
     if (entry.lruNext != FileState::kInvalidRuntimeIndex) {
         fs.runtime[entry.lruNext].lruPrev = entry.lruPrev;
-    } else if (fs.unpinnedOpenTail == index) {
-        fs.unpinnedOpenTail = entry.lruPrev;
+    } else if (fs.segmentTail[segment] == index) {
+        fs.segmentTail[segment] = entry.lruPrev;
+    }
+    if (fs.segmentCount[segment] == 0) {
+        fd_cache_invariant_violation("segment-count-underflow", 0, 1);
+    } else {
+        --fs.segmentCount[segment];
     }
     entry.lruPrev = FileState::kInvalidRuntimeIndex;
     entry.lruNext = FileState::kInvalidRuntimeIndex;
@@ -271,23 +312,145 @@ static void fd_runtime_lru_append_locked(FileState& fs, FileState::RuntimeFile& 
         return;
     }
     fd_runtime_lru_unlink_locked(fs, entry);
-    entry.lruPrev = fs.unpinnedOpenTail;
+    const size_t segment = fd_runtime_segment_index(entry.segment);
+    entry.lruPrev = fs.segmentTail[segment];
     entry.lruNext = FileState::kInvalidRuntimeIndex;
-    if (fs.unpinnedOpenTail != FileState::kInvalidRuntimeIndex) {
-        fs.runtime[fs.unpinnedOpenTail].lruNext = index;
+    if (fs.segmentTail[segment] != FileState::kInvalidRuntimeIndex) {
+        fs.runtime[fs.segmentTail[segment]].lruNext = index;
     } else {
-        fs.unpinnedOpenHead = index;
+        fs.segmentHead[segment] = index;
     }
-    fs.unpinnedOpenTail = index;
+    fs.segmentTail[segment] = index;
+    ++fs.segmentCount[segment];
     entry.onUnpinnedOpenList = true;
 }
 
-static void fd_runtime_note_open_locked(FileState& fs, FileState::RuntimeFile& entry, int fd) {
+static size_t fd_runtime_protected_target_locked(const FileState& fs) {
+#if !AMPR_EMU_FD_CACHE_SLRU
+    (void)fs;
+    return SIZE_MAX;
+#else
+    if (fs.evictableOpenCount == 0 || AMPR_EMU_FD_CACHE_PROTECTED_PERCENT == 0) {
+        return 0;
+    }
+    size_t target =
+        (fs.evictableOpenCount * AMPR_EMU_FD_CACHE_PROTECTED_PERCENT) / 100u;
+    if (target == 0) target = 1;
+    if (AMPR_EMU_FD_CACHE_PROTECTED_PERCENT < 100u &&
+        fs.evictableOpenCount > 1u && target >= fs.evictableOpenCount) {
+        target = fs.evictableOpenCount - 1u;
+    }
+    if (target > fs.evictableOpenCount) target = fs.evictableOpenCount;
+    return target;
+#endif
+}
+
+static void fd_runtime_balance_segments_locked(FileState& fs) {
+#if AMPR_EMU_FD_CACHE_SLRU
+    const size_t protectedIndex =
+        fd_runtime_segment_index(FileState::Segment::Protected);
+    const size_t target = fd_runtime_protected_target_locked(fs);
+    while (fs.segmentCount[protectedIndex] > target &&
+           fs.segmentHead[protectedIndex] != FileState::kInvalidRuntimeIndex) {
+        FileState::RuntimeFile& demoted =
+            fs.runtime[fs.segmentHead[protectedIndex]];
+        fd_runtime_lru_unlink_locked(fs, demoted);
+        demoted.segment = FileState::Segment::Probationary;
+        fd_runtime_lru_append_locked(fs, demoted);
+        ++fs.slruDemotions;
+    }
+#else
+    (void)fs;
+#endif
+}
+
+static void fd_runtime_promote_locked(FileState& fs, FileState::RuntimeFile& entry) {
+#if AMPR_EMU_FD_CACHE_SLRU
+    if (entry.segment == FileState::Segment::Protected) {
+        return;
+    }
+    const bool relink = entry.onUnpinnedOpenList;
+    if (relink) fd_runtime_lru_unlink_locked(fs, entry);
+    entry.segment = FileState::Segment::Protected;
+    if (relink) fd_runtime_lru_append_locked(fs, entry);
+    ++fs.slruPromotions;
+    fd_runtime_balance_segments_locked(fs);
+#else
+    (void)fs;
+    (void)entry;
+#endif
+}
+
+static FileState::RuntimeFile* fd_runtime_evict_candidate_locked(
+    FileState& fs,
+    bool physicalOnly = false) {
+    const size_t probationary =
+        fd_runtime_segment_index(FileState::Segment::Probationary);
+    const size_t protectedIndex =
+        fd_runtime_segment_index(FileState::Segment::Protected);
+    uint32_t index = fs.segmentHead[probationary];
+    while (index != FileState::kInvalidRuntimeIndex &&
+           physicalOnly && !fs.runtime[index].physicalFd) {
+        index = fs.runtime[index].lruNext;
+    }
+    if (index == FileState::kInvalidRuntimeIndex) {
+        index = fs.segmentHead[protectedIndex];
+        while (index != FileState::kInvalidRuntimeIndex &&
+               physicalOnly && !fs.runtime[index].physicalFd) {
+            index = fs.runtime[index].lruNext;
+        }
+    }
+    return index != FileState::kInvalidRuntimeIndex ? &fs.runtime[index] : nullptr;
+}
+
+static FileState::RuntimeFile* fd_runtime_oldest_idle_locked(FileState& fs) {
+    const size_t probationary =
+        fd_runtime_segment_index(FileState::Segment::Probationary);
+    const size_t protectedIndex =
+        fd_runtime_segment_index(FileState::Segment::Protected);
+    FileState::RuntimeFile* a = fs.segmentHead[probationary] != FileState::kInvalidRuntimeIndex
+        ? &fs.runtime[fs.segmentHead[probationary]] : nullptr;
+    FileState::RuntimeFile* b = fs.segmentHead[protectedIndex] != FileState::kInvalidRuntimeIndex
+        ? &fs.runtime[fs.segmentHead[protectedIndex]] : nullptr;
+    if (!a) return b;
+    if (!b) return a;
+    if (a->lastUseNs == 0) return a;
+    if (b->lastUseNs == 0) return b;
+    return a->lastUseNs <= b->lastUseNs ? a : b;
+}
+
+static int fd_runtime_detach_fd_locked(FileState& fs,
+                                       FileState::RuntimeFile& entry);
+
+static int fd_runtime_detach_eviction_locked(FileState& fs,
+                                             FileState::RuntimeFile& entry) {
+    const bool protectedVictim =
+        entry.segment == FileState::Segment::Protected;
+    const int fd = fd_runtime_detach_fd_locked(fs, entry);
+#if AMPR_EMU_FD_CACHE_SLRU
+    if (fd >= 0) {
+        if (protectedVictim) {
+            ++fs.slruProtectedEvictions;
+        } else {
+            ++fs.slruProbationaryEvictions;
+        }
+    }
+#else
+    (void)protectedVictim;
+#endif
+    return fd;
+}
+
+static void fd_runtime_note_open_locked(FileState& fs,
+                                        FileState::RuntimeFile& entry,
+                                        int fd,
+                                        bool physicalFd) {
     if (entry.fd >= 0) {
         return;
     }
     fd_runtime_closed_unlink_locked(fs, entry);
     entry.fd = fd;
+    entry.physicalFd = physicalFd;
     ++fs.openCount;
     if (entry.pinCount != 0) {
         ++fs.pinnedOpenCount;
@@ -296,6 +459,15 @@ static void fd_runtime_note_open_locked(FileState& fs, FileState::RuntimeFile& e
         ++fs.evictableOpenCount;
         fd_runtime_lru_append_locked(fs, entry);
     }
+    if (physicalFd) {
+        ++fs.physicalOpenCount;
+        if (entry.pinCount != 0) {
+            ++fs.physicalPinnedOpenCount;
+            fs.physicalOpenPinCount += entry.pinCount;
+        } else {
+            ++fs.physicalEvictableOpenCount;
+        }
+    }
 }
 
 static int fd_runtime_detach_fd_locked(FileState& fs, FileState::RuntimeFile& entry) {
@@ -303,6 +475,7 @@ static int fd_runtime_detach_fd_locked(FileState& fs, FileState::RuntimeFile& en
         return -1;
     }
     const int fd = entry.fd;
+    const bool physicalFd = entry.physicalFd;
     if (entry.pinCount != 0) {
         if (fs.pinnedOpenCount == 0) {
             fd_cache_invariant_violation("detach-pinned-open-underflow",
@@ -331,7 +504,39 @@ static int fd_runtime_detach_fd_locked(FileState& fs, FileState::RuntimeFile& en
     } else {
         --fs.openCount;
     }
+    if (physicalFd) {
+        if (fs.physicalOpenCount == 0) {
+            fd_cache_invariant_violation(
+                "detach-physical-open-underflow", fs.physicalOpenCount, 1);
+        } else {
+            --fs.physicalOpenCount;
+        }
+        if (entry.pinCount != 0) {
+            if (fs.physicalPinnedOpenCount == 0) {
+                fd_cache_invariant_violation(
+                    "detach-physical-pinned-underflow",
+                    fs.physicalPinnedOpenCount, 1);
+            } else {
+                --fs.physicalPinnedOpenCount;
+            }
+            if (fs.physicalOpenPinCount < entry.pinCount) {
+                fd_cache_invariant_violation(
+                    "detach-physical-pin-underflow",
+                    fs.physicalOpenPinCount, entry.pinCount);
+                fs.physicalOpenPinCount = 0;
+            } else {
+                fs.physicalOpenPinCount -= entry.pinCount;
+            }
+        } else if (fs.physicalEvictableOpenCount == 0) {
+            fd_cache_invariant_violation(
+                "detach-physical-evictable-underflow",
+                fs.physicalEvictableOpenCount, 1);
+        } else {
+            --fs.physicalEvictableOpenCount;
+        }
+    }
     entry.fd = -1;
+    entry.physicalFd = false;
     if (entry.pinCount == 0) {
         fd_runtime_closed_push_locked(fs, entry);
     }
@@ -382,6 +587,19 @@ static void fd_runtime_note_pin_locked(FileState& fs, FileState::RuntimeFile& en
             --fs.evictableOpenCount;
         }
         ++fs.pinnedOpenCount;
+        if (entry.physicalFd) {
+            if (fs.physicalEvictableOpenCount == 0) {
+                fd_cache_invariant_violation(
+                    "pin-physical-evictable-underflow",
+                    fs.physicalEvictableOpenCount, 1);
+            } else {
+                --fs.physicalEvictableOpenCount;
+            }
+            ++fs.physicalPinnedOpenCount;
+        }
+    }
+    if (entry.physicalFd) {
+        ++fs.physicalOpenPinCount;
     }
 }
 
@@ -403,6 +621,14 @@ static void fd_runtime_note_unpin_locked(FileState& fs, FileState::RuntimeFile& 
     } else {
         --fs.openPinCount;
     }
+    if (entry.physicalFd) {
+        if (fs.physicalOpenPinCount == 0) {
+            fd_cache_invariant_violation(
+                "unpin-physical-pin-underflow", fs.physicalOpenPinCount, 1);
+        } else {
+            --fs.physicalOpenPinCount;
+        }
+    }
     if (oldPins == 1) {
         if (fs.pinnedOpenCount == 0) {
             fd_cache_invariant_violation("unpin-pinned-open-underflow",
@@ -411,7 +637,18 @@ static void fd_runtime_note_unpin_locked(FileState& fs, FileState::RuntimeFile& 
             --fs.pinnedOpenCount;
         }
         ++fs.evictableOpenCount;
+        if (entry.physicalFd) {
+            if (fs.physicalPinnedOpenCount == 0) {
+                fd_cache_invariant_violation(
+                    "unpin-physical-pinned-underflow",
+                    fs.physicalPinnedOpenCount, 1);
+            } else {
+                --fs.physicalPinnedOpenCount;
+            }
+            ++fs.physicalEvictableOpenCount;
+        }
         fd_runtime_lru_append_locked(fs, entry);
+        fd_runtime_balance_segments_locked(fs);
     }
 }
 
@@ -430,6 +667,8 @@ static constexpr size_t kFdOpenBudgetMinCap =
 static std::atomic<size_t> g_fd_open_budget_effective_cap{kFdOpenBudgetBaseCap};
 static std::atomic<size_t> g_fd_cache_effective_cap{AMPR_EMU_FD_CACHE_CAP};
 static std::atomic<size_t> g_fd_direct_open_count{0};
+static std::atomic<size_t> g_fd_pack_open_count{0};
+static std::atomic<uint64_t> g_fd_budget_progress_generation{1};
 static std::atomic<uint64_t> g_fd_cache_open_pressure_generation{0};
 static std::atomic<uint64_t> g_fd_cache_last_idle_scan_ns{0};
 #if AMPR_EMU_DEBUG_LOG
@@ -474,7 +713,15 @@ void ampr_index_fd_open_budget_set_effective_cap(size_t cap) {
     if (cap < minCap) {
         cap = minCap;
     }
-    g_fd_open_budget_effective_cap.store(cap, std::memory_order_relaxed);
+    const size_t oldCap = g_fd_open_budget_effective_cap.exchange(
+        cap, std::memory_order_acq_rel);
+    if (cap > oldCap) {
+        g_fd_budget_progress_generation.fetch_add(
+            1, std::memory_order_release);
+#if AMPR_EMU_PACK_ENABLE
+        ampr_pack_notify_fd_budget_progress();
+#endif
+    }
 }
 
 static FdPressureCaps fd_pressure_caps_for_budget(size_t fdBudget) {
@@ -535,9 +782,11 @@ static FileState::RuntimeFile* fd_runtime_create_locked(FileState& fs, uint32_t 
     if (!reusable) {
         reusable = fd_runtime_pop_closed_locked(fs);
     }
-    if (!reusable && fs.unpinnedOpenHead != FileState::kInvalidRuntimeIndex) {
-        reusable = &fs.runtime[fs.unpinnedOpenHead];
-        const int fd = fd_runtime_detach_fd_locked(fs, *reusable);
+    if (!reusable) {
+        reusable = fd_runtime_evict_candidate_locked(fs);
+    }
+    if (reusable && reusable->fd >= 0) {
+        const int fd = fd_runtime_detach_eviction_locked(fs, *reusable);
         if (outFdToClose) {
             *outFdToClose = fd;
         }
@@ -552,10 +801,13 @@ static FileState::RuntimeFile* fd_runtime_create_locked(FileState& fs, uint32_t 
 
 struct FdCacheStats {
     size_t entries{};
+    size_t handles{};
     size_t open{};
     size_t pinnedOpen{};
     size_t pins{};
     size_t evictable{};
+    size_t probationary{};
+    size_t protectedEntries{};
 };
 
 class FdCloseList {
@@ -604,6 +856,18 @@ size_t ampr_index_fd_direct_open_count() {
     return g_fd_direct_open_count.load(std::memory_order_relaxed);
 }
 
+size_t ampr_index_fd_pack_open_count() {
+    return g_fd_pack_open_count.load(std::memory_order_relaxed);
+}
+
+size_t ampr_index_fd_uncached_open_count() {
+    return ampr_index_fd_direct_open_count() + ampr_index_fd_pack_open_count();
+}
+
+uint64_t ampr_index_fd_open_budget_progress_generation() {
+    return g_fd_budget_progress_generation.load(std::memory_order_acquire);
+}
+
 void ampr_index_fd_direct_note_open() {
     g_fd_direct_open_count.fetch_add(1, std::memory_order_relaxed);
 }
@@ -619,13 +883,42 @@ void ampr_index_fd_direct_note_close() {
                                                          oldValue - 1,
                                                          std::memory_order_relaxed,
                                                          std::memory_order_relaxed)) {
+            g_fd_budget_progress_generation.fetch_add(1, std::memory_order_release);
+#if AMPR_EMU_PACK_ENABLE
+            ampr_pack_notify_fd_budget_progress();
+#endif
+            return;
+        }
+    }
+}
+
+void ampr_index_fd_pack_note_open() {
+    g_fd_pack_open_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ampr_index_fd_pack_note_close() {
+    size_t oldValue = g_fd_pack_open_count.load(std::memory_order_relaxed);
+    for (;;) {
+        if (oldValue == 0) {
+            fd_cache_invariant_violation("pack-open-count-underflow", oldValue, 1);
+            return;
+        }
+        if (g_fd_pack_open_count.compare_exchange_weak(
+                oldValue,
+                oldValue - 1,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            g_fd_budget_progress_generation.fetch_add(1, std::memory_order_release);
+#if AMPR_EMU_PACK_ENABLE
+            ampr_pack_notify_fd_budget_progress();
+#endif
             return;
         }
     }
 }
 
 static size_t fd_observed_open_count(const FdCacheStats& cacheStats) {
-    return cacheStats.open + ampr_index_fd_direct_open_count();
+    return cacheStats.open + ampr_index_fd_uncached_open_count();
 }
 
 static FdPressureCaps fd_open_budget_mark_emfile(size_t observedOpen) {
@@ -664,25 +957,24 @@ void ampr_index_fd_cache_set_effective_cap(size_t cap) {
     g_fd_cache_effective_cap.store(cap, std::memory_order_relaxed);
 }
 
-static size_t fd_cache_budget_cap_for_direct_count(size_t directOpen) {
+static size_t fd_cache_budget_cap_for_uncached_count(size_t uncachedOpen) {
     const size_t budget = ampr_index_fd_open_budget_effective_cap();
-    return directOpen < budget ? budget - directOpen : 0;
-}
-
-static size_t fd_cache_open_cap_for_current_budget() {
-    const size_t cacheCap = fd_cache_effective_cap();
-    const size_t budgetCap = fd_cache_budget_cap_for_direct_count(ampr_index_fd_direct_open_count());
-    return cacheCap < budgetCap ? cacheCap : budgetCap;
+    return uncachedOpen < budget ? budget - uncachedOpen : 0;
 }
 
 static FdCacheStats fd_cache_stats_locked() {
     FdCacheStats stats{};
     const auto& fs = file_state();
     stats.entries = fs.activeCount;
-    stats.open = fs.openCount;
-    stats.pinnedOpen = fs.pinnedOpenCount;
-    stats.pins = fs.openPinCount;
-    stats.evictable = fs.evictableOpenCount;
+    stats.handles = fs.openCount;
+    stats.open = fs.physicalOpenCount;
+    stats.pinnedOpen = fs.physicalPinnedOpenCount;
+    stats.pins = fs.physicalOpenPinCount;
+    stats.evictable = fs.physicalEvictableOpenCount;
+    stats.probationary = fs.segmentCount[
+        fd_runtime_segment_index(FileState::Segment::Probationary)];
+    stats.protectedEntries = fs.segmentCount[
+        fd_runtime_segment_index(FileState::Segment::Protected)];
     return stats;
 }
 
@@ -706,10 +998,10 @@ static void fd_cache_collect_evictions_locked(FdCloseList& fdsToClose,
         cap = fd_cache_effective_cap();
     }
     auto& fs = file_state();
-    while (fs.openCount + reserve > cap &&
-           fs.unpinnedOpenHead != FileState::kInvalidRuntimeIndex) {
-        FileState::RuntimeFile& victim = fs.runtime[fs.unpinnedOpenHead];
-        const int fd = fd_runtime_detach_fd_locked(fs, victim);
+    while (fs.openCount + reserve > cap) {
+        FileState::RuntimeFile* victim = fd_runtime_evict_candidate_locked(fs);
+        if (!victim) break;
+        const int fd = fd_runtime_detach_eviction_locked(fs, *victim);
         if (fd < 0) {
             break;
         }
@@ -730,20 +1022,19 @@ static size_t fd_cache_collect_stale_locked(FileState& fs, FdCloseList& fdsToClo
 
     size_t closed = 0;
     const size_t scanLimit = fs.evictableOpenCount;
-    for (size_t scanned = 0;
-         scanned < scanLimit && fs.unpinnedOpenHead != FileState::kInvalidRuntimeIndex;
-         ++scanned) {
-        FileState::RuntimeFile& victim = fs.runtime[fs.unpinnedOpenHead];
-        if (victim.lastUseNs == 0) {
-            fd_runtime_note_use_time_locked(victim, nowNs);
-            fd_runtime_lru_append_locked(fs, victim);
+    for (size_t scanned = 0; scanned < scanLimit; ++scanned) {
+        FileState::RuntimeFile* victim = fd_runtime_oldest_idle_locked(fs);
+        if (!victim) break;
+        if (victim->lastUseNs == 0) {
+            fd_runtime_note_use_time_locked(*victim, nowNs);
+            fd_runtime_lru_append_locked(fs, *victim);
             continue;
         }
-        if (nowNs < victim.lastUseNs ||
-            nowNs - victim.lastUseNs < AMPR_EMU_FD_CACHE_IDLE_CLOSE_NS) {
+        if (nowNs < victim->lastUseNs ||
+            nowNs - victim->lastUseNs < AMPR_EMU_FD_CACHE_IDLE_CLOSE_NS) {
             break;
         }
-        const int fd = fd_runtime_detach_fd_locked(fs, victim);
+        const int fd = fd_runtime_detach_eviction_locked(fs, *victim);
         if (fd < 0) {
             break;
         }
@@ -758,15 +1049,22 @@ static void fd_cache_collect_current_limit_evictions_locked(FdCloseList& fdsToCl
                                                             size_t reserve = 0) {
     fd_cache_collect_evictions_locked(fdsToClose,
                                       reserve,
-                                      fd_cache_open_cap_for_current_budget());
+                                      fd_cache_effective_cap());
 }
 
 static void fd_cache_collect_budget_headroom_locked(FdCloseList& fdsToClose,
                                                     size_t reserve = 0) {
-    fd_cache_collect_evictions_locked(
-        fdsToClose,
-        reserve,
-        fd_cache_budget_cap_for_direct_count(ampr_index_fd_direct_open_count()));
+    auto& fs = file_state();
+    const size_t cap = fd_cache_budget_cap_for_uncached_count(
+        ampr_index_fd_uncached_open_count());
+    while (fs.physicalOpenCount + reserve > cap) {
+        FileState::RuntimeFile* victim = fd_runtime_evict_candidate_locked(
+            fs, true);
+        if (!victim) break;
+        const int fd = fd_runtime_detach_eviction_locked(fs, *victim);
+        if (fd < 0) break;
+        fdsToClose.push_back(fd);
+    }
 }
 
 static size_t fd_cache_collect_idle_percent_locked(FdCloseList& fdsToClose,
@@ -776,7 +1074,7 @@ static size_t fd_cache_collect_idle_percent_locked(FdCloseList& fdsToClose,
     }
 
     auto& fs = file_state();
-    const size_t evictable = fs.evictableOpenCount;
+    const size_t evictable = fs.physicalEvictableOpenCount;
     if (evictable == 0) {
         return 0;
     }
@@ -789,10 +1087,11 @@ static size_t fd_cache_collect_idle_percent_locked(FdCloseList& fdsToClose,
     }
 
     size_t closed = 0;
-    while (closed < toClose &&
-           fs.unpinnedOpenHead != FileState::kInvalidRuntimeIndex) {
-        FileState::RuntimeFile& victim = fs.runtime[fs.unpinnedOpenHead];
-        const int fd = fd_runtime_detach_fd_locked(fs, victim);
+    while (closed < toClose) {
+        FileState::RuntimeFile* victim = fd_runtime_evict_candidate_locked(
+            fs, true);
+        if (!victim) break;
+        const int fd = fd_runtime_detach_eviction_locked(fs, *victim);
         if (fd < 0) {
             break;
         }
@@ -868,7 +1167,14 @@ static void fd_cache_close_list(FdCloseList& fdsToClose, const char* reason = "f
         AMPR_TLOGF("apr.fdcache.close-list.leave reason=%s",
                   reason ? reason : "unknown");
     }
+    const bool madeBudgetProgress = !fdsToClose.empty();
     fdsToClose.clear();
+    if (madeBudgetProgress) {
+        g_fd_budget_progress_generation.fetch_add(1, std::memory_order_release);
+#if AMPR_EMU_PACK_ENABLE
+        ampr_pack_notify_fd_budget_progress();
+#endif
+    }
 }
 
 void ampr_index_fd_cache_release_open_fd_headroom(size_t reserve, size_t cap) {
@@ -1019,16 +1325,16 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
     const char* pathToOpen = nullptr;
     FdCloseList fdsToClose;
     int fd = -1;
-    const uint64_t nowNs = fd_cache_time_now_ns();
 
-    AMPR_TLOGF("apr.fdcache.acquire.enter job=0x%llx fileId=%u path=%s size=0x%llx budget=%zu cacheCap=%zu directOpen=%zu",
+    AMPR_TLOGF("apr.fdcache.acquire.enter job=0x%llx fileId=%u path=%s size=0x%llx budget=%zu cacheCap=%zu uncachedOpen=%zu packOpen=%zu",
               (unsigned long long)jobId,
               id,
               ampr_log_path_arg(entry.path),
               (unsigned long long)entry.size,
               ampr_index_fd_open_budget_effective_cap(),
               fd_cache_effective_cap(),
-              ampr_index_fd_direct_open_count());
+              ampr_index_fd_uncached_open_count(),
+              ampr_index_fd_pack_open_count());
 
     {
         auto& fs = file_state();
@@ -1044,7 +1350,7 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
             }
 #endif
             e->lastUseTick = fs.tick.fetch_add(1, std::memory_order_relaxed);
-            fd_runtime_note_use_time_locked(*e, nowNs);
+            fd_runtime_promote_locked(fs, *e);
             fd_runtime_note_pin_locked(fs, *e);
             fd = e->fd;
             fd_cache_collect_current_limit_evictions_locked(fdsToClose);
@@ -1073,12 +1379,11 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
 #endif
             if (e) {
                 e->lastUseTick = fs.tick.fetch_add(1, std::memory_order_relaxed);
-                fd_runtime_note_use_time_locked(*e, nowNs);
             }
             if (allowOpen) {
                 fd_cache_collect_current_limit_evictions_locked(fdsToClose, 1);
                 (void)fd_cache_collect_watermark_evictions_locked(fdsToClose, 1);
-                if (fs.openCount < fd_cache_open_cap_for_current_budget()) {
+                if (fs.openCount < fd_cache_effective_cap()) {
                     pathToOpen = entry.path;
                 }
             }
@@ -1127,9 +1432,18 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
               id,
               pathToOpen,
               flags);
-    int opened = ampr_real_sceKernelOpen(pathToOpen, flags, static_cast<SceKernelMode>(mode));
-    // ampr_real_sceKernelOpen() is the raw libkernel slot: preserve the SCE
-    // return code and derive POSIX errno only for local pressure/error classes.
+    bool openedPhysical = false;
+    int opened = ampr_open_indexed_or_real(
+        id, entry, flags, static_cast<SceKernelMode>(mode), &openedPhysical);
+    if (opened >= 0 && openedPhysical &&
+        !ampr_index_fd_cache_release_open_fd_budget_headroom(1u)) {
+        (void)::sceKernelClose(opened);
+        opened = SCE_KERNEL_ERROR_EAGAIN;
+        openedPhysical = false;
+    }
+    // The indexed helper returns either a packed virtual FD or a real fd and
+    // preserves the SCE error domain for both backends. Derive POSIX errno only
+    // for local pressure/error classes.
     const int openErrno = opened < 0 ? ampr_posix_errno_from_sce(opened) : 0;
     const bool openPressure =
         opened < 0 && ampr_posix_errno_is_fd_open_pressure(openErrno);
@@ -1158,7 +1472,7 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
         (void)closedStale;
         (void)closedIdle;
         (void)afterStats;
-        AMPR_LOGF("apr.fdcache.acquire.open defer-pressure job=0x%llx fileId=%u path=%s rawRc=0x%x errno=%d observedOpen=%zu fdBudget=%zu cacheCap=%zu closedStale=%zu closedIdle=%zu cacheBefore=%zu/%zu directBefore=%zu pinned=%zu pins=%zu evictable=%zu cacheAfter=%zu/%zu directAfter=%zu pinnedAfter=%zu pinsAfter=%zu evictableAfter=%zu",
+        AMPR_LOGF("apr.fdcache.acquire.open defer-pressure job=0x%llx fileId=%u path=%s rawRc=0x%x errno=%d observedOpen=%zu fdBudget=%zu cacheCap=%zu closedStale=%zu closedIdle=%zu cacheBefore=%zu/%zu uncachedBefore=%zu pinned=%zu pins=%zu evictable=%zu cacheAfter=%zu/%zu uncachedAfter=%zu pinnedAfter=%zu pinsAfter=%zu evictableAfter=%zu",
                   (unsigned long long)jobId,
                   id,
                   pathToOpen,
@@ -1177,7 +1491,7 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
                   beforeStats.evictable,
                   afterStats.open,
                   afterStats.entries,
-                  ampr_index_fd_direct_open_count(),
+                  ampr_index_fd_uncached_open_count(),
                   afterStats.pinnedOpen,
                   afterStats.pins,
                   afterStats.evictable);
@@ -1228,8 +1542,8 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
                       opened);
         } else {
             e->lastUseTick = fs.tick.fetch_add(1, std::memory_order_relaxed);
-            fd_runtime_note_use_time_locked(*e, fd_cache_time_now_ns());
             if (e->fd >= 0) {
+                fd_runtime_promote_locked(fs, *e);
                 fd_runtime_note_pin_locked(fs, *e);
                 fd = e->fd;
                 fdToClose = opened;
@@ -1242,7 +1556,7 @@ int ampr_index_acquire_cached_fd(uint64_t jobId,
                           e->pinCount);
             } else {
                 fd_runtime_note_pin_locked(fs, *e);
-                fd_runtime_note_open_locked(fs, *e, opened);
+                fd_runtime_note_open_locked(fs, *e, opened, openedPhysical);
                 fd = opened;
                 AMPR_TLOGF("apr.fdcache.acquire.open job=0x%llx fileId=%u path=%s fd=%d pinCount=%zu",
                           (unsigned long long)jobId,
@@ -1298,6 +1612,8 @@ void ampr_index_release_cached_fd_pin(uint32_t fileId) {
     }
 
     FdCloseList fdsToClose;
+    // A cached descriptor cannot become idle while pinned. Timestamp the
+    // completed use here, so acquire/install needs no monotonic-clock syscall.
     const uint64_t nowNs = fd_cache_time_now_ns();
     {
         auto& fs = file_state();
@@ -1333,10 +1649,13 @@ AmprIndexFdCacheStats ampr_index_fd_cache_stats() {
     const FdCacheStats stats = fd_cache_stats();
     return AmprIndexFdCacheStats{
         stats.entries,
+        stats.handles,
         stats.open,
         stats.pinnedOpen,
         stats.pins,
         stats.evictable,
+        stats.probationary,
+        stats.protectedEntries,
     };
 }
 
@@ -1345,17 +1664,43 @@ AmprIndexFdCacheDiagCounters ampr_index_fd_cache_diag_counters(bool reset) {
     if (!ampr_debug_log_runtime_enabled()) {
         return AmprIndexFdCacheDiagCounters{};
     }
+    uint64_t promotions = 0;
+    uint64_t demotions = 0;
+    uint64_t probationaryEvictions = 0;
+    uint64_t protectedEvictions = 0;
+    {
+        auto& fs = file_state();
+        AmprLockGuard lk(fs.m);
+        promotions = fs.slruPromotions;
+        demotions = fs.slruDemotions;
+        probationaryEvictions = fs.slruProbationaryEvictions;
+        protectedEvictions = fs.slruProtectedEvictions;
+        if (reset) {
+            fs.slruPromotions = 0;
+            fs.slruDemotions = 0;
+            fs.slruProbationaryEvictions = 0;
+            fs.slruProtectedEvictions = 0;
+        }
+    }
     if (reset) {
         return AmprIndexFdCacheDiagCounters{
             g_fd_cache_diag_hits.exchange(0, std::memory_order_relaxed),
             g_fd_cache_diag_misses.exchange(0, std::memory_order_relaxed),
             g_fd_cache_diag_emfile.exchange(0, std::memory_order_relaxed),
+            promotions,
+            demotions,
+            probationaryEvictions,
+            protectedEvictions,
         };
     }
     return AmprIndexFdCacheDiagCounters{
         g_fd_cache_diag_hits.load(std::memory_order_relaxed),
         g_fd_cache_diag_misses.load(std::memory_order_relaxed),
         g_fd_cache_diag_emfile.load(std::memory_order_relaxed),
+        promotions,
+        demotions,
+        probationaryEvictions,
+        protectedEvictions,
     };
 #else
     (void)reset;

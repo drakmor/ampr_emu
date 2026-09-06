@@ -1,0 +1,167 @@
+# AMPR seekable asset-pack example (AMPRPAK4 / AMPRDAT3).
+# Paths are matched relative to /app0. Rules are evaluated in order and the
+# last matching rule wins.
+
+[pack]
+index_name = "ampr_assets.index"
+pack_pattern = "ampr_assets-{group}-lane{lane:02d}-vol{volume:02d}-{id:03d}.pak"
+
+# Files not selected by a later rule stay on the ordinary filesystem.
+default_action = "loose"       # loose | compress | store
+default_block_size = "64KiB"   # 16, 32, 64, 128, 256, 512 KiB or 1 MiB
+
+# f_iosize is 64 KiB on the target filesystems used for this configuration.
+# Random/mixed chunks no larger than one I/O page share pages but are never
+# allowed to straddle one. Larger random/mixed chunks start page-aligned.
+# Streaming extents begin page-aligned and remain densely packed so the runtime
+# can issue one bounded aligned read for several consecutive chunks.
+io_page_size = "64KiB"
+payload_alignment = "64KiB"   # volume payload boundary
+chunk_alignment = "64B"       # dense physical packing inside an I/O page
+
+workers = 8
+compression_mode = "hc"        # fast | hc
+compression_level = 12          # used by hc
+acceleration = 1                # used by fast/python-lz4
+deduplicate = true
+deduplicate_scope = "lane"      # lane preserves striping; group maximizes size savings
+deduplicate_streaming = false    # preserve dense forward streaming extents
+min_savings_bytes = 64
+min_savings_ratio = 0.01
+
+# A random/mixed 64 KiB block that shrinks only slightly still costs one cold
+# 64 KiB filesystem I/O page. Reject such CPU-only wins unless they save at
+# least 8 KiB and 12.5%. Streaming rules use the normal thresholds because the
+# runtime coalesces their dense physical ranges.
+io_neutral_min_savings_bytes = "8KiB"
+io_neutral_min_savings_ratio = 0.125
+
+# Avoid routing large already-compressed archives through the userspace pack
+# path when deterministic samples show negligible LZ4 gain. This decision is
+# made before balanced lane assignment. Hot files remain packed unless opted in.
+auto_loose_large_files = true
+auto_loose_hot_files = false
+auto_loose_min_file_size = "64MiB"
+auto_loose_sample_blocks = 32
+auto_loose_sample_bytes = "16MiB"
+auto_loose_min_savings_ratio = 0.05
+auto_loose_max_raw_ratio = 0.90
+
+preserve_mtime = true
+validate_index_metadata = true
+
+# General assets are distributed between four independent pack lanes. Balanced
+# assignment keeps complete small/medium files on one lane while equalizing
+# total bytes. Multiple lanes are useful because the APR reactor can have
+# several 512 KiB slices in flight concurrently.
+[groups.assets]
+pack_count = 4
+assignment = "balanced"        # balanced | hash | round_robin
+max_pack_size = "8GiB"         # 0 means unlimited
+stripe_large_files = false
+io_page_size = "64KiB"         # optional per-group override
+
+# Large opaque archives can be striped at block-group boundaries. Eight 64 KiB
+# blocks form one 512 KiB stripe group, matching the default APR dispatch
+# quantum and avoiding round-robin I/O at every tiny block.
+[groups.bulk]
+pack_count = 4
+assignment = "hash"
+max_pack_size = "16GiB"
+stripe_large_files = false # enable only after an on-console A/B test
+stripe_threshold = "256MiB"
+stripe_group_blocks = 8
+io_page_size = "64KiB"
+
+# Broad selection: compress ordinary assets with independent 64 KiB blocks.
+# Mixed layout gives bounded 512 KiB coalescing while retaining page-safe random
+# access if the observed pattern changes.
+[[rule]]
+action = "compress"
+include = [
+  "assets/**",
+  "data/**",
+  "localization/**",
+  "scripts/**",
+  "config/**",
+]
+exclude = [
+  "**/*.prx",
+  "**/*.sprx",
+  "**/eboot.bin",
+  "**/ampr_emu.index",
+  "**/ampr_assets.index",
+  "**/ampr_assets.index.crc",
+  "**/ampr_assets.index.runtime",
+  "**/ampr_assets-*.pak",
+]
+block_size = "64KiB"
+group = "assets"
+layout = "mixed"               # auto | random | mixed | streaming
+# force_pack = true             # optional override for auto-loose
+
+# Many tiny, frequently reused files benefit from smaller blocks, one-page
+# random reads, and immediate decoded-cache admission.
+[[rule]]
+action = "compress"
+include = ["scripts/**", "config/**", "localization/**"]
+block_size = "16KiB"
+group = "assets"
+layout = "random"
+hot = true
+min_savings_bytes = 16
+min_savings_ratio = 0.0025
+io_neutral_min_savings_bytes = "2KiB"
+io_neutral_min_savings_ratio = 0.125
+
+# Large game-owned archives remain opaque to AMPR. Independent 64 KiB LZ4
+# blocks preserve arbitrary internal seeks. Mixed layout is the conservative
+# default for archives with their own indexes; choose streaming only after a
+# trace proves that access is predominantly sequential.
+[[rule]]
+action = "compress"
+include = [
+  "**/*.pak",
+  "**/*.ucas",
+  "**/*.utoc",
+  "**/*.bundle",
+  "**/*.archive",
+]
+block_size = "64KiB"
+group = "bulk"
+layout = "mixed"
+
+# Already-compressed video/audio can still be packed to reduce FD pressure and
+# improve placement. 'store' bypasses LZ4 but keeps seekable blocks; decoded
+# CRCs are written to the offline-only <manifest>.crc sidecar.
+# Dense streaming layout permits aligned reads up to the runtime 1 MiB window.
+[[rule]]
+action = "store"
+include = [
+  "movies/**",
+  "audio/**/*.wem",
+  "audio/**/*.opus",
+  "audio/**/*.ogg",
+]
+block_size = "256KiB"
+group = "assets"
+layout = "streaming"
+
+# Explicit opt-out examples. Because the last matching rule wins, these remain
+# loose even if a broad rule above selected them.
+[[rule]]
+action = "loose"
+include = [
+  "sce_module/**",
+  "system/**",
+  "mods/**",
+  "save/**",
+]
+
+# Large trace-derived exact lists may be placed beside this TOML:
+# [[rule]]
+# action = "compress"
+# include_from = ["game.rule-001.include.txt"]
+# exclude_from = ["manual-exclusions.txt"]
+# block_size = "64KiB"
+# layout = "mixed"

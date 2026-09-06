@@ -17,14 +17,23 @@ EXPORT_RE = re.compile(
 )
 
 LIBC_IMPORTS = {
+    "__cxa_atexit",
     "__cxa_finalize",
     "__cxa_guard_acquire",
     "__cxa_guard_release",
     "abort",
+    "calloc",
+    "free",
+    "gmtime_r",
+    "malloc",
+    "memchr",
     "memcpy",
+    "memmove",
     "memset",
     "snprintf",
+    "strftime",
     "strlen",
+    "strnlen",
     "vsnprintf",
 }
 
@@ -38,6 +47,10 @@ METADATA_SYMBOLS = (
     "libSceAmpr",
     "libSceAmpr.prx",
 )
+
+CRT_PROVIDED_SYMBOLS = {
+    "__dso_handle",
+}
 
 
 def name_to_nid(name: str) -> str:
@@ -155,7 +168,10 @@ def main() -> int:
         for line in args.undefined.read_text(encoding="utf-8").splitlines()
         if line.strip()
     }
-    imports = sorted((undefined_names - set(names)) | {"__cxa_finalize"})
+    imports = sorted(
+        (undefined_names - set(names) - CRT_PROVIDED_SYMBOLS)
+        | {"__cxa_finalize"}
+    )
     if not imports:
         raise ValueError("no unresolved PRX imports found")
     libc_imports = []

@@ -13,6 +13,7 @@
 #include <kernel.h>
 #include <stdint.h>
 #include <sys/dmem.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 namespace sce::Ampr {
@@ -20,11 +21,50 @@ class AprCommandBuffer;
 }
 
 extern "C" {
-int sceKernelOpen_emul(const char* path, int flags, SceKernelMode mode);
-int sceKernelStat_emul(const char* path, SceKernelStat* sb);
+int posix_open_emul(const char* path, int flags, ...);
+int posix_stat_emul(const char* path, struct stat* sb);
 int sceKernelCheckReachability_emul(const char* path);
-int sceKernelUnlink_emul(const char* path);
-int sceKernelRename_emul(const char* from, const char* to);
+int posix_unlink_emul(const char* path);
+int posix_rename_emul(const char* from, const char* to);
+#if AMPR_EMU_PACK_ENABLE && (AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE || AMPR_EMU_PACK_PROCESS_OPEN_ENABLE)
+int sceKernelClose_emul(int fd);
+int posix_close_emul(int fd);
+int posix_fstat_emul(int fd, struct stat* stat);
+off_t posix_lseek_emul(int fd, off_t offset, int whence);
+#endif
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+int posix_getdents_emul(int fd, char* buffer, int size);
+int posix_getdirentries_emul(int fd, char* buffer, int size, long* basep);
+#endif
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_INTERCEPT_PROCESS_SYNC_READS
+ssize_t posix_pread_emul(int fd, void* buffer, size_t size, off_t offset);
+ssize_t posix_preadv_emul(int fd, const SceKernelIovec* iov, int iovcnt,
+                         off_t offset);
+ssize_t posix_read_emul(int fd, void* buffer, size_t size);
+ssize_t posix_readv_emul(int fd, const SceKernelIovec* iov, int iovcnt);
+#endif
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_INTERCEPT_PROCESS_AIO
+int sceKernelAioSubmitReadCommands_emul(
+    SceKernelAioRWRequest requests[], int count, int priority,
+    SceKernelAioSubmitId* id);
+int sceKernelAioSubmitReadCommandsMultiple_emul(
+    SceKernelAioRWRequest requests[], int count, int priority,
+    SceKernelAioSubmitId ids[]);
+int sceKernelAioPollRequest_emul(SceKernelAioSubmitId id, int* state);
+int sceKernelAioPollRequests_emul(SceKernelAioSubmitId ids[],
+                                  int count, int states[]);
+int sceKernelAioWaitRequest_emul(SceKernelAioSubmitId id, int* state,
+                                 SceKernelUseconds* usec);
+int sceKernelAioWaitRequests_emul(SceKernelAioSubmitId ids[], int count,
+                                  int states[], uint32_t mode,
+                                  SceKernelUseconds* usec);
+int sceKernelAioCancelRequest_emul(SceKernelAioSubmitId id, int* state);
+int sceKernelAioCancelRequests_emul(SceKernelAioSubmitId ids[],
+                                    int count, int states[]);
+int sceKernelAioDeleteRequest_emul(SceKernelAioSubmitId id, int* result);
+int sceKernelAioDeleteRequests_emul(SceKernelAioSubmitId ids[],
+                                    int count, int results[]);
+#endif
 int sceKernelMprotect_emul(const void* addr, size_t len, int prot);
 int sceKernelMtypeprotect_emul(const void* addr, size_t size, int type, int prot);
 int sceKernelMapFlexibleMemory_emul(void** addrInOut, size_t len, int prot, int flags);

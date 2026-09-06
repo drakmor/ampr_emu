@@ -10,6 +10,7 @@
 #include "ampr_emu_kernel_file.h"
 #include "ampr_emu_kernel_memory.h"
 #include "ampr_emu_log.h"
+#include "ampr_emu_pack.h"
 #include "ampr_emu_runtime_memory.h"
 #include "ampr_emu_sync.h"
 #include "ampr.h"
@@ -19,7 +20,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdarg>
 #include <cstring>
+#include <fcntl.h>
 #include <new>
 
 [[maybe_unused]] static inline const char* ampr_log_path_arg(const char* path) {
@@ -75,6 +78,7 @@ struct FileIndexState {
     void* compactMapBase{nullptr};
     size_t compactMapSize{0};
     size_t compactPathBlobSize{0};
+    bool compactRecordsSorted{false};
 };
 
 static std::atomic<FileIndexState*> g_file_index_state{nullptr};
@@ -153,6 +157,8 @@ static constexpr size_t kAmprIndexMaxPath = 4096;
 #ifndef SCE_KERNEL_NAME_MAX
 #define SCE_KERNEL_NAME_MAX 255
 #endif
+static constexpr size_t kAmprRuntimePathCapacity =
+    static_cast<size_t>(SCE_KERNEL_PATH_MAX) + 1u;
 
 struct App0IndexBuildWorkspace {
     char indexKey[kAmprIndexMaxPath];
@@ -592,6 +598,7 @@ static void clear_compact_file_index_locked(FileIndexState& idx) {
     idx.compactHashSlots = nullptr;
     idx.compactHashMask = 0;
     idx.compactPathBlobSize = 0;
+    idx.compactRecordsSorted = false;
     idx.compactAvailable = false;
 }
 
@@ -605,6 +612,7 @@ static void move_compact_file_index_locked(FileIndexState& dst, FileIndexState& 
     dst.compactMapBase = src.compactMapBase;
     dst.compactMapSize = src.compactMapSize;
     dst.compactPathBlobSize = src.compactPathBlobSize;
+    dst.compactRecordsSorted = src.compactRecordsSorted;
     dst.compactAvailable = src.compactAvailable;
 
     src.compactEntries = nullptr;
@@ -615,6 +623,7 @@ static void move_compact_file_index_locked(FileIndexState& dst, FileIndexState& 
     src.compactMapBase = nullptr;
     src.compactMapSize = 0;
     src.compactPathBlobSize = 0;
+    src.compactRecordsSorted = false;
     src.compactAvailable = false;
 }
 
@@ -629,22 +638,6 @@ static const char* compact_index_path_ptr(const FileIndexState& idx, const Compa
         return nullptr;
     }
     return path;
-}
-
-static bool compact_index_copy_path(const FileIndexState& idx,
-                                    const CompactFileIndexEntry& e,
-                                    char* dst,
-                                    size_t dstSize) {
-    if (!dst || dstSize == 0) return false;
-    dst[0] = '\0';
-    if ((size_t)e.pathLength + 1u > dstSize) return false;
-
-    if (const char* path = compact_index_path_ptr(idx, e)) {
-        std::memcpy(dst, path, (size_t)e.pathLength + 1u);
-        return true;
-    }
-
-    return false;
 }
 
 static uint64_t compact_index_hash_key(const char* path) {
@@ -799,7 +792,7 @@ private:
 class AmprRuntimeIndexBuilder {
 public:
     bool open() {
-        (void)ampr_real_sceKernelUnlink(kAmprApp0IndexTempPath);
+        (void)ampr_real_posix_unlink(kAmprApp0IndexTempPath);
         AMPR_LOGF("apr.index build.memory open ok tmp=%s", kAmprApp0IndexTempPath);
         return true;
     }
@@ -852,6 +845,13 @@ public:
             release_buffers();
             return false;
         }
+
+        std::sort(records_, records_ + static_cast<size_t>(entryCount_),
+                  [this](const CompactFileIndexEntry& left,
+                         const CompactFileIndexEntry& right) {
+                      return compare_index_path_key(paths_ + left.pathOffset,
+                                                    paths_ + right.pathOffset) < 0;
+                  });
 
         size_t hashSlotCount = 0;
         if (!compact_index_hash_slot_count((size_t)entryCount_, &hashSlotCount) ||
@@ -958,7 +958,7 @@ public:
             return false;
         }
 
-        const int outFd = ampr_real_sceKernelOpen(kAmprApp0IndexTempPath,
+        const int outFd = ampr_real_posix_open(kAmprApp0IndexTempPath,
                                                   SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC,
                                                   SCE_KERNEL_S_IRWU);
         if (outFd < 0) {
@@ -972,7 +972,7 @@ public:
 
         AmprSceBufferedWriter writer(outFd);
         ok = writer.valid() && writer.write(image, (size_t)fileBytes) && writer.flush();
-        const int closeRc = sceKernelClose(outFd);
+        const int closeRc = ampr_real_physical_close(outFd);
         if (closeRc < 0) ok = false;
 
         ampr_release_sdk_cpu_memory(imageMap,
@@ -980,12 +980,12 @@ public:
                                     AmprSharedSdkCpuMemoryClass::Transient);
 
         if (!ok) {
-            (void)ampr_real_sceKernelUnlink(kAmprApp0IndexTempPath);
+            (void)ampr_real_posix_unlink(kAmprApp0IndexTempPath);
             AMPR_CRITICAL_LOGF("apr.index save fail path=%s closeRc=0x%x", kAmprApp0IndexTempPath, closeRc);
             release_buffers();
             return false;
         }
-        int renameRc = ampr_real_sceKernelRename(kAmprApp0IndexTempPath, kAmprApp0IndexPath);
+        int renameRc = ampr_real_posix_rename(kAmprApp0IndexTempPath, kAmprApp0IndexPath);
         if (renameRc < 0) {
             // Fallback for filesystems that do not replace an existing target:
             // retain the old index as a backup until the new rename succeeds.
@@ -993,17 +993,17 @@ public:
             // recoverable copy and must remain untouched after a failed install.
             SceKernelStat destinationStat{};
             const bool destinationExists =
-                ampr_real_sceKernelStat(kAmprApp0IndexPath, &destinationStat) == 0;
+                ampr_real_posix_stat(kAmprApp0IndexPath, &destinationStat) == 0;
             bool oldMoved = false;
             if (destinationExists) {
-                (void)ampr_real_sceKernelUnlink(kAmprApp0IndexBackupPath);
-                oldMoved = ampr_real_sceKernelRename(
+                (void)ampr_real_posix_unlink(kAmprApp0IndexBackupPath);
+                oldMoved = ampr_real_posix_rename(
                     kAmprApp0IndexPath, kAmprApp0IndexBackupPath) >= 0;
             }
-            renameRc = ampr_real_sceKernelRename(kAmprApp0IndexTempPath, kAmprApp0IndexPath);
+            renameRc = ampr_real_posix_rename(kAmprApp0IndexTempPath, kAmprApp0IndexPath);
             if (renameRc < 0 && oldMoved) {
                 const int restoreRc =
-                    ampr_real_sceKernelRename(kAmprApp0IndexBackupPath, kAmprApp0IndexPath);
+                    ampr_real_posix_rename(kAmprApp0IndexBackupPath, kAmprApp0IndexPath);
                 if (restoreRc < 0) {
                     AMPR_CRITICAL_LOGF("apr.index save restore fail backup=%s dst=%s rc=0x%x",
                                        kAmprApp0IndexBackupPath,
@@ -1011,11 +1011,11 @@ public:
                                        restoreRc);
                 }
             } else if (renameRc >= 0 && oldMoved) {
-                (void)ampr_real_sceKernelUnlink(kAmprApp0IndexBackupPath);
+                (void)ampr_real_posix_unlink(kAmprApp0IndexBackupPath);
             }
         }
         if (renameRc < 0) {
-            (void)ampr_real_sceKernelUnlink(kAmprApp0IndexTempPath);
+            (void)ampr_real_posix_unlink(kAmprApp0IndexTempPath);
             AMPR_CRITICAL_LOGF("apr.index save rename fail tmp=%s dst=%s rc=0x%x",
                       kAmprApp0IndexTempPath, kAmprApp0IndexPath, renameRc);
             release_buffers();
@@ -1024,7 +1024,7 @@ public:
         // A previous interrupted replacement may have left a backup behind.
         // Once the new destination is installed, that stale recovery copy is no
         // longer needed and must not accumulate across successful rebuilds.
-        (void)ampr_real_sceKernelUnlink(kAmprApp0IndexBackupPath);
+        (void)ampr_real_posix_unlink(kAmprApp0IndexBackupPath);
 
         AMPR_LOGF("apr.index saved path=%s format=AMPRIDX3 entries=%llu pathBytes=0x%llx hashSlots=%zu hashOffset=0x%llx memory=1",
                   kAmprApp0IndexPath,
@@ -1208,22 +1208,25 @@ static bool ampr_join_dirent_path(const char* dir,
     (void)dirCount;
     size_t fileCount = 0;
     size_t nextProgressFileCount = 1000;
-    while (!dirs.empty()) {
+    bool scanComplete = true;
+    while (scanComplete && !dirs.empty()) {
         if (!dirs.pop(dir, sizeof(dir))) {
             AMPR_CRITICAL_LOGF("apr.index scan.dir-stack pop fail pendingDirs=%zu", dirs.size());
+            scanComplete = false;
             break;
         }
         ++dirCount;
 
-        int fd = ampr_real_sceKernelOpen(dir, SCE_KERNEL_O_RDONLY | SCE_KERNEL_O_DIRECTORY, 0);
+        int fd = ampr_real_posix_open(dir, SCE_KERNEL_O_RDONLY | SCE_KERNEL_O_DIRECTORY, 0);
         if (fd < 0) {
             AMPR_CRITICAL_LOGF("apr.index scan.open-dir fail path=%s rc=0x%x", dir, fd);
-            continue;
+            scanComplete = false;
+            break;
         }
 
         size_t dentsSize = 16 * 1024;
         struct stat dirStat{};
-        const int fstatRc = sceKernelFstat(fd, &dirStat);
+        const int fstatRc = ampr_real_physical_fstat(fd, &dirStat);
         if (fstatRc == 0 && dirStat.st_blksize > 0) {
             dentsSize = std::max(dentsSize, static_cast<size_t>(dirStat.st_blksize));
         }
@@ -1232,21 +1235,25 @@ static bool ampr_join_dirent_path(const char* dir,
             AMPR_CRITICAL_LOGF("apr.index scan.getdents alloc fail path=%s size=0x%llx fstatRc=0x%x blksize=0x%llx",
                       dir, (unsigned long long)dentsSize, fstatRc,
                       (unsigned long long)(fstatRc == 0 ? dirStat.st_blksize : 0));
-            (void)sceKernelClose(fd);
-            continue;
+            (void)ampr_real_physical_close(fd);
+            scanComplete = false;
+            break;
         }
 
-        for (;;) {
-            const int nread = sceKernelGetdents(fd, dents.data(), static_cast<int>(dentsSize));
+        while (scanComplete) {
+            const int nread = ampr_real_physical_getdents(
+                fd, dents.data(), static_cast<int>(dentsSize));
             if (nread < 0) {
                 AMPR_CRITICAL_LOGF("apr.index scan.getdents fail path=%s rc=0x%x size=0x%llx fstatRc=0x%x blksize=0x%llx",
                           dir, nread, (unsigned long long)dentsSize, fstatRc,
                           (unsigned long long)(fstatRc == 0 ? dirStat.st_blksize : 0));
+                scanComplete = false;
                 break;
             }
             if (static_cast<size_t>(nread) > dentsSize) {
                 AMPR_LOGF("apr.index scan.getdents malformed path=%s bytes=%d buffer=0x%llx",
                           dir, nread, (unsigned long long)dentsSize);
+                scanComplete = false;
                 break;
             }
             if (nread == 0) break;
@@ -1254,18 +1261,20 @@ static bool ampr_join_dirent_path(const char* dir,
             char* p = dents.data();
             char* end = dents.data() + nread;
             static constexpr size_t kDirentHeaderSize = offsetof(struct dirent, d_name);
-            while (p + kDirentHeaderSize <= end) {
+            while (scanComplete && static_cast<size_t>(end - p) >= kDirentHeaderSize) {
                 struct dirent* ent = reinterpret_cast<struct dirent*>(p);
                 const size_t remaining = static_cast<size_t>(end - p);
                 if (ent->d_reclen < kDirentHeaderSize + 1 || ent->d_reclen > remaining) {
                     AMPR_LOGF("apr.index scan.getdents malformed path=%s reason=reclen reclen=%u left=%llu",
                               dir, (unsigned)ent->d_reclen, (unsigned long long)remaining);
+                    scanComplete = false;
                     break;
                 }
                 if (ent->d_namlen != 0 && ent->d_namlen > ent->d_reclen - kDirentHeaderSize - 1u) {
                     AMPR_LOGF("apr.index scan.getdents malformed path=%s reason=namlen reclen=%u namlen=%u left=%llu",
                               dir, (unsigned)ent->d_reclen, (unsigned)ent->d_namlen,
                               (unsigned long long)remaining);
+                    scanComplete = false;
                     break;
                 }
                 p += ent->d_reclen;
@@ -1302,6 +1311,7 @@ static bool ampr_join_dirent_path(const char* dir,
                     if (!dirs.push(path)) {
                         AMPR_CRITICAL_LOGF("apr.index scan.dir-stack push fail path=%s pendingDirs=%zu",
                                            path, dirs.size());
+                        scanComplete = false;
                     }
                     continue;
                 }
@@ -1310,15 +1320,17 @@ static bool ampr_join_dirent_path(const char* dir,
                 }
 
                 struct stat st{};
-                if (ampr_real_sceKernelStat(path, &st) != 0) {
+                if (ampr_real_posix_stat(path, &st) != 0) {
                     AMPR_CRITICAL_LOGF("apr.index scan.stat fail path=%s dtype=%u errno=%d",
                               path, (unsigned)dtype, errno);
-                    continue;
+                    scanComplete = false;
+                    break;
                 }
                 if (dtype == DT_UNKNOWN && S_ISDIR(st.st_mode)) {
                     if (!dirs.push(path)) {
                         AMPR_CRITICAL_LOGF("apr.index scan.dir-stack push fail path=%s pendingDirs=%zu",
                                            path, dirs.size());
+                        scanComplete = false;
                     }
                     continue;
                 }
@@ -1330,6 +1342,9 @@ static bool ampr_join_dirent_path(const char* dir,
                                      static_cast<size_t>(st.st_size),
                                      static_cast<int64_t>(st.st_mtime))) {
                     ++fileCount;
+                } else {
+                    scanComplete = false;
+                    break;
                 }
                 if (fileCount >= nextProgressFileCount) {
                     AMPR_LOGF("apr.index scan.progress dirs=%zu files=%zu pendingDirs=%zu entries=%llu pathBytes=0x%llx memory=1",
@@ -1339,10 +1354,20 @@ static bool ampr_join_dirent_path(const char* dir,
                     nextProgressFileCount += 1000;
                 }
             }
+            if (p != end) {
+                AMPR_CRITICAL_LOGF("apr.index scan.incomplete path=%s remaining=%zu", dir,
+                                   static_cast<size_t>(end - p));
+                scanComplete = false;
+            }
         }
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
     }
 
+    if (!scanComplete) {
+        AMPR_CRITICAL_LOGF("apr.index build fail reason=incomplete-scan root=%s dirs=%zu files=%zu",
+                           kAmprApp0Root, dirCount, fileCount);
+        return;
+    }
     AMPR_LOGF("apr.index built root=%s dirs=%zu files=%zu entries=%llu pathBytes=0x%llx memory=1",
               kAmprApp0Root, dirCount, fileCount,
               (unsigned long long)builder.entry_count(),
@@ -1375,7 +1400,8 @@ static bool pread_exact_logged(int fd, void* dst, size_t size, off_t offset, con
     size_t done = 0;
     while (done < size) {
         const size_t want = std::min<size_t>(1024 * 1024, size - done);
-        const ssize_t nread = sceKernelPread(fd, out + done, want, offset + (off_t)done);
+        const ssize_t nread = ampr_real_physical_pread(
+            fd, out + done, want, offset + (off_t)done);
         if (nread <= 0) {
             AMPR_CRITICAL_LOGF("apr.index read.%s fail off=0x%llx want=0x%llx rc=0x%llx",
                       label, (unsigned long long)(offset + (off_t)done),
@@ -1391,24 +1417,24 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
     clear_compact_file_index_locked(idx);
 
     AMPR_LOGF("apr.index open enter path=%s format=AMPRIDX3", kAmprApp0IndexPath);
-    int fd = ampr_real_sceKernelOpen(kAmprApp0IndexPath, SCE_KERNEL_O_RDONLY, 0);
+    int fd = ampr_real_posix_open(kAmprApp0IndexPath, SCE_KERNEL_O_RDONLY, 0);
     if (fd < 0) {
         AMPR_LOGF("apr.index open miss path=%s rc=0x%x", kAmprApp0IndexPath, fd);
         return CompactIndexLoadResult::Missing;
     }
 
     SceKernelStat indexStat{};
-    const int statRc = sceKernelFstat(fd, &indexStat);
+    const int statRc = ampr_real_physical_fstat(fd, &indexStat);
     AMPR_LOGF("apr.index fstat path=%s fd=%d rc=0x%x size=0x%llx",
               kAmprApp0IndexPath, fd, statRc, statRc == 0 ? (unsigned long long)indexStat.st_size : 0ull);
     if (statRc != 0 || indexStat.st_size < (off_t)sizeof(CompactFileIndexHeader)) {
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
         return CompactIndexLoadResult::Invalid;
     }
 
     CompactFileIndexHeader header{};
     if (!pread_exact_logged(fd, &header, sizeof(header), 0, "header")) {
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
         return CompactIndexLoadResult::Invalid;
     }
 
@@ -1418,7 +1444,7 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
         header.hashSlotSize != sizeof(CompactFileIndexHashSlot)) {
         AMPR_LOGF("apr.index invalid-header path=%s format=AMPRIDX3 version=%u entrySize=%u hashSlotSize=%u",
                   kAmprApp0IndexPath, header.version, header.entrySize, header.hashSlotSize);
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
         return CompactIndexLoadResult::Invalid;
     }
 
@@ -1431,14 +1457,14 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
     const uint32_t hashSlotCount = header.hashSlotCount;
     if (entryCount == 0 || entryCount > kMaxEntries ||
         pathBytes == 0 || pathBytes > kMaxPathBytes ||
-        hashSlotCount == 0 ||
+        hashSlotCount < 2 ||
         (hashSlotCount & (hashSlotCount - 1u)) != 0 ||
         static_cast<uint64_t>(hashSlotCount) < entryCount) {
         AMPR_LOGF("apr.index invalid-counts entries=%llu pathBytes=0x%llx hashSlots=%u",
                   (unsigned long long)entryCount,
                   (unsigned long long)pathBytes,
                   hashSlotCount);
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
         return CompactIndexLoadResult::Invalid;
     }
     const uint64_t recordsBytes = entryCount * (uint64_t)sizeof(CompactFileIndexEntry);
@@ -1454,7 +1480,7 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
                   hashSlotCount,
                   (unsigned long long)hashFileOffset,
                   (unsigned long long)(pathFileOffset + pathBytes));
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
         return CompactIndexLoadResult::Invalid;
     }
     const uint64_t payloadBytes = (hashFileOffset - headerBytes) + hashBytes;
@@ -1465,7 +1491,7 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
                   (unsigned long long)entryCount,
                   (unsigned long long)pathBytes,
                   (unsigned long long)indexStat.st_size);
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
         return CompactIndexLoadResult::Invalid;
     }
 
@@ -1486,7 +1512,7 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
                   (unsigned long long)pathBytes,
                   (unsigned long long)mappedBytes);
         clear_compact_file_index_locked(idx);
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
         return CompactIndexLoadResult::Memory;
     }
     idx.compactMapBase = mapped;
@@ -1501,7 +1527,7 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
                   (unsigned long long)entryCount,
                   (unsigned long long)pathBytes);
         clear_compact_file_index_locked(idx);
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
         return CompactIndexLoadResult::Invalid;
     }
     idx.compactEntryCount = (size_t)entryCount;
@@ -1515,7 +1541,7 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
                                               (off_t)headerBytes, "records");
     if (!recordsOk) {
         clear_compact_file_index_locked(idx);
-        (void)sceKernelClose(fd);
+        (void)ampr_real_physical_close(fd);
         return CompactIndexLoadResult::Invalid;
     }
 
@@ -1528,7 +1554,7 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
                                                 (size_t)hashBytes,
                                                 (off_t)hashFileOffset,
                                                 "hashslots");
-    (void)sceKernelClose(fd);
+    (void)ampr_real_physical_close(fd);
     fd = -1;
     if (!pathBlobOk || !hashSlotsOk) {
         clear_compact_file_index_locked(idx);
@@ -1536,32 +1562,80 @@ __attribute__((noinline)) static CompactIndexLoadResult load_compact_app0_index_
     }
 
     bool valid = true;
-    const size_t validationIndexes[] = {0, idx.compactEntryCount / 2, idx.compactEntryCount - 1};
-    for (size_t vi = 0; vi < sizeof(validationIndexes) / sizeof(validationIndexes[0]); ++vi) {
-        const size_t i = validationIndexes[vi];
+    bool recordsSorted = true;
+    const char* previousPath = nullptr;
+    for (size_t i = 0; i < idx.compactEntryCount; ++i) {
         const auto& e = idx.compactEntries[i];
-        const uint64_t begin = e.pathOffset;
-        const uint64_t end = begin + e.pathLength;
-        char pathBuf[4096];
-        if (begin >= idx.compactPathBlobSize || end >= idx.compactPathBlobSize ||
-            !compact_index_copy_path(idx, e, pathBuf, sizeof(pathBuf))) {
+        const char* const currentPath = compact_index_path_ptr(idx, e);
+        char canonical[kAmprIndexMaxPath]{};
+        size_t canonicalLength = 0;
+        if (!currentPath ||
+            std::memchr(currentPath, '\0', e.pathLength) != nullptr ||
+            !normalize_app0_path_key(currentPath, canonical, sizeof(canonical),
+                                     &canonicalLength) ||
+            canonicalLength <= 6 || std::memcmp(canonical, "/app0/", 6) != 0 ||
+            canonicalLength != e.pathLength ||
+            compare_index_path_key(currentPath, canonical) != 0) {
             AMPR_LOGF("apr.index invalid-record idx=%zu off=0x%x len=0x%x pathBytes=0x%llx",
                       i, e.pathOffset, e.pathLength, (unsigned long long)idx.compactPathBlobSize);
             valid = false;
             break;
         }
+        if (previousPath && compare_index_path_key(previousPath, currentPath) > 0) {
+            recordsSorted = false;
+        }
+        previousPath = currentPath;
+    }
+    // Validate the immutable table before publishing it. Looking up every
+    // record also rejects duplicate names, missing records and broken chains.
+    size_t occupied = 0;
+    for (size_t i = 0; valid && i < hashSlotCount; ++i) {
+        const auto& slot = idx.compactHashSlots[i];
+        if (slot.indexPlusOne == 0) {
+            valid = slot.hash == 0 && slot.reserved == 0;
+            continue;
+        }
+        ++occupied;
+        valid = slot.indexPlusOne <= entryCount &&
+                (slot.reserved & ~kCompactIndexHashDuplicate) == 0;
+        if (valid) {
+            const char* path = compact_index_path_ptr(
+                idx, idx.compactEntries[slot.indexPlusOne - 1u]);
+            valid = path && slot.hash == compact_index_hash_key(path);
+        }
+    }
+    valid = valid && occupied == entryCount;
+    for (size_t i = 0; valid && i < idx.compactEntryCount; ++i) {
+        const char* path = compact_index_path_ptr(idx, idx.compactEntries[i]);
+        const uint64_t hash = compact_index_hash_key(path);
+        size_t pos = static_cast<size_t>(hash) & idx.compactHashMask;
+        bool found = false;
+        for (size_t probe = 0; probe < hashSlotCount; ++probe) {
+            const auto& slot = idx.compactHashSlots[pos];
+            if (slot.indexPlusOne == 0) break;
+            if (slot.hash == hash && compare_index_path_key(path,
+                    compact_index_path_ptr(idx,
+                        idx.compactEntries[slot.indexPlusOne - 1u])) == 0) {
+                found = slot.indexPlusOne == i + 1u;
+                break;
+            }
+            pos = (pos + 1u) & idx.compactHashMask;
+        }
+        valid = found;
     }
     if (!valid) {
         clear_compact_file_index_locked(idx);
         return CompactIndexLoadResult::Invalid;
     }
 
+    idx.compactRecordsSorted = recordsSorted;
     idx.compactAvailable = true;
     idx.available = true;
-    AMPR_LOGF("apr.index loaded path=%s format=AMPRIDX3 entries=%zu pathBytes=0x%llx hashSlots=%zu",
+    AMPR_LOGF("apr.index loaded path=%s format=AMPRIDX3 entries=%zu pathBytes=0x%llx hashSlots=%zu recordsSorted=%u",
               kAmprApp0IndexPath, idx.compactEntryCount,
               (unsigned long long)idx.compactPathBlobSize,
-              idx.compactHashMask != 0 ? idx.compactHashMask + 1u : 0u);
+              idx.compactHashMask != 0 ? idx.compactHashMask + 1u : 0u,
+              recordsSorted ? 1u : 0u);
     return CompactIndexLoadResult::Loaded;
 }
 
@@ -1621,6 +1695,15 @@ __attribute__((noinline)) static bool ensure_app0_index_ready_slow(FileIndexStat
             }
 #endif
         }
+
+#if AMPR_EMU_PACK_ENABLE
+        // Complete the pack snapshot while this is still a known-safe index
+        // construction boundary. Process hooks must never observe AMPRIDX3 as
+        // resident before the manifest load has reached a terminal state.
+        if (finalLoaded && work.available) {
+            (void)ampr_pack_ensure_manifest_ready_safe();
+        }
+#endif
 
         {
             AmprLockGuard lk(idx.m);
@@ -1683,12 +1766,8 @@ static bool lookup_app0_index_key_view(const char* key,
                 if (entryIndex < idx.compactEntryCount) {
                     const auto& e = idx.compactEntries[entryIndex];
                     const char* pathPtr = compact_index_path_ptr(idx, e);
-                    const bool trustUniqueHash =
-                        AMPR_EMU_APP0_INDEX_TRUST_UNIQUE_HASH != 0 &&
-                        (slot.reserved & kCompactIndexHashDuplicate) == 0 &&
-                        e.pathLength == keyLen;
-                    if (pathPtr &&
-                        (trustUniqueHash || compare_index_path_key(pathPtr, key) == 0)) {
+                    if (pathPtr && e.pathLength == keyLen &&
+                        compare_index_path_key(pathPtr, key) == 0) {
                         out->path = pathPtr;
                         out->pathLength = e.pathLength;
                         out->size = static_cast<size_t>(e.size);
@@ -1719,32 +1798,174 @@ static bool lookup_app0_index_key_view(const char* key,
     return false;
 }
 
+static bool compact_index_path_is_descendant(const char* path,
+                                             size_t pathLength,
+                                             const char* directoryKey,
+                                             size_t directoryLength) {
+    if (!path || !directoryKey || pathLength <= directoryLength) return false;
+    for (size_t i = 0; i < directoryLength; ++i) {
+        char pathChar = path[i] == '\\' ? '/' : path[i];
+        pathChar = ampr_ascii_lower(pathChar);
+        if (pathChar != directoryKey[i]) return false;
+    }
+    return path[directoryLength] == '/' || path[directoryLength] == '\\';
+}
+
+// AMPRIDX3 stores files only. A directory is present when at least one resident
+// file record is its descendant. Host-built indexes are sorted and use a
+// logarithmic lower bound. Older runtime-built images were unsorted, so retain
+// a compatible linear scan for those already deployed snapshots.
+static bool lookup_resident_app0_directory_key(const char* key,
+                                               size_t keyLength,
+                                               FileEntryView* representative) {
+    if (!key || !representative) return false;
+    auto& idx = file_index_state();
+    if (!idx.compactAvailable || !idx.compactEntries ||
+        idx.compactEntryCount == 0) {
+        return false;
+    }
+
+    size_t candidate = 0;
+    if (idx.compactRecordsSorted) {
+        if (keyLength + 2u > kAmprRuntimePathCapacity) return false;
+        char directoryPrefix[kAmprRuntimePathCapacity];
+        std::memcpy(directoryPrefix, key, keyLength);
+        directoryPrefix[keyLength] = '/';
+        directoryPrefix[keyLength + 1u] = '\0';
+        size_t first = 0;
+        size_t last = idx.compactEntryCount;
+        while (first < last) {
+            const size_t middle = first + (last - first) / 2u;
+            const char* const path = compact_index_path_ptr(
+                idx, idx.compactEntries[middle]);
+            if (path && compare_index_path_key(path, directoryPrefix) < 0) {
+                first = middle + 1u;
+            } else {
+                last = middle;
+            }
+        }
+        candidate = first;
+    }
+
+    const size_t scanEnd = idx.compactRecordsSorted
+        ? std::min(candidate + 1u, idx.compactEntryCount)
+        : idx.compactEntryCount;
+    for (size_t i = candidate; i < scanEnd; ++i) {
+        const CompactFileIndexEntry& entry = idx.compactEntries[i];
+        const char* const path = compact_index_path_ptr(idx, entry);
+        if (!path ||
+            !compact_index_path_is_descendant(path, entry.pathLength,
+                                              key, keyLength)) {
+            continue;
+        }
+        representative->path = path;
+        representative->pathLength = static_cast<uint32_t>(keyLength);
+        representative->size = 0;
+        representative->mtime = entry.mtime;
+        return true;
+    }
+    return false;
+}
+
 static bool is_normalized_app0_key(const char* key, size_t keyLen) {
     if (!key) return false;
     return (keyLen == 5u && std::memcmp(key, "/app0", 5u) == 0) ||
            (keyLen > 6u && std::memcmp(key, "/app0/", 6u) == 0);
 }
 
+bool ampr_index_path_has_app0_root_fast(const char* path) {
+    if (!path || (path[0] != '/' && path[0] != '\\')) return false;
+
+    // Reject ordinary non-/app paths with at most four byte comparisons. The
+    // exact root check is paid only by the rare matching prefix.
+    if (ampr_ascii_lower(path[1]) != 'a' ||
+        ampr_ascii_lower(path[2]) != 'p' ||
+        ampr_ascii_lower(path[3]) != 'p') {
+        return false;
+    }
+    if (path[4] != '0') return false;
+    return path[5] == '\0' || path[5] == '/' || path[5] == '\\';
+}
+
+bool ampr_index_is_resident_ready() {
+    return g_file_index_publish_state.load(std::memory_order_acquire) ==
+           FileIndexPublishState::Available;
+}
+
+bool ampr_index_ensure_ready_safe() {
+    return ensure_app0_index_ready(
+        file_index_state(), AMPR_EMU_APP0_INDEX_AUTOBUILD != 0);
+}
+
+enum class ResidentApp0LookupState : uint8_t {
+    NotApp0,
+    IndexNotReady,
+    Miss,
+    Hit,
+    Directory,
+};
+
+struct ResidentApp0Lookup {
+    ResidentApp0LookupState state{ResidentApp0LookupState::NotApp0};
+    FileEntryView entry{};
+    uint32_t fileId{0};
+    bool expectedMiss{false};
+};
+
+// Process hooks may only consume the immutable published image. They must not
+// start index I/O or wait for construction while libkernel owns a nonsleeping
+// lock. Once published, the index is authoritative for the /app0 file namespace.
+__attribute__((noinline)) static ResidentApp0Lookup lookup_resident_app0_path(
+    const char* path) {
+    ResidentApp0Lookup result{};
+    if (!ampr_index_path_has_app0_root_fast(path)) {
+        return result;
+    }
+    if (!ampr_index_is_resident_ready()) {
+        result.state = ResidentApp0LookupState::IndexNotReady;
+        return result;
+    }
+
+    result.state = ResidentApp0LookupState::Miss;
+    char key[kAmprRuntimePathCapacity];
+    size_t keyLen = 0;
+    bool hadTrailingSeparator = false;
+    if (normalize_app0_path_key_result(path, key, sizeof(key), &keyLen,
+                                      &hadTrailingSeparator) != 0 ||
+        !is_normalized_app0_key(key, keyLen)) {
+        AMPR_FILE_WRAPPER_LOGF("fs.resolve_app0 miss path=%s reason=invalid-or-directory",
+                               ampr_log_path_arg(path));
+        return result;
+    }
+    if (!hadTrailingSeparator && keyLen > 5u &&
+        lookup_app0_index_key_view(key,
+                                   keyLen,
+                                   &result.entry,
+                                   &result.fileId,
+                                   false)) {
+        result.state = ResidentApp0LookupState::Hit;
+        AMPR_FILE_WRAPPER_LOGF("fs.resolve_app0 hit path=%s real=%s fileId=%u",
+                               ampr_log_path_arg(path), result.entry.path,
+                               result.fileId);
+        return result;
+    }
+    if (lookup_resident_app0_directory_key(key, keyLen, &result.entry)) {
+        result.state = ResidentApp0LookupState::Directory;
+        AMPR_FILE_WRAPPER_LOGF("fs.resolve_app0 directory path=%s representative=%s",
+                               ampr_log_path_arg(path), result.entry.path);
+        return result;
+    }
+    result.expectedMiss = true;
+    AMPR_FILE_WRAPPER_LOGF("fs.resolve_app0 miss path=%s reason=index-miss",
+                           ampr_log_path_arg(path));
+    return result;
+}
+
 __attribute__((noinline)) static const char* maybe_resolve_app0_path_arg(const char* path) {
     AMPR_FILE_WRAPPER_LOGF("fs.resolve_app0 enter path=%s", ampr_log_path_arg(path));
-    char key[kAmprIndexMaxPath];
-    size_t keyLen = 0;
-    if (normalize_app0_path_key(path, key, sizeof(key), &keyLen) &&
-        is_normalized_app0_key(key, keyLen) &&
-        keyLen > 6u) {
-        FileEntryView indexed{};
-        if (lookup_app0_index_key_view(key,
-                                       keyLen,
-                                       &indexed,
-                                       nullptr,
-                                       AMPR_EMU_APP0_INDEX_AUTOBUILD != 0)) {
-            AMPR_FILE_WRAPPER_LOGF("fs.resolve_app0 hit path=%s real=%s",
-                                   ampr_log_path_arg(path), indexed.path);
-            return indexed.path;
-        }
-    }
-    AMPR_FILE_WRAPPER_LOGF("fs.resolve_app0 miss path=%s", ampr_log_path_arg(path));
-    return path;
+    const ResidentApp0Lookup indexed = lookup_resident_app0_path(path);
+    return indexed.state == ResidentApp0LookupState::Hit ? indexed.entry.path
+                                                         : path;
 }
 
 int ampr_index_get_entry_view(uint32_t id, FileEntryView* out);
@@ -1756,7 +1977,7 @@ int ampr_index_resolve_path_to_id(const char* path, uint32_t* outId, size_t* out
         return -EFAULT;
     }
 
-    char key[kAmprIndexMaxPath];
+    char key[kAmprRuntimePathCapacity];
     size_t keyLen = 0;
     bool hadTrailingSeparator = false;
     const int normalizeRc = normalize_app0_path_key_result(path,
@@ -1805,7 +2026,8 @@ int ampr_index_resolve_path_to_id(const char* path, uint32_t* outId, size_t* out
 }
 
 __attribute__((noinline)) static bool is_app0_path_arg(const char* path) {
-    char key[kAmprIndexMaxPath];
+    if (!ampr_index_path_has_app0_root_fast(path)) return false;
+    char key[kAmprRuntimePathCapacity];
     size_t keyLen = 0;
     return normalize_app0_path_key(path, key, sizeof(key), &keyLen) &&
            is_normalized_app0_key(key, keyLen);
@@ -1833,85 +2055,240 @@ static int app0_file_hook_return_direct(int directRc, int directErrno) {
     return directRc;
 }
 
-// Retry failed /app0 path operations with the canonical indexed spelling.
-extern "C" int sceKernelOpen_emul(const char* path, int flags, SceKernelMode mode) {
-    const int direct = ampr_real_sceKernelOpen(path, flags, mode);
-    const int directErrno = direct == -1 ? errno : 0;
-    if (direct >= 0 ||
-        (flags & SCE_KERNEL_O_DIRECTORY) != 0 ||
-        !app0_file_hook_should_try_index_fallback(direct, directErrno)) {
-        AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%p directRc=0x%x flags=0x%x mode=0x%x indexed=0",
-                               direct >= 0 ? "opened" : "failed",
-                               path, direct, flags, (unsigned)mode);
-        return app0_file_hook_return_direct(direct, directErrno);
-    }
-    if (!is_app0_path_arg(path)) {
-        return app0_file_hook_return_direct(direct, directErrno);
-    }
-
-    const char* realPath = maybe_resolve_app0_path_arg(path);
-    if (realPath == path) {
-        AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=failed path=%s directRc=0x%x flags=0x%x mode=0x%x indexed=0",
-                               ampr_log_path_arg(path), direct, flags, (unsigned)mode);
-        return app0_file_hook_return_direct(direct, directErrno);
-    }
-    const int rc = ampr_real_sceKernelOpen(realPath, flags, mode);
-    AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%s real=%s rc=0x%x flags=0x%x mode=0x%x indexed=1",
-                           rc >= 0 ? "opened" : "failed",
-                           ampr_log_path_arg(path), ampr_log_path_arg(realPath), rc, flags, (unsigned)mode);
-    return rc;
+[[maybe_unused]] static int app0_posix_return_from_sce(int rc) {
+    if (rc >= 0) return rc;
+    if (rc != -1) errno = ampr_posix_errno_from_sce(rc);
+    return -1;
 }
 
-extern "C" int sceKernelStat_emul(const char* path, SceKernelStat* sb) {
-    const int direct = ampr_real_sceKernelStat(path, sb);
-    const int directErrno = direct == -1 ? errno : 0;
-    if (direct == 0 || !app0_file_hook_should_try_index_fallback(direct, directErrno)) {
-        AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%p directRc=0x%x out=%p indexed=0",
-                               path, direct, sb);
-        return app0_file_hook_return_direct(direct, directErrno);
-    }
-    if (!is_app0_path_arg(path)) {
-        return app0_file_hook_return_direct(direct, directErrno);
-    }
-
-    const char* realPath = maybe_resolve_app0_path_arg(path);
-    if (realPath == path) {
-        AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%s directRc=0x%x out=%p indexed=0",
-                               ampr_log_path_arg(path), direct, sb);
-        return app0_file_hook_return_direct(direct, directErrno);
-    }
-    const int rc = ampr_real_sceKernelStat(realPath, sb);
-    AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%s real=%s rc=0x%x out=%p indexed=1",
-                           ampr_log_path_arg(path), ampr_log_path_arg(realPath), rc, sb);
-    return rc;
+static int app0_posix_index_miss() {
+    errno = ENOENT;
+    return -1;
 }
 
-extern "C" int sceKernelCheckReachability_emul(const char* path) {
+static void fill_indexed_file_stat(struct stat* sb,
+                                   const ResidentApp0Lookup& indexed) {
+    std::memset(sb, 0, sizeof(*sb));
+    sb->st_mode = static_cast<mode_t>(S_IFREG | 0444);
+    sb->st_nlink = static_cast<nlink_t>(1);
+    sb->st_size = static_cast<off_t>(indexed.entry.size);
+    sb->st_blksize = static_cast<blksize_t>(65536);
+    sb->st_blocks = static_cast<blkcnt_t>(
+        indexed.entry.size / 512u + (indexed.entry.size % 512u != 0 ? 1u : 0u));
+    sb->st_mtim.tv_sec = static_cast<time_t>(indexed.entry.mtime);
+    sb->st_atim.tv_sec = static_cast<time_t>(indexed.entry.mtime);
+    sb->st_ctim.tv_sec = static_cast<time_t>(indexed.entry.mtime);
+    // Resident file IDs are already unique and non-zero. Preserve that
+    // property in synthetic metadata instead of folding adjacent IDs together.
+    sb->st_ino = static_cast<ino_t>(indexed.fileId);
+}
+
+static void fill_indexed_directory_stat(struct stat* sb,
+                                        const ResidentApp0Lookup& indexed) {
+    std::memset(sb, 0, sizeof(*sb));
+    sb->st_mode = static_cast<mode_t>(S_IFDIR | 0555);
+    sb->st_nlink = static_cast<nlink_t>(2);
+    sb->st_blksize = static_cast<blksize_t>(65536);
+    sb->st_mtim.tv_sec = static_cast<time_t>(indexed.entry.mtime);
+    sb->st_atim.tv_sec = static_cast<time_t>(indexed.entry.mtime);
+    sb->st_ctim.tv_sec = static_cast<time_t>(indexed.entry.mtime);
+}
+
+static bool copy_indexed_directory_path(const ResidentApp0Lookup& indexed,
+                                        char* out,
+                                        size_t outSize) {
+    const size_t length = indexed.entry.pathLength;
+    if (!out || !indexed.entry.path || length + 1u > outSize) return false;
+    std::memcpy(out, indexed.entry.path, length);
+    out[length] = '\0';
+    return true;
+}
+
+// Published AMPRIDX3 is authoritative for /app0 file lookups. A miss returns
+// immediately; only an indexed loose file reaches the physical open syscall.
+static int posix_open_impl(const char* path, int flags, SceKernelMode mode,
+                           bool* expectedIndexMiss) {
+    if (expectedIndexMiss) *expectedIndexMiss = false;
+    const ResidentApp0Lookup indexed = lookup_resident_app0_path(path);
+    if (indexed.state == ResidentApp0LookupState::Directory) {
+        char canonicalDirectory[kAmprRuntimePathCapacity];
+        if (!copy_indexed_directory_path(indexed, canonicalDirectory,
+                                         sizeof(canonicalDirectory))) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+        if ((flags & SCE_KERNEL_O_DIRECTORY) != 0 &&
+            ampr_pack_manifest_is_resident_ready()) {
+            bool handled = false;
+            const int packRc = ampr_pack_open_directory(
+                canonicalDirectory, flags, mode, &handled);
+            if (handled) return app0_posix_return_from_sce(packRc);
+        }
+#endif
+        const int rc = ampr_real_posix_open(canonicalDirectory, flags, mode);
+        AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%s real=%s rc=0x%x flags=0x%x mode=0x%x indexedDirectory=1",
+                               rc >= 0 ? "opened" : "failed",
+                               ampr_log_path_arg(path), canonicalDirectory, rc,
+                               flags, (unsigned)mode);
+        return rc;
+    }
+    if (indexed.state == ResidentApp0LookupState::Hit) {
+        if ((flags & SCE_KERNEL_O_DIRECTORY) != 0) {
+            errno = ENOTDIR;
+            AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=failed path=%s flags=0x%x mode=0x%x indexed=1 reason=not-directory",
+                                   ampr_log_path_arg(path), flags,
+                                   (unsigned)mode);
+            return -1;
+        }
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_PROCESS_OPEN_ENABLE
+        bool handled = false;
+        const int packRc = ampr_pack_try_process_open_indexed(
+            indexed.fileId, indexed.entry, flags, mode, &handled);
+        if (handled) {
+            AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%s real=%s rc=0x%x flags=0x%x mode=0x%x processPack=1 indexed=1",
+                                   packRc >= 0 ? "opened" : "failed",
+                                   ampr_log_path_arg(path), indexed.entry.path,
+                                   packRc, flags, (unsigned)mode);
+            return app0_posix_return_from_sce(packRc);
+        }
+#endif
+        const int rc = ampr_real_posix_open(indexed.entry.path, flags, mode);
+        AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%s real=%s rc=0x%x flags=0x%x mode=0x%x indexed=1",
+                               rc >= 0 ? "opened" : "failed",
+                               ampr_log_path_arg(path), indexed.entry.path, rc,
+                               flags, (unsigned)mode);
+        return rc;
+    }
+
+    if (indexed.state == ResidentApp0LookupState::Miss) {
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+        if ((flags & SCE_KERNEL_O_DIRECTORY) != 0 &&
+            ampr_pack_manifest_is_resident_ready()) {
+            bool handled = false;
+            const int packRc = ampr_pack_open_virtual_directory(
+                path, flags, mode, &handled);
+            if (handled) {
+                AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%s rc=0x%x flags=0x%x mode=0x%x directoryOverlay=1 indexedMiss=1",
+                                       packRc >= 0 ? "opened" : "failed",
+                                       ampr_log_path_arg(path), packRc, flags,
+                                       (unsigned)mode);
+                return app0_posix_return_from_sce(packRc);
+            }
+        }
+#endif
+        AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=failed path=%s flags=0x%x mode=0x%x indexed=0 reason=index-miss",
+                               ampr_log_path_arg(path), flags, (unsigned)mode);
+        if (expectedIndexMiss) *expectedIndexMiss = indexed.expectedMiss;
+        return app0_posix_index_miss();
+    }
+
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+    if ((flags & SCE_KERNEL_O_DIRECTORY) != 0 &&
+        ampr_index_path_has_app0_root_fast(path) &&
+        ampr_pack_manifest_is_resident_ready()) {
+        bool handled = false;
+        const int rc = ampr_pack_open_directory(path, flags, mode, &handled);
+        if (handled) return app0_posix_return_from_sce(rc);
+    }
+#endif
+    const int direct = ampr_real_posix_open(path, flags, mode);
+    const int directErrno = direct == -1 ? errno : 0;
+    AMPR_FILE_WRAPPER_LOGF("fs.open.emu status=%s path=%p directRc=0x%x flags=0x%x mode=0x%x indexed=0 indexReady=%u",
+                           direct >= 0 ? "opened" : "failed", path, direct,
+                           flags, (unsigned)mode,
+                           indexed.state == ResidentApp0LookupState::IndexNotReady ? 0u : 1u);
+    return app0_file_hook_return_direct(direct, directErrno);
+}
+
+static int posix_stat_impl(const char* path, struct stat* sb,
+                           bool* expectedIndexMiss) {
+    if (expectedIndexMiss) *expectedIndexMiss = false;
+    if (!sb) {
+        errno = EFAULT;
+        return -1;
+    }
+    const ResidentApp0Lookup indexed = lookup_resident_app0_path(path);
+    if (indexed.state == ResidentApp0LookupState::Directory) {
+        fill_indexed_directory_stat(sb, indexed);
+        AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%s rc=0x0 out=%p indexedDirectory=1 synthetic=1",
+                               ampr_log_path_arg(path), sb);
+        return 0;
+    }
+    if (indexed.state == ResidentApp0LookupState::Hit) {
+        fill_indexed_file_stat(sb, indexed);
+        AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%s real=%s rc=0x0 out=%p indexed=1 synthetic=1 fileId=%u",
+                               ampr_log_path_arg(path), indexed.entry.path, sb,
+                               indexed.fileId);
+        return 0;
+    }
+    if (indexed.state == ResidentApp0LookupState::Miss) {
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+        if (ampr_pack_manifest_is_resident_ready()) {
+            bool handled = false;
+            const int packRc = ampr_pack_try_stat_path(path, sb, &handled);
+            if (handled) {
+                AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%s rc=0x%x out=%p packSynthetic=1",
+                                       ampr_log_path_arg(path), packRc, sb);
+                return app0_posix_return_from_sce(packRc);
+            }
+        }
+#endif
+        AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%s out=%p indexed=0 reason=index-miss",
+                               ampr_log_path_arg(path), sb);
+        if (expectedIndexMiss) *expectedIndexMiss = indexed.expectedMiss;
+        return app0_posix_index_miss();
+    }
+    const int direct = ampr_real_posix_stat(path, sb);
+    const int directErrno = direct == -1 ? errno : 0;
+    AMPR_FILE_WRAPPER_LOGF("fs.stat.emu path=%p directRc=0x%x out=%p indexed=0 indexReady=%u",
+                           path, direct, sb,
+                           indexed.state == ResidentApp0LookupState::IndexNotReady ? 0u : 1u);
+    return app0_file_hook_return_direct(direct, directErrno);
+}
+
+static int sceKernelCheckReachability_impl(const char* path,
+                                            bool* expectedIndexMiss) {
+    if (expectedIndexMiss) *expectedIndexMiss = false;
+    const ResidentApp0Lookup indexed = lookup_resident_app0_path(path);
+    if (indexed.state == ResidentApp0LookupState::Directory) {
+        AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%s rc=0x0 indexedDirectory=1 synthetic=1",
+                               ampr_log_path_arg(path));
+        return 0;
+    }
+    if (indexed.state == ResidentApp0LookupState::Hit) {
+        AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%s real=%s rc=0x0 indexed=1 synthetic=1 fileId=%u",
+                               ampr_log_path_arg(path), indexed.entry.path,
+                               indexed.fileId);
+        return 0;
+    }
+    if (indexed.state == ResidentApp0LookupState::Miss) {
+#if AMPR_EMU_PACK_ENABLE && AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+        if (ampr_pack_manifest_is_resident_ready()) {
+            bool handled = false;
+            const int packRc = ampr_pack_try_reachability(path, &handled);
+            if (handled) {
+                AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%s rc=0x%x packSynthetic=1",
+                                       ampr_log_path_arg(path), packRc);
+                return packRc;
+            }
+        }
+#endif
+        AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%s rc=0x%x indexed=0 reason=index-miss",
+                               ampr_log_path_arg(path),
+                               SCE_KERNEL_ERROR_ENOENT);
+        if (expectedIndexMiss) *expectedIndexMiss = indexed.expectedMiss;
+        return SCE_KERNEL_ERROR_ENOENT;
+    }
     const int direct = ampr_real_sceKernelCheckReachability(path);
-    const int directErrno = direct == -1 ? errno : 0;
-    if (direct == 0 || !app0_file_hook_should_try_index_fallback(direct, directErrno)) {
-        AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%p directRc=0x%x indexed=0",
-                               path, direct);
-        return app0_file_hook_return_direct(direct, directErrno);
-    }
-    if (!is_app0_path_arg(path)) {
-        return app0_file_hook_return_direct(direct, directErrno);
-    }
-
-    const char* realPath = maybe_resolve_app0_path_arg(path);
-    if (realPath == path) {
-        AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%s directRc=0x%x indexed=0",
-                               ampr_log_path_arg(path), direct);
-        return app0_file_hook_return_direct(direct, directErrno);
-    }
-    const int rc = ampr_real_sceKernelCheckReachability(realPath);
-    AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%s real=%s rc=0x%x indexed=1",
-                           ampr_log_path_arg(path), ampr_log_path_arg(realPath), rc);
-    return rc;
+    AMPR_FILE_WRAPPER_LOGF("fs.checkReachability.emu path=%p directRc=0x%x indexed=0 indexReady=%u",
+                           path, direct,
+                           indexed.state == ResidentApp0LookupState::IndexNotReady ? 0u : 1u);
+    return direct;
 }
 
-extern "C" int sceKernelUnlink_emul(const char* path) {
-    const int direct = ampr_real_sceKernelUnlink(path);
+static int posix_unlink_impl(const char* path) {
+    const int direct = ampr_real_posix_unlink(path);
     const int directErrno = direct == -1 ? errno : 0;
     if (direct == 0 || !app0_file_hook_should_try_index_fallback(direct, directErrno)) {
         AMPR_FILE_WRAPPER_LOGF("fs.unlink.emu path=%p directRc=0x%x indexed=0",
@@ -1928,14 +2305,14 @@ extern "C" int sceKernelUnlink_emul(const char* path) {
                                ampr_log_path_arg(path), direct);
         return app0_file_hook_return_direct(direct, directErrno);
     }
-    const int rc = ampr_real_sceKernelUnlink(realPath);
+    const int rc = ampr_real_posix_unlink(realPath);
     AMPR_FILE_WRAPPER_LOGF("fs.unlink.emu path=%s real=%s rc=0x%x indexed=1",
                            ampr_log_path_arg(path), ampr_log_path_arg(realPath), rc);
     return rc;
 }
 
-extern "C" int sceKernelRename_emul(const char* from, const char* to) {
-    const int direct = ampr_real_sceKernelRename(from, to);
+static int posix_rename_impl(const char* from, const char* to) {
+    const int direct = ampr_real_posix_rename(from, to);
     const int directErrno = direct == -1 ? errno : 0;
     if (direct == 0) {
         AMPR_FILE_WRAPPER_LOGF("fs.rename.emu from=%s to=%s directRc=0x%x indexedFrom=0 indexedTo=0",
@@ -1962,12 +2339,56 @@ extern "C" int sceKernelRename_emul(const char* from, const char* to) {
                                ampr_log_path_arg(from), ampr_log_path_arg(to), direct);
         return app0_file_hook_return_direct(direct, directErrno);
     }
-    const int rc = ampr_real_sceKernelRename(realFrom, realTo);
+    const int rc = ampr_real_posix_rename(realFrom, realTo);
     AMPR_FILE_WRAPPER_LOGF("fs.rename.emu from=%s realFrom=%s to=%s realTo=%s rc=0x%x indexedFrom=%u indexedTo=%u",
                            ampr_log_path_arg(from), ampr_log_path_arg(realFrom),
                            ampr_log_path_arg(to), ampr_log_path_arg(realTo), rc,
                            realFrom != from ? 1u : 0u, realTo != to ? 1u : 0u);
     return rc;
+}
+
+extern "C" int posix_open_emul(const char* path, int flags, ...) {
+    SceKernelMode mode = 0;
+    if ((flags & O_CREAT) != 0) {
+        va_list args;
+        va_start(args, flags);
+        mode = static_cast<SceKernelMode>(va_arg(args, int));
+        va_end(args);
+    }
+    bool expectedIndexMiss = false;
+    const int result = posix_open_impl(
+        path, flags, mode, &expectedIndexMiss);
+    return expectedIndexMiss
+        ? result
+        : ampr_klog_io_hook_path_result("open", path, result);
+}
+
+extern "C" int posix_stat_emul(const char* path, struct stat* sb) {
+    bool expectedIndexMiss = false;
+    const int result = posix_stat_impl(path, sb, &expectedIndexMiss);
+    return expectedIndexMiss
+        ? result
+        : ampr_klog_io_hook_path_result("stat", path, result);
+}
+
+extern "C" int sceKernelCheckReachability_emul(const char* path) {
+    bool expectedIndexMiss = false;
+    const int result = sceKernelCheckReachability_impl(
+        path, &expectedIndexMiss);
+    return expectedIndexMiss
+        ? result
+        : ampr_klog_io_hook_path_result(
+              "sceKernelCheckReachability", path, result);
+}
+
+extern "C" int posix_unlink_emul(const char* path) {
+    return ampr_klog_io_hook_path_result("unlink", path,
+                                         posix_unlink_impl(path));
+}
+
+extern "C" int posix_rename_emul(const char* from, const char* to) {
+    return ampr_klog_io_hook_paths_result(
+        "rename", "from", from, "to", to, posix_rename_impl(from, to));
 }
 
 int ampr_index_get_entry_view(uint32_t id, FileEntryView* out) {
@@ -1994,4 +2415,3 @@ int ampr_index_get_entry_view(uint32_t id, FileEntryView* out) {
     if (out) *out = view;
     return 0;
 }
-

@@ -18,16 +18,23 @@ struct AmprIndexFdPressureCaps {
 
 struct AmprIndexFdCacheStats {
     size_t entries{};
+    size_t handles{};
     size_t open{};
     size_t pinnedOpen{};
     size_t pins{};
     size_t evictable{};
+    size_t probationary{};
+    size_t protectedEntries{};
 };
 
 struct AmprIndexFdCacheDiagCounters {
     uint64_t hits{};
     uint64_t misses{};
     uint64_t emfile{};
+    uint64_t promotions{};
+    uint64_t demotions{};
+    uint64_t probationaryEvictions{};
+    uint64_t protectedEvictions{};
 };
 
 
@@ -41,6 +48,11 @@ void ampr_index_release_cached_fd_pin(uint32_t fileId);
 void ampr_index_fd_direct_note_open();
 void ampr_index_fd_direct_note_close();
 size_t ampr_index_fd_direct_open_count();
+void ampr_index_fd_pack_note_open();
+void ampr_index_fd_pack_note_close();
+size_t ampr_index_fd_pack_open_count();
+size_t ampr_index_fd_uncached_open_count();
+uint64_t ampr_index_fd_open_budget_progress_generation();
 size_t ampr_index_fd_open_budget_effective_cap();
 void ampr_index_fd_open_budget_set_effective_cap(size_t cap);
 AmprIndexFdPressureCaps ampr_index_fd_pressure_current_caps();

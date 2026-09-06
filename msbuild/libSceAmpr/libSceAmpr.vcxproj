@@ -5,6 +5,22 @@
       <Configuration>ReleaseHooks</Configuration>
       <Platform>Prospero</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="DebugHooksLooseStdio|Prospero">
+      <Configuration>DebugHooksLooseStdio</Configuration>
+      <Platform>Prospero</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="DebugHooksPackedStdio|Prospero">
+      <Configuration>DebugHooksPackedStdio</Configuration>
+      <Platform>Prospero</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="ReleaseHooksLooseStdio|Prospero">
+      <Configuration>ReleaseHooksLooseStdio</Configuration>
+      <Platform>Prospero</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="ReleaseHooksPackedStdio|Prospero">
+      <Configuration>ReleaseHooksPackedStdio</Configuration>
+      <Platform>Prospero</Platform>
+    </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{1C1DF483-F977-4DF2-84C7-CA97E6E9B2B2}</ProjectGuid>
@@ -14,32 +30,75 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseHooks|Prospero'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugHooksLooseStdio|Prospero'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugHooksPackedStdio|Prospero'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseHooksLooseStdio|Prospero'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseHooksPackedStdio|Prospero'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <Import Project="..\Prospero.Common.props" />
   <ImportGroup Label="ExtensionSettings" />
-  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='ReleaseHooks|Prospero'">
+  <ImportGroup Label="PropertySheets" Condition="'$(Platform)'=='Prospero'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <TargetName>libSceAmpr</TargetName>
     <TargetExt>.prx</TargetExt>
+    <AmprPackEnable Condition="'$(AmprPackEnable)'=='' and '$(AmprBuildFlavor)'=='LooseStdio'">0</AmprPackEnable>
+    <AmprDirectoryOverlay Condition="'$(AmprDirectoryOverlay)'=='' and '$(AmprBuildFlavor)'=='LooseStdio'">0</AmprDirectoryOverlay>
+    <AmprProcessOpenIntercept Condition="'$(AmprProcessOpenIntercept)'=='' and '$(AmprBuildFlavor)'=='LooseStdio'">0</AmprProcessOpenIntercept>
+    <AmprProcessAioIntercept Condition="'$(AmprProcessAioIntercept)'=='' and '$(AmprBuildFlavor)'=='LooseStdio'">0</AmprProcessAioIntercept>
+    <AmprProcessSyncReadIntercept Condition="'$(AmprProcessSyncReadIntercept)'=='' and '$(AmprBuildFlavor)'=='LooseStdio'">0</AmprProcessSyncReadIntercept>
+    <AmprProcessReadIntercept Condition="'$(AmprProcessReadIntercept)'=='' and '$(AmprBuildFlavor)'=='LooseStdio'">0</AmprProcessReadIntercept>
+    <AmprInternalAmmPoolSize Condition="'$(AmprInternalAmmPoolSize)'=='' and '$(AmprBuildFlavor)'=='LooseStdio'">0x04000000ull</AmprInternalAmmPoolSize>
+    <AmprPackEnable Condition="'$(AmprPackEnable)'=='' and '$(AmprBuildFlavor)'=='PackedStdio'">1</AmprPackEnable>
+    <AmprDirectoryOverlay Condition="'$(AmprDirectoryOverlay)'=='' and '$(AmprBuildFlavor)'=='PackedStdio'">1</AmprDirectoryOverlay>
+    <AmprProcessOpenIntercept Condition="'$(AmprProcessOpenIntercept)'=='' and '$(AmprBuildFlavor)'=='PackedStdio'">1</AmprProcessOpenIntercept>
+    <AmprProcessAioIntercept Condition="'$(AmprProcessAioIntercept)'=='' and '$(AmprBuildFlavor)'=='PackedStdio'">1</AmprProcessAioIntercept>
+    <AmprProcessSyncReadIntercept Condition="'$(AmprProcessSyncReadIntercept)'=='' and '$(AmprBuildFlavor)'=='PackedStdio'">1</AmprProcessSyncReadIntercept>
+    <AmprProcessReadIntercept Condition="'$(AmprProcessReadIntercept)'=='' and '$(AmprBuildFlavor)'=='PackedStdio'">1</AmprProcessReadIntercept>
+    <AmprInternalAmmPoolSize Condition="'$(AmprInternalAmmPoolSize)'=='' and '$(AmprBuildFlavor)'=='PackedStdio'">0x18000000ull</AmprInternalAmmPoolSize>
+    <AmprDebugLogDefinition Condition="'$(AmprDebugBuild)'=='1'">AMPR_EMU_DEBUG_LOG=1;</AmprDebugLogDefinition>
+    <AmprDebugLogDefinition Condition="'$(AmprDebugBuild)'=='0'">AMPR_EMU_DEBUG_LOG=0;</AmprDebugLogDefinition>
+    <AmprCommandLog Condition="'$(AmprCommandLog)'=='' and '$(AmprDebugBuild)'=='1'">3</AmprCommandLog>
+    <AmprCommandLog Condition="'$(AmprCommandLog)'==''">0</AmprCommandLog>
+    <AmprPackEnable Condition="'$(AmprPackEnable)'==''">1</AmprPackEnable>
+    <AmprDirectoryOverlay Condition="'$(AmprDirectoryOverlay)'==''">1</AmprDirectoryOverlay>
+    <AmprProcessOpenIntercept Condition="'$(AmprProcessOpenIntercept)'==''">1</AmprProcessOpenIntercept>
+    <AmprProcessAioIntercept Condition="'$(AmprProcessAioIntercept)'==''">1</AmprProcessAioIntercept>
+    <AmprProcessSyncReadIntercept Condition="'$(AmprProcessSyncReadIntercept)'==''">1</AmprProcessSyncReadIntercept>
+    <AmprProcessReadIntercept Condition="'$(AmprProcessReadIntercept)'==''">1</AmprProcessReadIntercept>
+    <AmprPackIoLog Condition="'$(AmprPackIoLog)'=='' and '$(AmprDebugBuild)'=='1'">1</AmprPackIoLog>
+    <AmprPackIoLog Condition="'$(AmprPackIoLog)'==''">0</AmprPackIoLog>
+    <AmprInternalAmmPoolSize Condition="'$(AmprInternalAmmPoolSize)'==''">0x18000000ull</AmprInternalAmmPoolSize>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <PreprocessorDefinitions>LIBSCEAMPR_IMPL=1;AMPR_EMU_HAS_LIBKERNEL_HOOK_IMPL=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(SolutionDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>LIBSCEAMPR_IMPL=1;AMPR_EMU_HAS_LIBKERNEL_HOOK_IMPL=1;$(AmprDebugLogDefinition)AMPR_EMU_COMMAND_LOG=$(AmprCommandLog);AMPR_EMU_PACK_ENABLE=$(AmprPackEnable);AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE=$(AmprDirectoryOverlay);AMPR_EMU_PACK_PROCESS_OPEN_ENABLE=$(AmprProcessOpenIntercept);AMPR_EMU_PACK_INTERCEPT_PROCESS_AIO=$(AmprProcessAioIntercept);AMPR_EMU_PACK_INTERCEPT_PROCESS_SYNC_READS=$(AmprProcessSyncReadIntercept);AMPR_EMU_PACK_INTERCEPT_PROCESS_READS=$(AmprProcessReadIntercept);AMPR_EMU_PACK_IO_LOG=$(AmprPackIoLog);AMPR_EMU_INTERNAL_AMM_POOL_SIZE=$(AmprInternalAmmPoolSize);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(SolutionDir)include;$(SolutionDir)third_party\lz4\lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>-fPIC %(AdditionalOptions)</AdditionalOptions>
-      <OptimizationLevel>Level3</OptimizationLevel>
-      <FastMath>true</FastMath>
       <NoStrictAliasing>true</NoStrictAliasing>
-      <UnrollLoops>true</UnrollLoops>
-      <LinkTimeOptimization>true</LinkTimeOptimization>
     </ClCompile>
     <Link>
       <AdditionalDependencies>$(OutDir)libSceLibcInternal_stub_weak.a;libkernel_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>-Wl,--as-needed -Wl,--oformat=prx %(AdditionalOptions)</AdditionalOptions>
     </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='Prospero' and ('$(Configuration)'=='ReleaseHooks' or '$(Configuration)'=='DebugHooksLooseStdio' or '$(Configuration)'=='DebugHooksPackedStdio' or '$(Configuration)'=='ReleaseHooksLooseStdio' or '$(Configuration)'=='ReleaseHooksPackedStdio')">
+    <ClCompile>
+      <OptimizationLevel>Level3</OptimizationLevel>
+      <FastMath>true</FastMath>
+      <UnrollLoops>true</UnrollLoops>
+      <LinkTimeOptimization>true</LinkTimeOptimization>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\..\src\ampr_debug_log.cpp" />
@@ -47,6 +106,14 @@
     <ClCompile Include="..\..\src\ampr_emu_runtime_memory.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_index.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_fd_cache.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_loose_adaptive.cpp" />
+    <ClCompile Include="..\..\third_party\lz4\lib\lz4.c">
+      <CompileAs>CompileAsCpp</CompileAs>
+    </ClCompile>
+    <ClCompile Include="..\..\src\ampr_emu_pack_core.cpp" />
+    <ClCompile Include="..\..\src\ampr_emu_pack.cpp">
+      <AdditionalOptions Condition="'$(AmprBuildFlavor)'=='LooseStdio'">-Wno-unused-function -Wno-unused-const-variable %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="..\..\src\ampr_emu_amm.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_command_buffer.cpp" />
     <ClCompile Include="..\..\src\ampr_emu_command_buffer_amm.cpp" />
@@ -87,6 +154,9 @@
     <ClInclude Include="..\..\include\ampr_emu_kernel_lookup.h" />
     <ClInclude Include="..\..\include\ampr_emu_kernel_memory.h" />
     <ClInclude Include="..\..\include\ampr_emu_log.h" />
+    <ClInclude Include="..\..\include\ampr_emu_pack.h" />
+    <ClInclude Include="..\..\include\ampr_emu_pack_core.h" />
+    <ClInclude Include="..\..\include\ampr_emu_pack_format.h" />
     <ClInclude Include="..\..\include\ampr_emu_runtime_memory.h" />
     <ClInclude Include="..\..\include\ampr_emu_sync.h" />
     <ClInclude Include="..\..\include\ampr_emu_apr_services.h" />
@@ -97,6 +167,7 @@
     <ClInclude Include="..\..\include\ampr_emu_command_packing.h" />
     <ClInclude Include="..\..\include\ampr_emu_index.h" />
     <ClInclude Include="..\..\include\ampr_emu_fd_cache.h" />
+    <ClInclude Include="..\..\include\ampr_emu_loose_adaptive.h" />
     <ClInclude Include="..\..\include\ampr_emu_prot.h" />
   </ItemGroup>
   <Target Name="GenerateLibSceAmprLibcInternalStub" BeforeTargets="Link">

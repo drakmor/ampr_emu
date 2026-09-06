@@ -67,6 +67,23 @@
 #define AMPR_EMU_FD_CACHE_EMFILE_IDLE_CLOSE_PERCENT 10
 #endif
 
+#ifndef AMPR_EMU_FD_CACHE_SLRU
+// 1 -> retain newly opened idle descriptors in a probationary segment and
+// promote descriptors after a real cache hit. Eviction prefers probationary
+// descriptors so one-shot file scans do not evict the repeatedly used set.
+#define AMPR_EMU_FD_CACHE_SLRU 1
+#endif
+
+#ifndef AMPR_EMU_FD_CACHE_PROTECTED_PERCENT
+// Soft share of the idle FD cache assigned to the protected SLRU segment.
+// The quota is borrowable; only eviction order and demotion use this target.
+#define AMPR_EMU_FD_CACHE_PROTECTED_PERCENT 67u
+#endif
+
+#if AMPR_EMU_FD_CACHE_PROTECTED_PERCENT > 100u
+#error "AMPR_EMU_FD_CACHE_PROTECTED_PERCENT must be <= 100"
+#endif
+
 #ifndef AMPR_EMU_FD_CACHE_IDLE_CLOSE_NS
 // Close unpinned cached APR FDs after this much monotonic idle time. Active
 // pinned FDs are never closed by this path. Set to 0 to keep idle FDs until
@@ -94,18 +111,10 @@
 #ifndef AMPR_EMU_APP0_INDEX_AUTOBUILD
 // 1 -> on the first safe AMPR entrypoint, load /app0/ampr_emu.index or build it
 // by recursively scanning /app0 once and trying to save the generated AMPRIDX3.
-// 0 -> require a deployed index for case-insensitive lookup and use direct
-// stat() for exact-case paths when the index is missing.
+// 0 -> require a deployed index for case-insensitive lookup. Before an index
+// is published, process hooks safely use libkernel; afterward, /app0 misses are
+// authoritative and do not probe the physical filesystem.
 #define AMPR_EMU_APP0_INDEX_AUTOBUILD 1
-#endif
-
-#ifndef AMPR_EMU_APP0_INDEX_TRUST_UNIQUE_HASH
-// 1 -> when an AMPRIDX3 hash appears exactly once in the loaded index, trust the
-// hash plus path length and skip full path comparison. This is faster but can
-// theoretically return a false positive if an absent path collides with a
-// unique 64-bit index hash. The active default enables this fast path; set it
-// to 0 for strict full path verification.
-#define AMPR_EMU_APP0_INDEX_TRUST_UNIQUE_HASH 1
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_INFLIGHT
@@ -113,6 +122,109 @@
 // Age-based backpressure may temporarily reduce this value, while the optional
 // small-read boost below may temporarily increase it.
 #define AMPR_EMU_APR_AIO_INFLIGHT 32
+#endif
+
+
+#ifndef AMPR_EMU_LOOSE_AIO_RESERVE_ENABLE
+// Protect a small share of the current SDK AIO window only while a latency
+// request is actually waiting. Unused capacity remains fully borrowable.
+#define AMPR_EMU_LOOSE_AIO_RESERVE_ENABLE 1
+#endif
+
+#ifndef AMPR_EMU_LOOSE_FD_PROMOTION_ENABLE
+// A repeated small full-file read stops using the one-shot open/close path and
+// is promoted into the ordinary descriptor cache.
+#define AMPR_EMU_LOOSE_FD_PROMOTION_ENABLE 1
+#endif
+
+#ifndef AMPR_EMU_LOOSE_ADAPTIVE_ENABLE
+// Zero-profile adaptive scheduling for ordinary indexed files. This does not
+// require asset packs or an offline workload classification.
+#define AMPR_EMU_LOOSE_ADAPTIVE_ENABLE 1
+#endif
+
+#ifndef AMPR_EMU_LOOSE_ADAPTIVE_FILE_CAPACITY
+// Bounded online history. Four-way set association keeps lookup constant-time
+// without dynamic allocation or a process-wide hash table.
+#define AMPR_EMU_LOOSE_ADAPTIVE_FILE_CAPACITY 4096u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_ADAPTIVE_FILE_WAYS
+#define AMPR_EMU_LOOSE_ADAPTIVE_FILE_WAYS 4u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_ADAPTIVE_IDLE_RESET_NS
+// Forget stale access-pattern scores after 30 seconds without activity.
+#define AMPR_EMU_LOOSE_ADAPTIVE_IDLE_RESET_NS 30000000000ull
+#endif
+
+#ifndef AMPR_EMU_LOOSE_TINY_READ_MAX_BYTES
+#define AMPR_EMU_LOOSE_TINY_READ_MAX_BYTES 0x4000u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_SMALL_READ_MAX_BYTES
+#define AMPR_EMU_LOOSE_SMALL_READ_MAX_BYTES 0x10000u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_BULK_READ_MIN_BYTES
+#define AMPR_EMU_LOOSE_BULK_READ_MIN_BYTES 0x40000u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_SEQUENTIAL_STREAK
+#define AMPR_EMU_LOOSE_SEQUENTIAL_STREAK 3u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_LATENCY_RESERVED_MAX
+// Maximum number of base-window AIO slots protected from new bulk admissions
+// while an equal-or-higher APR priority has latency work waiting. Unused slots
+// remain fully borrowable when there is no latency demand.
+#define AMPR_EMU_LOOSE_LATENCY_RESERVED_MAX 4u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_FULL_FILE_PROMOTE_HITS
+// A small full-file read is one-shot on its first access. Starting with this
+// access count it is promoted to the ordinary FD cache instead of open/AIO/close.
+#define AMPR_EMU_LOOSE_FULL_FILE_PROMOTE_HITS 2u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_COALESCE_ENABLE
+// Merge adjacent APR read commands only when their resolved file ranges and
+// destination ranges are both exactly contiguous. No fence, wait, event, reset,
+// EOP, native packet, or other non-read command may be crossed.
+#define AMPR_EMU_LOOSE_COALESCE_ENABLE 1
+#endif
+
+#ifndef AMPR_EMU_LOOSE_COALESCE_MAX_BYTES
+#define AMPR_EMU_LOOSE_COALESCE_MAX_BYTES 0x80000u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS
+#define AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS 8u
+#endif
+
+#ifndef AMPR_EMU_LOOSE_GS_COALESCE_ENABLE
+// Extend direct loose-file coalescing to ReadGather/ReadScatter/
+// ReadGatherScatter after resolving each command through a transactional shadow
+// gather/scatter state. Only the no-staging subset with contiguous source and
+// destination ranges is eligible.
+#define AMPR_EMU_LOOSE_GS_COALESCE_ENABLE 1
+#endif
+
+#ifndef AMPR_EMU_LOOSE_GS_COALESCE_MAX_BYTES
+#define AMPR_EMU_LOOSE_GS_COALESCE_MAX_BYTES \
+    AMPR_EMU_LOOSE_COALESCE_MAX_BYTES
+#endif
+
+#ifndef AMPR_EMU_LOOSE_GS_COALESCE_MAX_COMMANDS
+#define AMPR_EMU_LOOSE_GS_COALESCE_MAX_COMMANDS \
+    AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS
+#endif
+
+#ifndef AMPR_EMU_LOOSE_CLASS_BATCH_ORDER
+// Experimental stable class ordering inside one exact APR priority. Keep this
+// disabled by default: the latency reserve and per-chain window already protect
+// short reads without reordering independent public submissions.
+#define AMPR_EMU_LOOSE_CLASS_BATCH_ORDER 0
 #endif
 
 #ifndef AMPR_EMU_FD_DIRECT_CAP_RESERVE
@@ -196,6 +308,12 @@
 // A request at or below this size is considered small for dynamic AIO-window
 // growth. The threshold applies to the actual SDK AIO slice, not file size.
 #define AMPR_EMU_APR_AIO_SMALL_READ_MAX_BYTES 0x10000u
+#endif
+
+#ifndef AMPR_EMU_APR_AIO_LATENCY_ESCAPE_SLOTS
+// Healthy small APR 0..3 latency work may use this many slots above the base
+// window without waiting for the whole active mix to become small-read-heavy.
+#define AMPR_EMU_APR_AIO_LATENCY_ESCAPE_SLOTS 4u
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_SMALL_READ_MIN_PERCENT
@@ -289,6 +407,24 @@
 // issued read is often only a provisional tail and may be superseded by more
 // reads from the same command buffer before it can gate visible completion.
 #define AMPR_EMU_APR_AIO_POLL_BACKGROUND_INITIAL_MIN_NS 250000
+#endif
+
+#ifndef AMPR_EMU_APR_EXTERNAL_AIO_POLL_LATENCY_INITIAL_NS
+// Small physical pack reads often complete within one background-poll period.
+// Observe them sooner without applying the 10 us EOP cadence to every request.
+#define AMPR_EMU_APR_EXTERNAL_AIO_POLL_LATENCY_INITIAL_NS 50000
+#endif
+
+#ifndef AMPR_EMU_APR_EXTERNAL_AIO_POLL_LATENCY_BACKOFF_MAX_NS
+#define AMPR_EMU_APR_EXTERNAL_AIO_POLL_LATENCY_BACKOFF_MAX_NS 100000
+#endif
+
+#ifndef AMPR_EMU_APR_EXTERNAL_AIO_POLL_BALANCED_INITIAL_NS
+#define AMPR_EMU_APR_EXTERNAL_AIO_POLL_BALANCED_INITIAL_NS 100000
+#endif
+
+#ifndef AMPR_EMU_APR_EXTERNAL_AIO_POLL_BALANCED_BACKOFF_MAX_NS
+#define AMPR_EMU_APR_EXTERNAL_AIO_POLL_BALANCED_BACKOFF_MAX_NS 500000
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_POLL_BACKOFF_MAX_NS
@@ -480,8 +616,11 @@
 #endif
 
 #ifndef AMPR_EMU_APR_LOCAL_EQUEUE_REG_CAPACITY
-// Process-wide mirror of successful native (eq,id,udata) AMPR registrations.
-#define AMPR_EMU_APR_LOCAL_EQUEUE_REG_CAPACITY AMPR_EMU_APR_COMMAND_BUFFER_LIVE_MAX
+// Process-wide mirror of successful native (eq,filter,id,udata) AMPR
+// registrations. Event-id fanout is independent of the public synthetic
+// submit-id pool; package-load bursts can exceed 4096 live registrations while
+// queue and pending-event occupancy remain below their existing bounds.
+#define AMPR_EMU_APR_LOCAL_EQUEUE_REG_CAPACITY 16384u
 #endif
 
 #ifndef AMPR_EMU_APR_LOCAL_EQUEUE_PENDING_CAPACITY
@@ -603,13 +742,16 @@
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_SLOW_COOLDOWN_TRIGGER_MS
-// A completed AIO at or above this age marks the disk as recently saturated.
-#define AMPR_EMU_APR_AIO_SLOW_COOLDOWN_TRIGGER_MS 500
+// A completion that crossed the live medium-age threshold must keep pressure
+// active after that request disappears from the oldest-active snapshot.
+#define AMPR_EMU_APR_AIO_SLOW_COOLDOWN_TRIGGER_MS \
+    AMPR_EMU_APR_AIO_THROTTLE_MEDIUM_AGE_MS
 #endif
 
 #ifndef AMPR_EMU_APR_AIO_SLOW_COOLDOWN_MS
-// Keep adaptive pressure active for this long after a slow AIO completion.
-#define AMPR_EMU_APR_AIO_SLOW_COOLDOWN_MS 2000
+// One bounded drain interval prevents an immediate 24 -> 32 refill without
+// imposing the former two-second throughput penalty after an isolated tail.
+#define AMPR_EMU_APR_AIO_SLOW_COOLDOWN_MS 500u
 #endif
 
 #ifndef AMPR_EMU_TIME_LIMIT_UNIX_SECONDS
@@ -619,7 +761,7 @@
 
 // Version
 #ifndef AMPR_EMU_VERSION
-#define AMPR_EMU_VERSION "0.3.6.6 (public beta) (c) Drakmor"
+#define AMPR_EMU_VERSION "0.4.2.1 (c) Drakmor"
 #endif
 
 #ifndef AMPR_EMU_DEBUG_LOG
@@ -720,4 +862,55 @@
 // 1 -> compile hidden libkernel hook startup/status log helpers. Runtime hook
 // forwarding and symbol resolution stay compiled independently of this flag.
 #define AMPR_EMU_LIBKERNEL_HOOK_DIAGNOSTICS 1
+#endif
+
+#ifndef AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
+// Expose packed-only files and their synthetic parent directories through
+// process-wide O_DIRECTORY/getdents/stat/fstat/reachability hooks.
+#define AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE 1
+#endif
+
+#ifndef AMPR_EMU_PACK_INTERCEPT_PROCESS_READS
+// Legacy compatibility switch. New builds should use the split process-open,
+// process-AIO and synchronous-read controls below.
+#define AMPR_EMU_PACK_INTERCEPT_PROCESS_READS 1
+#endif
+
+#ifndef AMPR_EMU_PACK_PROCESS_OPEN_ENABLE
+// Expose packed files through ordinary read-only sceKernelOpen. This is
+// independent of directory enumeration: some engines know asset paths in
+// advance and never call getdents/readdir.
+#define AMPR_EMU_PACK_PROCESS_OPEN_ENABLE 1
+#endif
+
+#ifndef AMPR_EMU_PACK_INTERCEPT_PROCESS_AIO
+// A packed FD returned to game code must be consumable by the normal AIO API.
+// Keep this enabled for the default transparent pack namespace.
+#define AMPR_EMU_PACK_INTERCEPT_PROCESS_AIO AMPR_EMU_PACK_PROCESS_OPEN_ENABLE
+#endif
+
+#ifndef AMPR_EMU_PACK_INTERCEPT_PROCESS_SYNC_READS
+// Optional synchronous read/pread interception. The legacy all-process-read
+// switch still enables it for backwards-compatible builds.
+#define AMPR_EMU_PACK_INTERCEPT_PROCESS_SYNC_READS AMPR_EMU_PACK_INTERCEPT_PROCESS_READS
+#endif
+
+#ifndef AMPR_EMU_PACK_PROCESS_AIO_STRICT_FIFO
+// Ordinary process-visible virtual FDs should preserve submission FIFO within
+// one SDK priority. APR-indexed virtual FDs may still use adaptive work classes.
+// This avoids introducing ordering semantics that the caller did not request.
+#define AMPR_EMU_PACK_PROCESS_AIO_STRICT_FIFO 1
+#endif
+
+#ifndef AMPR_EMU_PACK_IO_LOG
+// Emit logical pack-open/AIO and directory-overlay diagnostics. Per-request
+// records use trace logging; lifecycle and failures use the normal log.
+#define AMPR_EMU_PACK_IO_LOG 1
+#endif
+
+#ifndef AMPR_EMU_PACK_TELEMETRY
+// Collect pack counters and worker/AIO latency samples used only by diagnostic
+// summaries. Product builds with the debug journal compiled out must not pay
+// atomic-update or clock-read overhead for unavailable diagnostics.
+#define AMPR_EMU_PACK_TELEMETRY AMPR_EMU_DEBUG_LOG
 #endif

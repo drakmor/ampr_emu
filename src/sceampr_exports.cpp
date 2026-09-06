@@ -8,8 +8,10 @@
 #include <new>
 #include "ampr.h"
 #include "ampr_emu_config.h"
+#include "ampr_emu_command_log.h"
 #include "ampr_debug_log.h"
 #include "ampr_emu_log.h"
+#include "ampr_emu_pack.h"
 #include "ampr_emu_amm.h"
 #include "ampr_emu_apr_equeue.h"
 #include "ampr_emu_apr_reactor.h"
@@ -32,13 +34,19 @@ int module_start(size_t args, const void* argp) {
 int module_stop(size_t args, const void* argp) {
     (void)args;
     (void)argp;
+    const int packRc = ampr_pack_shutdown();
+    if (packRc != 0) {
+        return -1;
+    }
     const int reactorRc = apr_reactor_shutdown();
     if (reactorRc != 0) {
         return -1;
     }
-    const int rc = amprUninstallLibkernelHooks();
-    sce::Ampr::Emu::shutdownDebugLog();
-    return rc;
+    if (sce::Ampr::Emu::shutdownCommandLog() != 0 ||
+        sce::Ampr::Emu::shutdownDebugLog() != 0) {
+        return -1;
+    }
+    return amprUninstallLibkernelHooks();
 }
 }
 
