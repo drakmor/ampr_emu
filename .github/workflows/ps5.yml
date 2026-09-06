@@ -59,14 +59,6 @@ jobs:
             python3
           python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
 
-      - name: Pin PS5 payload SDK v0.42
-        working-directory: pacbrew-repo/sdk
-        run: |
-          sed -i \
-            's|git+https://github.com/ps5-payload-dev/sdk.git|git+https://github.com/ps5-payload-dev/sdk.git#commit=4eb701204fc3f8d31e84cf8ca272974e2be9c867|' \
-            PKGBUILD
-          grep -Fq '#commit=4eb701204fc3f8d31e84cf8ca272974e2be9c867' PKGBUILD
-
       - name: Build PS5 payload SDK
         working-directory: pacbrew-repo/sdk
         run: |
@@ -93,7 +85,10 @@ jobs:
 
       - name: Build and verify runtime variants
         run: |
-          make clean-runtime-variants PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          rm -rf -- \
+            out/payload-sdk-loose-stdio \
+            out/payload-sdk-packed-stdio \
+            out/payload-sdk-variants
           make runtime-variants PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 
       - name: Upload runtime variants
