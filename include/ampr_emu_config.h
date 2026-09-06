@@ -864,6 +864,10 @@
 #define AMPR_EMU_LIBKERNEL_HOOK_DIAGNOSTICS 1
 #endif
 
+#ifndef AMPR_EMU_PACK_ENABLE
+#define AMPR_EMU_PACK_ENABLE 1
+#endif
+
 #ifndef AMPR_EMU_PACK_DIRECTORY_OVERLAY_ENABLE
 // Expose packed-only files and their synthetic parent directories through
 // process-wide O_DIRECTORY/getdents/stat/fstat/reachability hooks.

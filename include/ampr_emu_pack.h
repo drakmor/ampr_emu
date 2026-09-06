@@ -7,6 +7,7 @@
  */
 #pragma once
 
+#include "ampr_emu_config.h"
 #include "ampr_emu_aio_broker.h"
 
 #include <kernel.h>
@@ -15,10 +16,6 @@
 #include <cstdint>
 
 struct FileEntryView;
-
-#ifndef AMPR_EMU_PACK_ENABLE
-#define AMPR_EMU_PACK_ENABLE 1
-#endif
 
 #ifndef AMPR_EMU_PACK_INDEX_PATH
 #define AMPR_EMU_PACK_INDEX_PATH "/app0/ampr_assets.index"
