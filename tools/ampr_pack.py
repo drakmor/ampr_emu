@@ -1891,6 +1891,8 @@ def verify_packs(index_path: Path, patterns: Sequence[str] = ()) -> dict[str, in
     manifest = load_manifest(index_path)
     read_runtime_settings(Path(str(index_path) + ".runtime"), manifest.build_id)
     ids = _selected_file_ids(manifest, patterns)
+    from ampr_progress import Progress
+    progress = Progress("Verifying", sum(manifest.files[i-1].logical_size for i in ids if manifest.files[i-1].flags & FILE_FLAG_PACKED))
     physical_seen: dict[
         tuple[int, int, int], tuple[int, int, int]
     ] = {}
@@ -1920,6 +1922,7 @@ def verify_packs(index_path: Path, patterns: Sequence[str] = ()) -> dict[str, in
                             "one physical chunk has conflicting metadata"
                         )
                     total += chunk.raw_size
+                    progress(chunk.raw_size)
                     continue
                 raw = reader.read_chunk(chunk_index, chunk)
                 total += len(raw)
@@ -1927,6 +1930,7 @@ def verify_packs(index_path: Path, patterns: Sequence[str] = ()) -> dict[str, in
                 verified_chunks += 1
                 verified_stored += chunk.stored_size
                 verified_raw += chunk.raw_size
+                progress(chunk.raw_size)
             if total != record.logical_size:
                 raise PackError(f"logical size mismatch for file id {file_id}")
             verified_files += 1
@@ -1947,6 +1951,8 @@ def verify_packs_against_root(
     """Reconstruct packed files and compare them byte-for-byte with root."""
     manifest = load_manifest(index_path)
     ids = _selected_file_ids(manifest, patterns)
+    from ampr_progress import Progress
+    progress = Progress("Comparing originals", sum(manifest.files[i-1].logical_size for i in ids if manifest.files[i-1].flags & FILE_FLAG_PACKED))
     compared_files = 0
     compared_bytes = 0
     compared_chunks = 0
@@ -1993,6 +1999,7 @@ def verify_packs_against_root(
                         )
                     logical_offset += len(packed_raw)
                     compared_bytes += len(packed_raw)
+                    progress(len(packed_raw))
                     compared_chunks += 1
                 if source.read(1):
                     raise PackError(f"source grew while comparing: {relative}")

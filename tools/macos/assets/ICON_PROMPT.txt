@@ -1,0 +1,3 @@
+Generated with the built-in image_gen tool.
+
+Use case: logo-brand. Create a polished macOS application icon for AMPR Pack Tools, a minimalist game asset packing utility. Single centered iconic sculptural object: three compact interlocking metallic layers forming a distinctive cube/package with a subtle angular A-shaped cutout. Premium restrained dark graphite, brushed silver and luminous teal accents, consistent with a minimal dark-mode desktop utility. Rounded-square dark tile, transparent canvas outside tile, generous equal safe margins. Bold simple silhouette recognizable at 32 pixels, refined dimensional lighting, not a screenshot or mockup. Square 1024x1024 raster asset. No floppy disk, no controller, no text, no letters printed, no watermark, no extra objects.

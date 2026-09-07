@@ -219,6 +219,7 @@ def build_index_local(root: Path, output: Path, allow_case_collisions: bool) -> 
     rows: list[tuple[int, int, str]] = []
 
     for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != ".ampr-mac-recovery"]
         dirnames.sort(key=key_for)
         filenames.sort(key=key_for)
         for filename in filenames:
@@ -228,7 +229,10 @@ def build_index_local(root: Path, output: Path, allow_case_collisions: bool) -> 
             except OSError as exc:
                 print(f"warning: skipping unresolved path {path}: {exc}", file=sys.stderr)
                 continue
-            if resolved == output or resolved == output_tmp:
+            if (filename.startswith("._") or filename in {".DS_Store", "ampr_emu.log", "ampr_emu.index"}
+                or filename.startswith("ampr_emu.index.old")
+                or filename.startswith("libSceAmpr.sprx.old")
+                or resolved == output or resolved == output_tmp):
                 continue
             indexed_path = app0_path(root, path)
             if indexed_path.lower() in {"/app0/ampr_commands.bin", "/app0/apr_emu.log"}:

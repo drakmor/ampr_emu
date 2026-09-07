@@ -1,0 +1,14 @@
+AMPR PAK Tools - macOS community port
+
+Original AMPR emulator and PAK tools by Drakmor.
+macOS port, Auto Guide and UI enhancements by Shambhala222.
+
+Original project: https://github.com/drakmor/ampr_emu
+
+This is a modified macOS version, not an official upstream release.
+Mac changes dated 2026-09-07. Existing upstream author and license notices
+remain applicable. The upstream project uses the GNU GPL version 3.
+See LICENSE-GPL-3.0.txt. LZ4 retains its separate license in LICENSE-LZ4.txt.
+
+The English and German guides cover this macOS workflow.
+The Russian PDF is the original upstream guide.

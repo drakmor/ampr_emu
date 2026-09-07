@@ -40,3 +40,9 @@ msbuild/**
 !msbuild/Prospero.Common.props
 !msbuild/libSceAmpr/
 !msbuild/libSceAmpr/libSceAmpr.vcxproj
+
+# macOS local packaging resources and outputs
+/dist/
+/tools/macos/*.sprx
+/tools/macos/emus/
+.venv/

@@ -15,3 +15,6 @@
 *.prx binary
 *.self binary
 *.sprx binary
+
+*.pdf binary
+*.icns binary
